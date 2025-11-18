@@ -60,7 +60,7 @@ Built from the ground up for the Windows Desktop Window Manager. Proudly Windows
 
 ## Author
 
-Made with love and pure determination by [@yourusername](https://github.com/yourusername)
+Made with passion and pure determination by [@C0sm0cats](https://github.com/C0sm0cats)
 
 ---
 
