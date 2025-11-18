@@ -7,7 +7,7 @@ No config files. No admin rights. Just press a key and get a perfect grid.
 
 ## What It Does
 
-- Instantly tiles all visible windows into clean 3×3, 4×3 or 5×3 grids (up to 15 windows)  
+- Instantly tiles all visible windows into clean full-screen, side_by_side, master_stack, 2x2, 3x2, 3×3, 4×3 or 5×3 grids (up to 15 windows)  
 - Uses constant gaps and edge padding for a polished look  
 - Fully supports multi-monitor setups:  
   → `Ctrl+Alt+M` moves **your entire grid** to the next monitor and automatically resizes everything  
