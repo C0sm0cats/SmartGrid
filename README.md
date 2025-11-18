@@ -1,4 +1,5 @@
-# SmartGrid — Powerful & Reliable Window Tiling for Windows
+# SmartGrid 
+## Powerful & Reliable Window Tiling for Windows
 
 **SmartGrid** is a lightweight, aggressive, pure-Python window tiler that **just works** on Windows 10 & 11 — even with the most stubborn modern applications.
 
