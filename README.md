@@ -27,7 +27,7 @@ No config files. No admin rights. Just press a key and get a perfect grid.
 
 - Windows 10 or Windows 11 (64-bit)
 - Python 3.9 or newer
-- One tiny dependency:
+- One tiny dependency: pywin32
 
 ## Quick Start
 
