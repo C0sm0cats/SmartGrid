@@ -1,19 +1,19 @@
 # SmartGrid 
-## Powerful & Reliable Window Tiling for Windows
+## Powerful Pure-Python Dynamic Tiling Window Manager for Windows
 
-**SmartGrid** is a lightweight, aggressive, pure-Python window tiler that **just works** on Windows 10 & 11 — even with the most stubborn modern applications.
+**SmartGrid** is not just a tiler.
+It’s a **real, living, breathing dynamic tiling window manager** for Windows 10 & 11 — written in pure Python.
 
-No config files. No admin rights. Just press a key and get a perfect grid.
+No config. No bullshit. Just press one key and live in perfect harmony.
 
-## What It Does
+## What It Actually Does Now
 
-- Instantly tiles all visible windows into clean full-screen, side_by_side, master_stack, 2x2, 3x2, 3×3, 4×3 or 5×3 grids (up to 15 windows)
-- Highlights the currently active window with a clean green border for instant focus
-- Uses constant gaps and edge padding for a polished look  
-- Fully supports multi-monitor setups:  
-  → `Ctrl+Alt+M` moves **your entire grid** to the next monitor and automatically resizes everything  
-- Works reliably with apps that have custom frames, invisible borders, acrylic effects, GPU rendering, etc.  
-- Zero perceptible lag on hotkeys
+- **True dynamic tiling**: every time you restore, minimize, open or close a window → **the layout instantly adapts** (1 → full, 2 → side-by-side, 3 → master+stack, 4 → 2×2, up to 5×3 grid)
+- **Zero manual re-tile needed** — it just *knows*
+- Perfect green border that **always** follows the active window (even after 100 minimizes)
+- Full multi-monitor cycling: `Ctrl+Alt+M` moves your entire living grid to the next monitor
+- Works with the most stubborn apps (Electron, UWP, WPF, acrylic, custom frames, etc.)
+- Under 500 lines of clean, readable, battle-tested Python
 
 ## Hotkeys
 
@@ -24,13 +24,31 @@ No config files. No admin rights. Just press a key and get a perfect grid.
 | `Ctrl + Alt + M`    | Cycle all tiled windows to the next monitor         |
 | `Ctrl + Alt + Q`    | Quit SmartGrid                                      |
 
+> **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
+
+## Behavior
+
+- Launch SmartGrid → nothing moves (you see the welcome message)
+- Press `Ctrl+Alt+T` → **BAM**. Instant perfect tiling + auto-retile activated
+- From now on: restore a window, minimize one, open Firefox → layout updates **automatically**
+- Press `Ctrl+Alt+T` again → free mode (move windows manually)
+- Press `Ctrl+Alt+T` again → everything snaps back into perfect order
+
+## Multi-Monitor Workflow
+
+1. Tile your windows on monitor 1
+2. Press `Ctrl + Alt + M` → everything jumps to monitor 2, perfectly resized
+3. Press again → back to monitor 1 (or to monitor 3, 4… fully cyclic)
+
+No manual dragging. No resizing. Just one key.
+
 ## Requirements
 
-- Windows 10 or Windows 11 (64-bit)
-- Python 3.9 or newer
-- One tiny dependency: pywin32
+- Windows 10 / 11 (64-bit)
+- Python 3.9+
+- `pip install pywin32`
 
-## Quick Start
+## Install & Run
 
 ```bash
 git clone https://github.com/yourusername/smartgrid.git
@@ -41,23 +59,11 @@ python smartgrid.py
 
 Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 
-## Multi-Monitor Workflow
-
-1. Tile your windows on monitor 1
-2. Press `Ctrl + Alt + M` → everything jumps to monitor 2, perfectly resized
-3. Press again → back to monitor 1 (or to monitor 3, 4… fully cyclic)
-
-No manual dragging. No resizing. Just one key.
-
 ## Why This Script Exists
 
 Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid uses low-level Win32 calls, DWM border compensation, and aggressive repositioning to make every visible window obey the grid — reliably and instantly.
 
 All in under 500 lines of clean, readable Python.
-
-## Windows Only
-
-Built from the ground up for the Windows Desktop Window Manager. Proudly Windows-only.
 
 
 ## Author

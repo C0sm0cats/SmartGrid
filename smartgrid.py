@@ -60,6 +60,7 @@ GAP = 8
 EDGE_PADDING = 8
 
 grid_state = {}
+last_visible_count = 0
 is_active = False
 monitor_thread = None
 
@@ -352,15 +353,39 @@ def move_all_tiled_to_next_monitor():
         apply_border(active)
     print(f"[SWITCH] {len(new_grid)} windows moved to monitor {CURRENT_MONITOR_INDEX + 1}")
 
-# ==================================================================
-# Polling monitor
-# ==================================================================
+# ==============================================================================
+# Polling monitor - Auto-retile when windows are shown/hidden/minimized/restored
+# ==============================================================================
 def monitor():
-    global current_hwnd, grid_state
-    while is_active:
-        for hwnd in list(grid_state.keys()):
-            if not user32.IsWindow(hwnd):
-                grid_state.pop(hwnd, None)
+    global current_hwnd, grid_state, last_visible_count
+
+    while True:
+        if is_active:
+            # Clean dead windows
+            for hwnd in list(grid_state.keys()):
+                if not user32.IsWindow(hwnd):
+                    grid_state.pop(hwnd, None)
+
+            # Get currently visible windows
+            visible_windows = get_visible_windows()
+            current_count = len(visible_windows)
+            current_hwnds = {hwnd for hwnd, _, _ in visible_windows}
+
+            # Add newly visible windows to grid_state (so they get tiled)
+            updated = False
+            for hwnd, title, _ in visible_windows:
+                if hwnd not in grid_state:
+                    grid_state[hwnd] = (0, 0, 0)   # temporary position
+                    updated = True
+
+            # Auto-retile only if number of visible windows changed
+            if current_count != last_visible_count or updated:
+                print(f"[AUTO-RETILE] {last_visible_count} → {current_count} visible windows")
+                smart_tile(temp=True)
+                last_visible_count = current_count
+                time.sleep(0.2)  # small debounce
+
+        # Update green border on active window
         active = user32.GetForegroundWindow()
         if active and user32.IsWindowVisible(active):
             if active != current_hwnd:
@@ -369,7 +394,8 @@ def monitor():
             if current_hwnd:
                 remove_border(current_hwnd)
                 current_hwnd = None
-        time.sleep(0.08)
+
+        time.sleep(0.35)  # responsive but no CPU spam
 
 # ==================================================================
 # Hotkeys & main loop
@@ -391,9 +417,6 @@ def toggle_persistent():
     print(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
     if is_active:
         smart_tile(temp=False)
-        if not monitor_thread or not monitor_thread.is_alive():
-            monitor_thread = threading.Thread(target=monitor, daemon=True)
-            monitor_thread.start()
 
 if __name__ == "__main__":
     print("="*70)
@@ -408,6 +431,7 @@ if __name__ == "__main__":
     clear_all_borders()
     time.sleep(0.05)
 
+    # Start monitoring immediately (auto-retile + green border)
     threading.Thread(target=monitor, daemon=True).start()
 
     register_hotkeys()
