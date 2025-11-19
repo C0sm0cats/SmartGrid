@@ -502,5 +502,8 @@ if __name__ == "__main__":
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
+    if current_hwnd:
+        remove_border(current_hwnd)
+    clear_all_borders()    
     unregister_hotkeys()
     print("[EXIT] SmartGrid stopped.")
