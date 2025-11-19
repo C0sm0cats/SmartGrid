@@ -61,10 +61,9 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 
 ## Why This Script Exists
 
-Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid uses low-level Win32 calls, DWM border compensation, and aggressive repositioning to make every visible window obey the grid — reliably and instantly.
+Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
 
 All in under 500 lines of clean, readable Python.
-
 
 ## Author
 
