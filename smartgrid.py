@@ -207,9 +207,11 @@ def clear_all_borders():
 # ==================================================================
 def smart_tile(temp=False):
     global grid_state
+    
     if temp:
         clear_all_borders()
         time.sleep(0.05)
+    
     monitors = get_monitors()
     visible_windows = get_visible_windows()
     if not visible_windows:
@@ -275,8 +277,7 @@ def smart_tile(temp=False):
         else:
             new_grid[hwnd] = (0, i, 0)   # ← for side-by-side / master-stack
 
-    if not temp:
-        grid_state = new_grid
+    grid_state = new_grid
 
     time.sleep(0.15)
     active = user32.GetForegroundWindow()
@@ -404,8 +405,12 @@ if __name__ == "__main__":
     print("Ctrl+Alt+Q  -> Quit SmartGrid")
     print("-"*70)
 
-    register_hotkeys()
+    clear_all_borders()
+    time.sleep(0.05)
+
     threading.Thread(target=monitor, daemon=True).start()
+
+    register_hotkeys()
 
     monitors = get_monitors()
     print(f"Detected {len(monitors)} monitor(s)")
