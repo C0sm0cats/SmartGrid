@@ -108,12 +108,51 @@ def get_monitors():
     MONITORS_CACHE = monitors
     return monitors
 
-def is_useful_window(title):
+def is_useful_window(title, class_name=""):
     if not title:
         return False
-    exclude = ["program manager", "start", "cortana", "search", "notification",
-               "toast", "popup", "tooltip", "splash", "realtek audio console"]
-    return not any(ex in title.lower() for ex in exclude)
+
+    title_lower = title.lower()
+    class_lower = class_name.lower() if class_name else ""
+
+    # === HARD EXCLUDE BY TITLE ===
+    bad_titles = [
+        "spotify", "discord", "steam", "call", "meeting", "join", "incoming call",
+        "obs", "streamlabs", "twitch studio", "nvidia overlay", "geforce experience",
+        "shadowplay", "radeon software", "amd relive", "rainmeter", "wallpaper engine",
+        "lively wallpaper", "msi afterburner", "rtss", "rivatuner", "hwinfo", "hwmonitor",
+        "displayfusion", "actual window", "aquasnap", "powertoys", "fancyzones",
+        "picture in picture", "pip", "miniplayer", "mini player", "youtube music",
+        "vlc media player", "media player classic", "battle.net", "origin", "epic games",
+        "gog galaxy", "uplay", "ubisoft connect", "ea app", "game bar", "xbox",
+        "notification", "toast", "popup", "tooltip", "splash", "alert", "flyout", "volume control", "brightness",
+        "program manager", "start", "cortana", "search", "realtek audio console",
+        "operationstatuswindow", "shell_secondarytraywnd"
+    ]
+
+    if any(bad in title_lower for bad in bad_titles):
+        return False
+
+    # === HARD EXCLUDE BY CLASS NAME (even if title is empty or sneaky) ===
+    bad_classes = [
+        "chrome_renderwidgethosthwnd",   # Chrome PIP
+        "mozillawindowclass",            # Firefox PIP
+        "operationstatuswindow",         # Win11 flyouts
+        "windows.ui.core.corewindow",    # UWP popups
+        "foregroundstaging",             # Teams call window
+        "workerw",                       # Desktop wallpaper tricks
+        "progman",                       # Program Manager
+        "shell_traywnd",                 # Taskbar
+        "realtimedisplay",               # Some overlays
+    ]
+
+    if class_lower in bad_classes:
+        return False
+
+    # === SIZE FILTER (tiny windows = overlays) ===
+    # We'll do this in get_visible_windows() instead — cleaner
+
+    return True
 
 def get_visible_windows():
     monitors = get_monitors()
@@ -124,17 +163,25 @@ def get_visible_windows():
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 w = rect.right - rect.left
                 h = rect.bottom - rect.top
-                if w > 50 and h > 50:
-                    title = ctypes.create_unicode_buffer(256)
-                    user32.GetWindowTextW(hwnd, title, 256)
-                    if title.value and is_useful_window(title.value):
-                        overlap = sum(max(0, min(rect.right, mx+mw) - max(rect.left, mx)) *
-                                      max(0, min(rect.bottom, my+mh) - max(rect.top, my))
-                                      for mx, my, mw, mh in monitors)
-                        if overlap > (w * h * 0.1):
-                            windows.append((hwnd, title.value, rect))
+                if w > 180 and h > 180:  # tighter than 50x50
+                    title_buf = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(hwnd, title_buf, 256)
+                    title = title_buf.value or ""
+                    class_name = win32gui.GetClassName(hwnd)
+
+                    if is_useful_window(title, class_name):
+                        overlap = sum(
+                            max(0, min(rect.right, mx + mw) - max(rect.left, mx)) *
+                            max(0, min(rect.bottom, my + mh) - max(rect.top, my))
+                            for mx, my, mw, mh in monitors
+                        )
+                        if overlap > (w * h * 0.15):  # slightly stricter
+                            windows.append((hwnd, title, rect))
         return True
-    user32.EnumWindows(ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum), 0)
+
+    user32.EnumWindows(
+        ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum), 0
+    )
     return windows
 
 def force_tile_resizable(hwnd, x, y, w, h):
