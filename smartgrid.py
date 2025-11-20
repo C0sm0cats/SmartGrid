@@ -154,6 +154,10 @@ def is_useful_window(title, class_name=""):
         "progman",                       # Program Manager
         "shell_traywnd",                 # Taskbar
         "realtimedisplay",               # Some overlays
+        # === Added to exclude Win+Tab / Alt+Tab task switcher ===
+        "multitaskingviewframe",           # Win+Tab
+        "taskswitcherwnd",                 # Alt+Tab
+        "xamlexplorerhostislandwindow",    # Alt+Tab / Win11 timeline
     ]
 
     if class_lower in bad_classes:
