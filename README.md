@@ -11,7 +11,7 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 - **True dynamic tiling**: every time you restore, minimize, open or close a window → **the layout instantly adapts** (1 → full, 2 → side-by-side, 3 → master+stack, 4 → 2×2, up to 5×3 grid)
 - **Zero manual re-tile needed** — it just *knows*
 - Dynamic SWAP mode: press `Ctrl+Alt+S` → select a window, navigate with arrow keys, press Enter to exchange positions instantly
-- Perfect green border that **always** follows the active window (even after 100 minimizes)
+- Perfect green border that **always** follows the active window
 - Full multi-monitor cycling: `Ctrl+Alt+M` moves your entire living grid to the next monitor
 - Works with the most stubborn apps (Electron, UWP, WPF, acrylic, custom frames, etc.)
 
