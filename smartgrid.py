@@ -14,6 +14,7 @@ DWMWA_BORDER_COLOR = 34
 DWMWA_COLOR_NONE   = 0xFFFFFFFF
 
 current_hwnd = None
+selected_hwnd = None
 
 def remove_border(hwnd):
     if hwnd:
@@ -26,21 +27,21 @@ def remove_border(hwnd):
         except:
             pass
 
-def apply_border(hwnd):
+def apply_border(hwnd, color=0x0000FF00):
     global current_hwnd
     if current_hwnd and current_hwnd != hwnd:
         remove_border(current_hwnd)
     if hwnd:
-        color = ctypes.c_uint(0x0000FF00)  # pure green
+        color_val = ctypes.c_uint(color)
         dwmapi.DwmSetWindowAttribute(
             hwnd, DWMWA_BORDER_COLOR,
-            ctypes.byref(color), ctypes.sizeof(ctypes.c_uint)
+            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
         )
         current_hwnd = hwnd
 
-# ==================================================================
+# ==============================================================================
 # Constants & config
-# ==================================================================
+# ==============================================================================
 MONITORS_CACHE = []
 
 GWL_STYLE = -16
@@ -68,6 +69,15 @@ HOTKEY_TOGGLE = 9001
 HOTKEY_RETILE = 9002
 HOTKEY_QUIT = 9003
 HOTKEY_MOVE_MONITOR = 9004
+
+HOTKEY_SWAP_MODE = 9005
+HOTKEY_SWAP_LEFT = 9006
+HOTKEY_SWAP_RIGHT = 9007
+HOTKEY_SWAP_UP = 9008
+HOTKEY_SWAP_DOWN = 9009
+HOTKEY_SWAP_CONFIRM = 9010
+
+swap_mode = False
 
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
@@ -149,9 +159,6 @@ def is_useful_window(title, class_name=""):
     if class_lower in bad_classes:
         return False
 
-    # === SIZE FILTER (tiny windows = overlays) ===
-    # We'll do this in get_visible_windows() instead — cleaner
-
     return True
 
 def get_visible_windows():
@@ -163,7 +170,7 @@ def get_visible_windows():
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 w = rect.right - rect.left
                 h = rect.bottom - rect.top
-                if w > 180 and h > 180:  # tighter than 50x50
+                if w > 180 and h > 180:
                     title_buf = ctypes.create_unicode_buffer(256)
                     user32.GetWindowTextW(hwnd, title_buf, 256)
                     title = title_buf.value or ""
@@ -175,7 +182,7 @@ def get_visible_windows():
                             max(0, min(rect.bottom, my + mh) - max(rect.top, my))
                             for mx, my, mw, mh in monitors
                         )
-                        if overlap > (w * h * 0.15):  # slightly stricter
+                        if overlap > (w * h * 0.15):
                             windows.append((hwnd, title, rect))
         return True
 
@@ -223,9 +230,9 @@ def force_tile_resizable(hwnd, x, y, w, h):
         print(f"   [NUKE] MoveWindow forced on -> {title[:60]}")
         win32gui.MoveWindow(hwnd, int(x), int(y), int(w), int(h), True)
 
-# ==================================================================
+# ==============================================================================
 # Smart layout chooser
-# ==================================================================
+# ==============================================================================
 def choose_layout(count):
     if count == 1: return "full", None
     if count == 2: return "side_by_side", None
@@ -250,9 +257,9 @@ def clear_all_borders():
     enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum_callback)
     user32.EnumWindows(enum_proc, 0)
 
-# ==================================================================
+# ==============================================================================
 # smart_tile with intelligent layouts + your grid fallback
-# ==================================================================
+# ==============================================================================
 def smart_tile(temp=False):
     global grid_state
     
@@ -323,7 +330,7 @@ def smart_tile(temp=False):
             cols = info[0]
             new_grid[hwnd] = (0, i % cols, i // cols)
         else:
-            new_grid[hwnd] = (0, i, 0)   # ← for side-by-side / master-stack
+            new_grid[hwnd] = (0, i, 0)
 
     grid_state = new_grid
 
@@ -332,9 +339,9 @@ def smart_tile(temp=False):
     if active and user32.IsWindowVisible(active):
         apply_border(active)
 
-# ==================================================================
+# ==============================================================================
 # Multi-monitor
-# ==================================================================
+# ==============================================================================
 CURRENT_MONITOR_INDEX = 0
 
 def move_all_tiled_to_next_monitor():
@@ -401,6 +408,265 @@ def move_all_tiled_to_next_monitor():
     print(f"[SWITCH] {len(new_grid)} windows moved to monitor {CURRENT_MONITOR_INDEX + 1}")
 
 # ==============================================================================
+# SWAP MODE
+# ==============================================================================
+def get_window_position_info(hwnd):
+    """Retourne (x_center, y_center, mon_idx, col, row) pour une fenêtre"""
+    if hwnd not in grid_state:
+        return None
+    
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return None
+    
+    x_center = (rect.left + rect.right) // 2
+    y_center = (rect.top + rect.bottom) // 2
+    mon_idx, col, row = grid_state[hwnd]
+    
+    return (x_center, y_center, mon_idx, col, row)
+
+def find_window_in_direction(from_hwnd, direction):
+    if not grid_state or from_hwnd not in grid_state:
+        return None
+
+    mon_idx = grid_state[from_hwnd][0]
+
+    # Get the actual position of the selected window
+    from_rect = wintypes.RECT()
+    if not user32.GetWindowRect(from_hwnd, ctypes.byref(from_rect)):
+        return None
+
+    fx1, fy1, fx2, fy2 = from_rect.left, from_rect.top, from_rect.right, from_rect.bottom
+    fcx = (fx1 + fx2) // 2
+    fcy = (fy1 + fy2) // 2
+    fw = fx2 - fx1
+    fh = fy2 - fy1
+
+    best_hwnd = None
+    best_score = 0
+
+    for hwnd, (m, _, _) in grid_state.items():
+        if hwnd == from_hwnd or m != mon_idx or not user32.IsWindow(hwnd):
+            continue
+
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+
+        x1, y1, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
+        cx = (x1 + x2) // 2
+        cy = (y1 + y2) // 2
+        w = x2 - x1
+        h = y2 - y1
+
+        dx = cx - fcx
+        dy = cy - fcy
+
+        # Very strict thresholds to avoid diagonals and false positives
+        if direction == "up":
+            if dy >= -30: continue                     # must be clearly above
+            if abs(dx) > max(fw, w) * 0.7: continue     # reasonable horizontal alignment
+            score = -dy                                 # higher = better score
+        elif direction == "down":
+            if dy <= 30: continue
+            if abs(dx) > max(fw, w) * 0.7: continue
+            score = dy
+        elif direction == "left":
+            if dx >= -30: continue
+            if abs(dy) > max(fh, h) * 0.7: continue     # vertical alignment
+            score = -dx
+        elif direction == "right":
+            if dx <= 30: continue
+            if abs(dy) > max(fh, h) * 0.7: continue
+            score = dx
+        else:
+            continue
+
+        # the closer the window, the higher the score
+        distance = abs(dx) + abs(dy)
+        score = score * 1000 - distance
+
+        if score > best_score:
+            best_score = score
+            best_hwnd = hwnd
+
+    return best_hwnd
+
+def swap_windows(hwnd1, hwnd2):
+    if hwnd1 not in grid_state or hwnd2 not in grid_state:
+        return False
+    
+    # First clear all borders
+    remove_border(hwnd1)
+    remove_border(hwnd2)
+    time.sleep(0.05)
+    
+    # Retrieve the current positions
+    rect1 = wintypes.RECT()
+    rect2 = wintypes.RECT()
+    
+    if not user32.GetWindowRect(hwnd1, ctypes.byref(rect1)):
+        return False
+    if not user32.GetWindowRect(hwnd2, ctypes.byref(rect2)):
+        return False
+    
+    lb1, tb1, rb1, bb1 = get_frame_borders(hwnd1)
+    lb2, tb2, rb2, bb2 = get_frame_borders(hwnd2)
+    
+    # Calculate dimensions without borders
+    x1, y1 = rect1.left + lb1, rect1.top + tb1
+    w1 = rect1.right - rect1.left - lb1 - rb1
+    h1 = rect1.bottom - rect1.top - tb1 - bb1
+    
+    x2, y2 = rect2.left + lb2, rect2.top + tb2
+    w2 = rect2.right - rect2.left - lb2 - rb2
+    h2 = rect2.bottom - rect2.top - tb2 - bb2
+    
+    title1 = win32gui.GetWindowText(hwnd1)[:40]
+    title2 = win32gui.GetWindowText(hwnd2)[:40]
+    print(f"[SWAP] '{title1}' ↔ '{title2}'")
+    
+    # Swap the positions in grid_state
+    grid_state[hwnd1], grid_state[hwnd2] = grid_state[hwnd2], grid_state[hwnd1]
+    
+    # Physically move the windows (SWAPPING positions, not sizes)
+    force_tile_resizable(hwnd1, x2, y2, w2, h2)
+    time.sleep(0.08)
+    force_tile_resizable(hwnd2, x1, y1, w1, h1)
+    time.sleep(0.08)
+    
+    # Clear the borders again after the swap
+    remove_border(hwnd1)
+    remove_border(hwnd2)
+    
+    return True
+
+def enter_swap_mode():
+    global swap_mode, selected_hwnd
+    
+    # Wait a tiny bit for the tiling to stabilize
+    time.sleep(0.15)
+    
+    # Force a quick update of grid_state in case it's empty or updating
+    if not grid_state:
+        visible_windows = get_visible_windows()
+        for hwnd, title, _ in visible_windows:
+            if hwnd not in grid_state:
+                grid_state[hwnd] = (0, 0, 0)
+        print(f"[SWAP] grid_state was empty → rebuilt with {len(grid_state)} windows")
+    if not grid_state:
+        print("[SWAP] No tiled windows detected. First press Ctrl+Alt+T or Ctrl+Alt+R")
+
+        return
+    
+    # Get the active window
+    active = user32.GetForegroundWindow()
+    if not active or active not in grid_state:
+        # Take the first window from grid_state
+        active = next(iter(grid_state.keys()))
+    
+    swap_mode = True
+    selected_hwnd = active
+    
+    remove_border(selected_hwnd)
+    time.sleep(0.05)
+    color_val = ctypes.c_uint(0x000000FF)  # Bright red (BGR format)
+    dwmapi.DwmSetWindowAttribute(
+        selected_hwnd, DWMWA_BORDER_COLOR,
+        ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+    )
+    
+    title = win32gui.GetWindowText(selected_hwnd)[:50]
+    print(f"\n[SWAP MODE] ✓ Activated - Selected window: '{title}'")
+    print(f"[SWAP MODE] Selected hwnd: {selected_hwnd}")
+    print("━" * 60)
+    print("  DIRECT SWAP with arrow keys:")
+    print("    ← → ↑ ↓  : Swap with adjacent window")
+    print("    Ctrl+Alt+S : Exit swap mode")
+    print("  ")
+    print("  The red window FOLLOWS your movements and swaps its position!")
+    print("━" * 60)
+
+def navigate_swap(direction):
+    global selected_hwnd
+    
+    if not swap_mode or not selected_hwnd:
+        print("[SWAP] Mode not active or no window selected")
+        return
+    
+    print(f"[SWAP] Attempting to swap {direction}...")
+    
+    # Find the window in the specified direction
+    target = find_window_in_direction(selected_hwnd, direction)
+    
+    if target:
+        # DIRECT SWAP!
+        if swap_windows(selected_hwnd, target):
+            # The selected window (red) has moved, we follow it
+            # selected_hwnd logically remains the same, but physically it has changed position
+            
+            # Clear and reapply the red border on the window that moved
+            time.sleep(0.1)
+            remove_border(selected_hwnd)
+            time.sleep(0.05)
+            color_val = ctypes.c_uint(0x000000FF)
+            dwmapi.DwmSetWindowAttribute(
+                selected_hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+            )
+            
+            title = win32gui.GetWindowText(selected_hwnd)[:50]
+            print(f"[SWAP] ✓ '{title}' swapped {direction}")
+            
+            # Focus on the window that moved
+            user32.SetForegroundWindow(selected_hwnd)
+        else:
+            print(f"[SWAP] ✗ Swap failed")
+    else:
+        print(f"[SWAP] ✗ No window in the {direction} direction (grid limit)")
+
+def confirm_swap():
+    global swap_mode, selected_hwnd
+
+    if not swap_mode or not selected_hwnd:
+        print("[SWAP] Swap mode not active or no window selected")
+        return
+
+    print(f"[SWAP] Confirming swap for hwnd {selected_hwnd}")
+
+    exit_swap_mode()
+    print("[SWAP] ✓ Swap confirmed and mode exited")
+
+def exit_swap_mode():
+    global swap_mode, selected_hwnd, current_hwnd
+    
+    if not swap_mode:
+        return
+    
+    # First, clear ALL borders
+    print("[SWAP MODE] Clearing borders...")
+    clear_all_borders()
+    time.sleep(0.15)
+    
+    swap_mode = False
+    old_selected = selected_hwnd
+    selected_hwnd = None
+    current_hwnd = None
+    
+    # Restore the green border on the active window
+    active = user32.GetForegroundWindow()
+    if active and user32.IsWindowVisible(active) and active in grid_state:
+        color_val = ctypes.c_uint(0x0000FF00)  # Vert
+        dwmapi.DwmSetWindowAttribute(
+            active, DWMWA_BORDER_COLOR,
+            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+        )
+        current_hwnd = active
+        print(f"[SWAP MODE] Green border restored on active window")
+    
+    print("[SWAP MODE] ✓ Deactivated\n")
+
+# ==============================================================================
 # Polling monitor - Auto-retile when windows are shown/hidden/minimized/restored
 # ==============================================================================
 def monitor():
@@ -422,7 +688,7 @@ def monitor():
             updated = False
             for hwnd, title, _ in visible_windows:
                 if hwnd not in grid_state:
-                    grid_state[hwnd] = (0, 0, 0)   # temporary position
+                    grid_state[hwnd] = (0, 0, 0)
                     updated = True
 
             # Auto-retile only if number of visible windows changed
@@ -430,34 +696,24 @@ def monitor():
                 print(f"[AUTO-RETILE] {last_visible_count} → {current_count} visible windows")
                 smart_tile(temp=True)
                 last_visible_count = current_count
-                time.sleep(0.2)  # small debounce
+                time.sleep(0.2)
 
-        # Update green border on active window
-        active = user32.GetForegroundWindow()
-        if active and user32.IsWindowVisible(active):
-            if active != current_hwnd:
-                apply_border(active)
-        else:
-            if current_hwnd:
-                remove_border(current_hwnd)
-                current_hwnd = None
+        # Update border on active window (except in swap mode)
+        if not swap_mode:
+            active = user32.GetForegroundWindow()
+            if active and user32.IsWindowVisible(active):
+                if active != current_hwnd:
+                    apply_border(active, color=0x0000FF00)  # Green
+            else:
+                if current_hwnd:
+                    remove_border(current_hwnd)
+                    current_hwnd = None
 
-        time.sleep(0.35)  # responsive but no CPU spam
+        time.sleep(0.35)
 
-# ==================================================================
+# ==============================================================================
 # Hotkeys & main loop
-# ==================================================================
-def register_hotkeys():
-    user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
-    user32.RegisterHotKey(None, HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R'))
-    user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
-    user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
-
-def unregister_hotkeys():
-    for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR):
-        try: user32.UnregisterHotKey(None, hk)
-        except: pass
-
+# ==============================================================================
 def toggle_persistent():
     global is_active, monitor_thread
     is_active = not is_active
@@ -465,13 +721,34 @@ def toggle_persistent():
     if is_active:
         smart_tile(temp=False)
 
+def register_hotkeys():
+    user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
+    user32.RegisterHotKey(None, HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R'))
+    user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
+    user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
+    user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
+    user32.RegisterHotKey(None, HOTKEY_SWAP_LEFT, 0, win32con.VK_LEFT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_RIGHT, 0, win32con.VK_RIGHT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_UP, 0, win32con.VK_UP)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_DOWN, 0, win32con.VK_DOWN)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_CONFIRM, 0, win32con.VK_RETURN)
+
+def unregister_hotkeys():
+    for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
+               HOTKEY_SWAP_MODE, HOTKEY_SWAP_LEFT, HOTKEY_SWAP_RIGHT, 
+               HOTKEY_SWAP_UP, HOTKEY_SWAP_DOWN, HOTKEY_SWAP_CONFIRM):
+        try: user32.UnregisterHotKey(None, hk)
+        except: pass
+
 if __name__ == "__main__":
     print("="*70)
-    print("   SMARTGRID - Intelligent layouts + green border")
+    print("   SMARTGRID - Intelligent layouts + green border + SWAP MODE")
     print("="*70)
     print("Ctrl+Alt+T  -> Toggle persistent tiling mode")
     print("Ctrl+Alt+R  -> One-shot re-tile of all visible windows")
     print("Ctrl+Alt+M  -> Cycle all tiled windows to the next monitor")
+    print("Ctrl+Alt+S  -> Enter SWAP mode to exchange window positions")
+    print("               (then use Arrow keys to navigate, Enter to swap)")
     print("Ctrl+Alt+Q  -> Quit SmartGrid")
     print("-"*70)
 
@@ -497,6 +774,21 @@ if __name__ == "__main__":
                 threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()
             elif msg.wParam == HOTKEY_MOVE_MONITOR:
                 threading.Thread(target=move_all_tiled_to_next_monitor, daemon=True).start()
+            elif msg.wParam == HOTKEY_SWAP_MODE:
+                if swap_mode:
+                    exit_swap_mode()
+                else:
+                    enter_swap_mode()
+            elif msg.wParam == HOTKEY_SWAP_LEFT and swap_mode:
+                navigate_swap("left")
+            elif msg.wParam == HOTKEY_SWAP_RIGHT and swap_mode:
+                navigate_swap("right")
+            elif msg.wParam == HOTKEY_SWAP_UP and swap_mode:
+                navigate_swap("up")
+            elif msg.wParam == HOTKEY_SWAP_DOWN and swap_mode:
+                navigate_swap("down")
+            elif msg.wParam == HOTKEY_SWAP_CONFIRM and swap_mode:
+                confirm_swap()
             elif msg.wParam == HOTKEY_QUIT:
                 break
         user32.TranslateMessage(ctypes.byref(msg))
