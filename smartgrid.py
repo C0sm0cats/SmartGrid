@@ -581,6 +581,7 @@ def enter_swap_mode():
     print("  ")
     print("  The red window FOLLOWS your movements and swaps its position!")
     print("━" * 60)
+    register_swap_hotkeys()
 
 def navigate_swap(direction):
     global selected_hwnd
@@ -644,6 +645,7 @@ def exit_swap_mode():
     time.sleep(0.15)
     
     swap_mode = False
+    unregister_swap_hotkeys()
     old_selected = selected_hwnd
     selected_hwnd = None
     current_hwnd = None
@@ -722,18 +724,26 @@ def register_hotkeys():
     user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
     user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
     user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
-    user32.RegisterHotKey(None, HOTKEY_SWAP_LEFT, 0, win32con.VK_LEFT)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_RIGHT, 0, win32con.VK_RIGHT)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_UP, 0, win32con.VK_UP)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_DOWN, 0, win32con.VK_DOWN)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_CONFIRM, 0, win32con.VK_RETURN)
 
 def unregister_hotkeys():
     for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
-               HOTKEY_SWAP_MODE, HOTKEY_SWAP_LEFT, HOTKEY_SWAP_RIGHT, 
-               HOTKEY_SWAP_UP, HOTKEY_SWAP_DOWN, HOTKEY_SWAP_CONFIRM):
+               HOTKEY_SWAP_MODE):
         try: user32.UnregisterHotKey(None, hk)
         except: pass
+
+def register_swap_hotkeys():
+    user32.RegisterHotKey(None, HOTKEY_SWAP_LEFT,    0, win32con.VK_LEFT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_RIGHT,   0, win32con.VK_RIGHT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_UP,      0, win32con.VK_UP)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_DOWN,     0, win32con.VK_DOWN)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_CONFIRM, 0, win32con.VK_RETURN)
+
+def unregister_swap_hotkeys():
+    for id in (HOTKEY_SWAP_LEFT, HOTKEY_SWAP_RIGHT, HOTKEY_SWAP_UP, HOTKEY_SWAP_DOWN, HOTKEY_SWAP_CONFIRM):
+        try:
+            user32.UnregisterHotKey(None, id)
+        except:
+            pass
 
 if __name__ == "__main__":
     print("="*70)
@@ -769,23 +779,25 @@ if __name__ == "__main__":
                 threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()
             elif msg.wParam == HOTKEY_MOVE_MONITOR:
                 threading.Thread(target=move_all_tiled_to_next_monitor, daemon=True).start()
+            elif msg.wParam == HOTKEY_QUIT:
+                break
             elif msg.wParam == HOTKEY_SWAP_MODE:
                 if swap_mode:
                     exit_swap_mode()
                 else:
                     enter_swap_mode()
-            elif msg.wParam == HOTKEY_SWAP_LEFT and swap_mode:
-                navigate_swap("left")
-            elif msg.wParam == HOTKEY_SWAP_RIGHT and swap_mode:
-                navigate_swap("right")
-            elif msg.wParam == HOTKEY_SWAP_UP and swap_mode:
-                navigate_swap("up")
-            elif msg.wParam == HOTKEY_SWAP_DOWN and swap_mode:
-                navigate_swap("down")
-            elif msg.wParam == HOTKEY_SWAP_CONFIRM and swap_mode:
-                confirm_swap()
-            elif msg.wParam == HOTKEY_QUIT:
-                break
+            elif swap_mode:
+                if msg.wParam == HOTKEY_SWAP_LEFT:
+                    navigate_swap("left")
+                elif msg.wParam == HOTKEY_SWAP_RIGHT:
+                    navigate_swap("right")
+                elif msg.wParam == HOTKEY_SWAP_UP:
+                    navigate_swap("up")
+                elif msg.wParam == HOTKEY_SWAP_DOWN:
+                    navigate_swap("down")
+                elif msg.wParam == HOTKEY_SWAP_CONFIRM:
+                    exit_swap_mode()
+
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
