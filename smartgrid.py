@@ -439,11 +439,9 @@ def find_window_in_direction(from_hwnd, direction):
     fx1, fy1, fx2, fy2 = from_rect.left, from_rect.top, from_rect.right, from_rect.bottom
     fcx = (fx1 + fx2) // 2
     fcy = (fy1 + fy2) // 2
-    fw = fx2 - fx1
-    fh = fy2 - fy1
 
     best_hwnd = None
-    best_score = 0
+    best_distance = float('inf')  # We want the CLOSEST one
 
     for hwnd, (m, _, _) in grid_state.items():
         if hwnd == from_hwnd or m != mon_idx or not user32.IsWindow(hwnd):
@@ -456,38 +454,35 @@ def find_window_in_direction(from_hwnd, direction):
         x1, y1, x2, y2 = rect.left, rect.top, rect.right, rect.bottom
         cx = (x1 + x2) // 2
         cy = (y1 + y2) // 2
-        w = x2 - x1
-        h = y2 - y1
 
         dx = cx - fcx
         dy = cy - fcy
 
-        # Very strict thresholds to avoid diagonals and false positives
-        if direction == "up":
-            if dy >= -30: continue                     # must be clearly above
-            if abs(dx) > max(fw, w) * 0.7: continue     # reasonable horizontal alignment
-            score = -dy                                 # higher = better score
-        elif direction == "down":
-            if dy <= 30: continue
-            if abs(dx) > max(fw, w) * 0.7: continue
-            score = dy
-        elif direction == "left":
-            if dx >= -30: continue
-            if abs(dy) > max(fh, h) * 0.7: continue     # vertical alignment
-            score = -dx
-        elif direction == "right":
-            if dx <= 30: continue
-            if abs(dy) > max(fh, h) * 0.7: continue
-            score = dx
+        # --- STRICT DIRECTION ---
+        if direction == "right" and dx <= 30: continue
+        if direction == "left"  and dx >= -30: continue
+        if direction == "down"  and dy <= 30: continue
+        if direction == "up"    and dy >= -30: continue
+
+        # --- OVERLAP MINIMUM (pour éviter les diagonales) ---
+        overlap_x = max(0, min(fx2, x2) - max(fx1, x1))
+        overlap_y = max(0, min(fy2, y2) - max(fy1, y1))
+
+        if direction in ("left", "right"):
+            if overlap_y < 50: continue   # must be well aligned vertically
         else:
-            continue
+            if overlap_x < 50: continue   # must be well aligned horizontally
 
-        # the closer the window, the higher the score
-        distance = abs(dx) + abs(dy)
-        score = score * 1000 - distance
+        # --- EUCLIDEAN DISTANCE (the key: we take the CLOSEST one) ---
+        distance = (dx * dx) + (dy * dy)
 
-        if score > best_score:
-            best_score = score
+        # Bonus: more overlap = better (in case of equal distance)
+        alignment_bonus = (overlap_x if direction in ("up", "down") else overlap_y) * 10
+
+        score = distance - alignment_bonus  # we MINIMIZE this score
+
+        if score < best_distance:
+            best_distance = score
             best_hwnd = hwnd
 
     return best_hwnd
