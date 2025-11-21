@@ -8,23 +8,30 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 ## What It Actually Does Now
 
-- **True dynamic tiling**: every time you restore, minimize, open or close a window → **the layout instantly adapts** (1 → full, 2 → side-by-side, 3 → master+stack, 4 → 2×2, up to 5×3 grid)
-- **Zero manual re-tile needed** — it just *knows*
-- Dynamic SWAP mode: press `Ctrl+Alt+S` → select a window, navigate with arrow keys, press Enter to exchange positions instantly
-- Perfect green border that **always** follows the active window
-- Full multi-monitor cycling: `Ctrl+Alt+M` moves your entire living grid to the next monitor
-- Works with the most stubborn apps (Electron, UWP, WPF, acrylic, custom frames, etc.)
+- **True dynamic tiling** — open, close, minimize, restore → layout adapts **instantly**  
+  1 window → full screen  
+  2 → perfect side-by-side  
+  3 → master + stack  
+  4+ → intelligent grid (up to 5×3)
+- **Drag & Drop Snap** — Grab any tiled window by the title bar → drop it anywhere → **it snaps perfectly**  
+  → Works **across monitors**  
+  → Automatically **swaps** if target cell is occupied  
+  → **Zero hotkeys needed** — pure mouse bliss
+- **SWAP Mode** — `Ctrl+Alt+S` → red border → arrow keys → press Enter → instant position exchange
+- **Green border** that **always** follows the active window
+- **One-key multi-monitor cycling** — `Ctrl+Alt+M` → entire layout jumps to next monitor, perfectly resized
+- Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 
 ## Hotkeys
 
-| Shortcut            | Action                                              |
-|---------------------|-----------------------------------------------------|
-| `Ctrl + Alt + T`    | Toggle persistent tiling mode                       |
-| `Ctrl + Alt + R`    | One-shot re-tile of all visible windows             |
-| `Ctrl + Alt + M`    | Cycle all tiled windows to the next monitor         |
-| `Ctrl + Alt + S`    | Enter SWAP mode to exchange window positions        |
-|                     | (then use Arrow keys to navigate, Enter to swap)    |
-| `Ctrl + Alt + Q`    | Quit SmartGrid                                      |
+| Shortcut         | Action                                                                    |
+|:-----------------|---------------------------------------------------------------------------|
+| `Ctrl + Alt + T` | Toggle persistent tiling mode (on/off)                                    |
+| `Ctrl + Alt + R` | Force re-tile all visible windows now                                     |
+| `Ctrl + Alt + M` | Move all tiled windows to next monitor                                    |
+| `Ctrl + Alt + S` | Enter SWAP MODE (red border + arrow keys) to exchange window positions   |
+|                  | ↳ Use ← → ↑ ↓ to navigate, Enter or Ctrl+Alt+S to exit                    |
+| `Ctrl + Alt + Q` | Quit SmartGrid                                                            |
 
 > **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
 
@@ -35,6 +42,20 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 - From now on: restore a window, minimize one, open Firefox → layout updates **automatically**
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
+
+## Drag & Drop Snap Feature
+
+This is the one that makes people go **"wait… how?!"**
+
+1. You have 6 windows tiled  
+2. You grab **one** by the title bar  
+3. You drag it over another monitor, or over an empty cell, or over another window  
+4. You **drop**  
+→ **BAM**. It snaps perfectly.  
+→ If you dropped on another window → they **swap instantly**  
+→ If you dropped in empty space → it **moves** there  
+→ Works **across monitors**  
+→ No keys. No thinking. Pure flow.
 
 ## Multi-Monitor Workflow
 
@@ -64,8 +85,6 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 ## Why This Script Exists
 
 Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
-
-All in under 500 lines of clean, readable Python.
 
 ## Author
 
