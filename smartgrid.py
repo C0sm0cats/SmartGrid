@@ -950,7 +950,7 @@ def handle_snap_drop(source_hwnd, cursor_pos):
 
     # Get windows currently on this monitor
     wins_on_mon = [h for h, (m, _, _) in grid_state.items() if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
-    count_including_source = len(wins_on_mon) + 1  # car source_hwnd va arriver
+    count_including_source = len(wins_on_mon) + 1  # +1 for the window being dropped
     current_layout, current_info = choose_layout(count_including_source)
 
     # Use the actual layout (critical during drag-and-drop operations)
