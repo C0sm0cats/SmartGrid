@@ -286,6 +286,27 @@ def clear_all_borders():
 # ==============================================================================
 # smart_tile with intelligent layouts + your grid fallback
 # ==============================================================================
+def assign_grid_position(grid_dict, hwnd, monitor_idx, layout, info, index):
+    """
+    Assigns true grid coordinates (column, row) to a window.
+    Critical for perfect Drag & Drop Snap behavior — especially in master/stack layouts.
+    """
+    if layout == "full":
+        grid_dict[hwnd] = (monitor_idx, 0, 0)          # Full-screen → single cell
+    elif layout == "side_by_side":
+        col = 0 if index == 0 else 1
+        grid_dict[hwnd] = (monitor_idx, col, 0)        # Two equal columns side by side
+    elif layout == "master_stack":
+        if index == 0:
+            grid_dict[hwnd] = (monitor_idx, 0, 0)      # Master pane (left, full heigh)
+        elif index == 1:
+            grid_dict[hwnd] = (monitor_idx, 1, 0)      # Stack pane → top-right
+        elif index == 2:
+            grid_dict[hwnd] = (monitor_idx, 1, 1)      # Stack pane → bottom-right
+    else:  # grid
+        cols, rows = info
+        grid_dict[hwnd] = (monitor_idx, index % cols, index // cols) # Classic grid layout
+
 def smart_tile(temp=False):
     """Full retile: detect windows → choose layout → assign grid positions"""
     global grid_state
@@ -353,11 +374,7 @@ def smart_tile(temp=False):
         print(f"   -> {title[:60]}")
         time.sleep(0.04 + i * 0.006)
 
-        if layout == "grid":
-            cols = info[0]
-            new_grid[hwnd] = (0, i % cols, i // cols)
-        else:
-            new_grid[hwnd] = (0, i, 0)
+        assign_grid_position(new_grid, hwnd, 0, layout, info, i)
 
     grid_state = new_grid
 
@@ -423,7 +440,7 @@ def move_all_tiled_to_next_monitor():
         force_tile_resizable(hwnd, x, y, w, h)
         title = win32gui.GetWindowText(hwnd)
         print(f"   -> {title[:50]}")
-        new_grid[hwnd] = (CURRENT_MONITOR_INDEX, col, row)
+        assign_grid_position(new_grid, hwnd, CURRENT_MONITOR_INDEX, layout, info, i)
         time.sleep(0.03)
 
     grid_state = new_grid
@@ -787,7 +804,7 @@ def unregister_swap_hotkeys():
 # DRAG & DROP SNAP
 # ==============================================================================
 def apply_grid_state():
-    """Re-apply current grid positions without full recalculation (used by snap)"""
+    """Re-apply grid positions — FOR ALL LAYOUTS (full, side_by_side, master_stack, grid)"""
     global grid_state
     
     if not grid_state:
@@ -804,88 +821,76 @@ def apply_grid_state():
         return
     
     # Group windows by monitor
-    windows_by_monitor = {}
+    wins_by_mon = {}
     for hwnd, (mon_idx, col, row) in grid_state.items():
-        windows_by_monitor.setdefault(mon_idx, []).append((hwnd, col, row))
+        wins_by_mon.setdefault(mon_idx, []).append((hwnd, col, row))
     
-    for mon_idx, windows in windows_by_monitor.items():
+    for mon_idx, windows in wins_by_mon.items():
         if mon_idx >= len(monitors):
             continue
-        
         mon_x, mon_y, mon_w, mon_h = monitors[mon_idx]
         count = len(windows)
         layout, info = choose_layout(count)
         
-        # DYNAMIC GRID EXTENSION (critical for empty cells)
-        if layout == "grid":
-            max_col = max((c for _, c, _ in windows), default=0)
-            max_row = max((r for _, _, r in windows), default=0)
-            cols, rows = info
-            cols = max(cols, max_col + 1)
-            rows = max(rows, max_row + 1)
-            info = (cols, rows)
-        # ======================================================
-        
-        all_positions = []
+        # === CALCULATE PHYSICAL POSITIONS FOR THIS MONITOR ===
         if layout == "full":
-            x = mon_x + EDGE_PADDING
-            y = mon_y + EDGE_PADDING
-            w = mon_w - 2 * EDGE_PADDING
-            h = mon_h - 2 * EDGE_PADDING
-            all_positions = [(x, y, w, h)]
-        
+            positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                          mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
+            coord_list = [(0, 0)]
+            
         elif layout == "side_by_side":
             cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-            all_positions = [
+            positions = [
                 (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
                 (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)
             ]
-        
+            coord_list = [(0, 0), (1, 0)]
+            
         elif layout == "master_stack":
             mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
             sw = mon_w - 2*EDGE_PADDING - mw - GAP
             sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-            all_positions = [
-                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
-                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
-                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)
+            positions = [
+                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),           # master
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),                   # Stack pane → top-right
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)        # Stack pane → bottom-right
             ]
-        else:  # grid
-            cols, rows = info
+            coord_list = [(0, 0), (1, 0), (1, 1)]
+            
+        else:  # grid → use the exact (col, row) positions stored in grid_state
+            max_col = max((c for _, c, _ in windows), default=0)
+            max_row = max((r for _, _, r in windows), default=0)
+            cols = max(info[0], max_col + 1)
+            rows = max(info[1], max_row + 1)
+            
             total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
             total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
             cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
             cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
+            
+            positions = []
+            coord_list = []
             for r in range(rows):
                 for c in range(cols):
                     x = mon_x + EDGE_PADDING + c * (cell_w + GAP)
                     y = mon_y + EDGE_PADDING + r * (cell_h + GAP)
-                    all_positions.append((x, y, cell_w, cell_h))
+                    positions.append((x, y, cell_w, cell_h))
+                    coord_list.append((c, r))
         
-        # Mapping (col,row) → position
-        pos_map = {}
-        if layout == "grid":
-            idx = 0
-            for r in range(rows):
-                for c in range(cols):
-                    if idx < len(all_positions):
-                        pos_map[(c, r)] = all_positions[idx]
-                        idx += 1
-        else:
-            for i, pos in enumerate(all_positions):
-                pos_map[(i, 0)] = pos
+        # === APPLY POSITIONS TO WINDOWS ===
+        pos_dict = dict(zip(coord_list, positions))
         
-        # Apply positions
         for hwnd, col, row in windows:
             key = (col, row)
-            if key in pos_map:
-                x, y, w, h = pos_map[key]
+            if key in pos_dict:
+                x, y, w, h = pos_dict[key]
                 force_tile_resizable(hwnd, x, y, w, h)
-                time.sleep(0.02)
+                time.sleep(0.015)
     
-    time.sleep(0.1)
+    # Apply green border to the active window
+    time.sleep(0.08)
     active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active):
+    if active and user32.IsWindowVisible(active) and active in grid_state:
         apply_border(active)
 
 def is_window_maximized(hwnd):
@@ -943,42 +948,48 @@ def handle_snap_drop(source_hwnd, cursor_pos):
 
     mon_x, mon_y, mon_w, mon_h = monitors[target_mon_idx]
 
-    # Count windows on target monitor
-    wins_on_mon = [h for h, (m, _, _) in grid_state.items() if m == target_mon_idx and user32.IsWindow(h)]
-    count = len(wins_on_mon)
-    layout, info = choose_layout(count)
+    # Get windows currently on this monitor
+    wins_on_mon = [h for h, (m, _, _) in grid_state.items() if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
+    count_including_source = len(wins_on_mon) + 1  # car source_hwnd va arriver
+    current_layout, current_info = choose_layout(count_including_source)
 
-    # Determine target cell
+    # Use the actual layout (critical during drag-and-drop operations)
     target_col = target_row = 0
 
-    if layout == "grid" and info:
-        cols, rows = info
+    if current_layout == "master_stack":
+        # Master pane = 3/5 of width
+        master_width = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+        master_right = mon_x + EDGE_PADDING + master_width + GAP//2
 
-        # Dynamic grid extension for empty cells
+        if cx < master_right:
+            target_col, target_row = 0, 0
+        else:
+            # Stack (right)
+            mid_y = mon_y + mon_h // 2
+            target_col = 1
+            target_row = 0 if cy < mid_y else 1
+
+    elif current_layout == "side_by_side":
+        target_col = 0 if cx < mon_x + mon_w // 2 else 1
+        target_row = 0
+
+    elif current_layout == "full":
+        target_col, target_row = 0, 0
+
+    else:  # grid → extend dynamically to preserve existing window positions
+        cols, rows = current_info if current_info else (2, 2)
         max_c = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
         max_r = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
         cols = max(cols, max_c + 1)
         rows = max(rows, max_r + 1)
 
-        total_gw = GAP * (cols - 1) if cols > 1 else 0
-        total_gh = GAP * (rows - 1) if rows > 1 else 0
-        cell_w = (mon_w - 2 * EDGE_PADDING - total_gw) // cols
-        cell_h = (mon_h - 2 * EDGE_PADDING - total_gh) // rows
+        cell_w = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
+        cell_h = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
 
         rel_x = cx - mon_x - EDGE_PADDING
         rel_y = cy - mon_y - EDGE_PADDING
-        target_col = min(max(0, int(rel_x // (cell_w + GAP))), cols - 1)
-        target_row = min(max(0, int(rel_y // (cell_h + GAP))), rows - 1)
-
-    elif layout == "side_by_side":
-        target_col = 1 if cx > mon_x + mon_w // 2 else 0
-    elif layout == "master_stack":
-        master_end = mon_x + EDGE_PADDING + (mon_w - 2 * EDGE_PADDING - GAP) * 3 // 5
-        if cx < master_end:
-            target_col, target_row = 0, 0
-        else:
-            target_col = 1
-            target_row = 1 if cy > mon_y + mon_h // 2 else 0
+        target_col = min(max(0, rel_x // (cell_w + GAP)), cols - 1)
+        target_row = min(max(0, rel_y // (cell_h + GAP)), rows - 1)
 
     old_pos = grid_state[source_hwnd]
     new_pos = (target_mon_idx, target_col, target_row)
@@ -986,7 +997,7 @@ def handle_snap_drop(source_hwnd, cursor_pos):
     if old_pos == new_pos:
         return
 
-    # Check if target cell is occupied
+    # Find if the target cell is occupied
     target_hwnd = None
     for h, pos in grid_state.items():
         if pos == new_pos and h != source_hwnd and user32.IsWindow(h):
@@ -998,10 +1009,9 @@ def handle_snap_drop(source_hwnd, cursor_pos):
         grid_state[source_hwnd] = new_pos
         grid_state[target_hwnd] = old_pos
     else:
-        print(f"[SNAP] MOVE to cell ({target_col},{target_row})")
+        print(f"[SNAP] MOVE to cell ({target_col},{target_row}) on monitor {target_mon_idx+1}")
         grid_state[source_hwnd] = new_pos
 
-    # Re-apply layout without full retile
     apply_grid_state()
 
 if __name__ == "__main__":
