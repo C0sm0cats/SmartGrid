@@ -1,12 +1,16 @@
 # pip install pywin32
+# pip install pystray
 
+import os
 import ctypes
+from ctypes import wintypes
 import time
 import threading
-from ctypes import wintypes
 import win32con
 import win32gui
 import win32api
+from pystray import Icon, Menu, MenuItem
+from PIL import Image, ImageDraw
 
 # ==============================================================================
 # Constants & config
@@ -77,6 +81,17 @@ swap_mode           = False   # Swap mode active?
 
 # Background threads
 monitor_thread        = None  # Thread running the main auto-retile + border monitor
+
+# Global overlay window
+overlay_hwnd = None
+preview_rect = None  # (x, y, w, h) of preview rectangle
+
+# Global systray icon
+tray_icon = None
+
+# Custom Windows message sent from the systray thread to the main thread
+# (used to trigger swap mode toggle safely in the message loop thread)
+CUSTOM_TOGGLE_SWAP = 0x9000
 
 # ==============================================================================
 # Workspace System
@@ -198,6 +213,7 @@ def is_useful_window(title, class_name=""):
         "multitaskingviewframe",           # Win+Tab
         "taskswitcherwnd",                 # Alt+Tab
         "xamlexplorerhostislandwindow",    # Alt+Tab / Win11 timeline
+        "#32770",                          # MessageBox dialog class
     ]
 
     if class_lower in bad_classes:
@@ -680,11 +696,14 @@ def enter_swap_mode():
     print("━" * 60)
     print("  DIRECT SWAP with arrow keys:")
     print("    ← → ↑ ↓  : Swap with adjacent window")
+    print("    Enter     : Confirm selection")
     print("    Ctrl+Alt+S : Exit swap mode")
     print("  ")
     print("  The red window FOLLOWS your movements and swaps its position!")
     print("━" * 60)
     register_swap_hotkeys()
+    # ✅ Refresh tray menu
+    update_tray_menu()
 
 def navigate_swap(direction):
     """Handle arrow key press in swap mode → find and swap with adjacent window"""
@@ -768,6 +787,8 @@ def exit_swap_mode():
         print(f"[SWAP MODE] Green border restored on active window")
     
     print("[SWAP MODE] ✓ Deactivated\n")
+    # ✅ Refresh tray menu
+    update_tray_menu()
 
 # ==============================================================================
 # Polling monitor - Auto-retile when windows are shown/hidden/minimized/restored
@@ -816,7 +837,7 @@ def monitor():
         time.sleep(0.35)
 
 # ==============================================================================
-# Hotkeys & main loop
+# Toggle Persistent Auto-Tiling
 # ==============================================================================
 def toggle_persistent():
     """Toggle persistent auto-tiling mode on/off"""
@@ -825,7 +846,12 @@ def toggle_persistent():
     print(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
     if is_active:
         smart_tile(temp=False)
+    # ✅ Refresh tray menu
+    update_tray_menu()
 
+# ==============================================================================
+# Hotkeys (Register / Unregister)
+# ==============================================================================
 def register_hotkeys():
     """Register global hotkeys: Ctrl+Alt+T/R/Q/M/S for main features""" 
     user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
@@ -1114,11 +1140,6 @@ class PAINTSTRUCT(ctypes.Structure):
         ("fIncUpdate", wintypes.BOOL),
         ("rgbReserved", ctypes.c_char * 32)
     ]
-
-# Global overlay window
-overlay_hwnd = None
-preview_rect = None  # (x, y, w, h) of preview rectangle
-
 def create_overlay_window():
     """Create transparent overlay window for snap preview"""
     global overlay_hwnd
@@ -1462,8 +1483,128 @@ def ws_switch(ws_idx):
     print(f"[WS] ✓ Switched to workspace {ws_idx+1}")
 
 # ==============================================================================
+# SYSTEM TRAY ICON
+# ==============================================================================
+def create_icon_image():
+    """Create SmartGrid icon (green square with white grid)"""
+    width = 64
+    height = 64
+    # Green background
+    image = Image.new('RGB', (width, height), (0, 180, 0))
+    dc = ImageDraw.Draw(image)
+    
+    # White border
+    dc.rectangle((4, 4, width-4, height-4), outline=(255, 255, 255), width=4)
+    
+    # Grid pattern (2x2)
+    mid_x = width // 2
+    mid_y = height // 2
+    dc.line((mid_x, 12, mid_x, height-12), fill=(255, 255, 255), width=3)
+    dc.line((12, mid_y, width-12, mid_y), fill=(255, 255, 255), width=3)
+    
+    return image
+
+def update_tray_menu():
+    """Update tray icon menu (refresh checkmarks)"""
+    global tray_icon
+    if tray_icon:
+        tray_icon.menu = create_tray_menu()
+        tray_icon.update_menu()
+
+def create_tray_menu():
+    """Create the context menu structure"""
+    return Menu(
+        MenuItem(
+            f"Tiling: {'ON' if is_active else 'OFF'}", 
+            lambda: (toggle_persistent(), update_tray_menu()),
+            checked=lambda item: is_active
+        ),
+        Menu.SEPARATOR,
+        MenuItem('Workspaces', Menu(
+            MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: ws_switch(0)),
+            MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)', lambda: ws_switch(1)),
+            MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)', lambda: ws_switch(2)),
+        )),
+        Menu.SEPARATOR,
+        MenuItem('Force Re-tile All Windows (Ctrl+Alt+R)', lambda: threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()),
+        MenuItem(
+            f"Swap Mode: {'ON' if swap_mode else 'OFF'} (Ctrl+Alt+S)",
+            lambda: user32.PostThreadMessageW(main_thread_id, CUSTOM_TOGGLE_SWAP, 0, 0),
+            checked=lambda item: swap_mode
+        ),
+        MenuItem('Move Workspace to Next Monitor (Ctrl+Alt+M)', lambda: threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()),
+        Menu.SEPARATOR,
+        #MenuItem('Hotkeys Cheatsheet', show_hotkeys_tooltip),
+        MenuItem('Hotkeys Cheatsheet', lambda: threading.Thread(target=show_hotkeys_tooltip, daemon=True).start()),
+        MenuItem('Quit SmartGrid (Ctrl+Alt+Q)', on_quit_from_tray)
+    )
+
+def on_quit_from_tray(icon, item):
+    """Quit from systray menu"""
+    global tray_icon
+    print("[TRAY] Quit requested from systray")
+    
+    # Stop the tray icon first
+    if tray_icon:
+        tray_icon.stop()
+    
+    # Clean up borders
+    if current_hwnd:
+        remove_border(current_hwnd)
+    clear_all_borders()
+    
+    # Unregister hotkeys
+    unregister_hotkeys()
+    
+    # Force exit the entire process
+    print("[EXIT] SmartGrid stopped.")
+    os._exit(0)  # ✅ Force exit (kills all threads)
+
+def show_hotkeys_tooltip():
+    """Show a notification with hotkeys"""
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "---------- MAIN HOTKEYS\n\n"
+        "Ctrl+Alt+T  →  Toggle tiling ON/OFF\n"
+        "Ctrl+Alt+R  →  Force re-tile all windows\n"
+        "Ctrl+Alt+S  →  Enter Swap Mode\n"
+        "Ctrl+Alt+M  →  Move workspace to next monitor\n\n"
+        "---------- WORKSPACES\n\n"
+        "Ctrl+Alt+1/2/3  →  Switch workspace\n\n"
+        "---------- DRAG & DROP\n\n"
+        "Drag any window by title bar → snap anywhere!\n"
+        "Blue preview shows where it will snap.\n\n"
+        "---------- EXIT\n\n"
+        "Ctrl+Alt+Q  →  Quit",
+        "SmartGrid Hotkeys",
+        0x40  # MB_ICONINFORMATION
+    )
+
+def toggle_swap_mode_from_tray():
+    """Toggle swap mode and show notification"""
+    if swap_mode:
+        exit_swap_mode()
+    else:
+        enter_swap_mode()
+
+    # ✅ Refresh tray menu after toggle
+    update_tray_menu()
+
+def start_systray():
+    """Start the system tray icon"""
+    global tray_icon
+    tray_icon = Icon(
+        "SmartGrid",
+        create_icon_image(),
+        "SmartGrid - Tiling Window Manager",
+        create_tray_menu()
+    )
+    tray_icon.run()
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
+main_thread_id = win32api.GetCurrentThreadId()
 if __name__ == "__main__":
     print("="*70)
     print("   SMARTGRID - Intelligent layouts + green border + SWAP MODE")
@@ -1471,8 +1612,8 @@ if __name__ == "__main__":
     print("Ctrl + Alt + T     → Toggle persistent tiling mode (on/off)")
     print("Ctrl + Alt + R     → Force re-tile all visible windows now")
     print("Ctrl + Alt + M     → Move current workspace to next monitor (merges if target workspace has windows)")
-    print("Ctrl + Alt + S     → Enter SWAP MODE (red border + arrow keys) to exchange window positions")
-    print("                     ↳ Use ← → ↑ ↓ to navigate, Enter or Ctrl+Alt+S to exit")
+    print("Ctrl + Alt + S     → Enter Swap Mode (red border + arrow keys) to exchange window positions")
+    print("                     ↳ Use ← → ↑ ↓ to swap with adjacent window, Enter to confirm")
     print("")
     print("WORKSPACES         → Ctrl + Alt + 1/2/3 to switch workspace")
     print("                     ↳ Each monitor has 3 independent workspaces")
@@ -1480,6 +1621,8 @@ if __name__ == "__main__":
     print("DRAG & DROP SNAP   → Grab any tiled window by title bar")
     print("                     ↳ Drop it anywhere → it snaps perfectly (swap or move)")
     print("                     ↳ Works even across monitors!")
+    print("")
+    print("SYSTEM TRAY        → Right-click tray icon for quick access")
     print("")
     print("Ctrl + Alt + Q     → Quit SmartGrid")
     print("-"*70)
@@ -1505,6 +1648,9 @@ if __name__ == "__main__":
 
     threading.Thread(target=start_drag_snap_monitor, daemon=True).start()
     # → Real-time drag detection: enables snap on drop (with swap/move)
+
+    threading.Thread(target=start_systray, daemon=True).start()
+    # → System tray icon with context menu
     # ------------------------------------------------------------------------
     register_hotkeys()
 
@@ -1541,12 +1687,19 @@ if __name__ == "__main__":
                 ws_switch(1)
             elif msg.wParam == HOTKEY_WS3:
                     ws_switch(2)
+        elif msg.message == CUSTOM_TOGGLE_SWAP:
+            toggle_swap_mode_from_tray()
 
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
     if current_hwnd:
         remove_border(current_hwnd)
-    clear_all_borders()    
+    clear_all_borders()
+
+    # Stop systray icon
+    if tray_icon:
+        tray_icon.stop()
+
     unregister_hotkeys()
     print("[EXIT] SmartGrid stopped.")

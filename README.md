@@ -37,7 +37,14 @@ No config. No bullshit. Just press one key and live in perfect harmony.
   → Other workspaces stay intact  
   → Merges smoothly if target workspace has windows
 - Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
-
+- **System Tray Icon + Menu**
+  → Quick access to :
+    → Toggle tiling ON/OFF  
+    → Switch workspaces (1/2/3)  
+    → Force re-tile all windows  
+    → Toggle Swap Mode ON/OFF  
+    → Move workspace to next monitor  
+    → Quick access to hotkeys cheatsheet and quit
 ## Hotkeys
 
 | Shortcut         | Action                                                                    |
@@ -45,8 +52,8 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 | `Ctrl + Alt + T` | Toggle persistent tiling mode (on/off)                                    |
 | `Ctrl + Alt + R` | Force re-tile all visible windows now                                     |
 | `Ctrl + Alt + M` | Move current workspace to next monitor                                    |
-| `Ctrl + Alt + S` | Enter SWAP MODE (red border + arrow keys) to exchange window positions   |
-|                  | ↳ Use ← → ↑ ↓ to navigate, Enter or Ctrl+Alt+S to exit                    |
+| `Ctrl + Alt + S` | Enter Swap Mode (red border + arrow keys) to exchange window positions    |
+|                  | ↳ Use ← → ↑ ↓ to swap with adjacent window, Enter to confirm             |
 | `Ctrl + Alt + 1` | Switch to workspace 1 (current monitor)                                   |
 | `Ctrl + Alt + 2` | Switch to workspace 2 (current monitor)                                   |
 | `Ctrl + Alt + 3` | Switch to workspace 3 (current monitor)                                   |
@@ -121,14 +128,14 @@ This is the one that makes people go **"wait… how?!"**
 
 - Windows 10 / 11 (64-bit)
 - Python 3.9+
-- `pip install pywin32`
+- `pywin32` and `pystray` Python package
 
 ## Install & Run
 
 ```bash
 git clone https://github.com/yourusername/smartgrid.git
 cd smartgrid
-pip install pywin32
+python -m pip install pywin32 pystray
 python smartgrid.py
 ```
 
