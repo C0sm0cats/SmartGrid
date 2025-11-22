@@ -81,7 +81,6 @@ monitor_thread        = None  # Thread running the main auto-retile + border mon
 # ==============================================================================
 # Workspace System
 # ==============================================================================
-
 def init_workspaces():
     """Initialize workspace structure based on detected monitors"""
     monitors = get_monitors()
