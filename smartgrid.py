@@ -13,7 +13,7 @@ import win32api
 # ==============================================================================
 # Win32 API
 user32 = ctypes.WinDLL('user32', use_last_error=True)   # Main Windows API
-dwmapi = ctypes.WinDLL('dwmapi')                         # Desktop Window Manager (for colored borders)
+dwmapi = ctypes.WinDLL('dwmapi')  # Desktop Window Manager (for colored borders)
 
 # Cached monitor work areas
 MONITORS_CACHE = []
@@ -26,32 +26,6 @@ EDGE_PADDING = 8      # Margin from screen edges
 DWMWA_BORDER_COLOR          = 34
 DWMWA_COLOR_NONE            = 0xFFFFFFFF
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
-
-# Application state
-current_hwnd         = None   # Window with green border (active)
-selected_hwnd        = None   # Window with red border (swap mode)
-CURRENT_MONITOR_INDEX = 0     # Target monitor when cycling with Ctrl+Alt+M
-
-# Background threads
-monitor_thread        = None  # Thread running the main auto-retile + border monitor
-
-# Runtime state
-grid_state          = {}      # hwnd → (monitor_idx, col, row)
-last_visible_count  = 0
-is_active           = False   # Persistent tiling enabled?
-swap_mode           = False   # Swap mode active?
-
-# Hotkey identifiers
-HOTKEY_TOGGLE = 9001
-HOTKEY_RETILE = 9002
-HOTKEY_QUIT = 9003
-HOTKEY_MOVE_MONITOR = 9004
-HOTKEY_SWAP_MODE = 9005
-HOTKEY_SWAP_LEFT = 9006
-HOTKEY_SWAP_RIGHT = 9007
-HOTKEY_SWAP_UP = 9008
-HOTKEY_SWAP_DOWN = 9009
-HOTKEY_SWAP_CONFIRM = 9010
 
 # Win32 window styles & flags
 GWL_STYLE = -16
@@ -69,6 +43,55 @@ SWP_NOSIZE        = 0x0001  # Don't change size
 SWP_NOACTIVATE    = 0x0010  # Don't activate the window
 SWP_FRAMECHANGED  = 0x0020  # Force WM_NCCALCSIZE recalculation (border refresh)
 SWP_NOSENDCHANGING = 0x0400 # Prevent WM_WINDOWPOSCHANGING (avoids conflicts)
+
+# Hotkey identifiers
+HOTKEY_TOGGLE = 9001
+HOTKEY_RETILE = 9002
+HOTKEY_QUIT = 9003
+HOTKEY_MOVE_MONITOR = 9004
+HOTKEY_SWAP_MODE = 9005
+HOTKEY_SWAP_LEFT = 9006
+HOTKEY_SWAP_RIGHT = 9007
+HOTKEY_SWAP_UP = 9008
+HOTKEY_SWAP_DOWN = 9009
+HOTKEY_SWAP_CONFIRM = 9010
+HOTKEY_WS1 = 9101
+HOTKEY_WS2 = 9102
+HOTKEY_WS3 = 9103
+
+# ==============================================================================
+# Application State
+# ==============================================================================
+# Window tracking
+current_hwnd         = None   # Window with green border (active)
+selected_hwnd        = None   # Window with red border (swap mode)
+grid_state          = {}      # hwnd → (monitor_idx, col, row)
+
+# Monitor state
+CURRENT_MONITOR_INDEX = 0     # Target monitor when cycling with Ctrl+Alt+M
+
+# Runtime flags
+last_visible_count  = 0
+is_active           = False   # Persistent tiling enabled?
+swap_mode           = False   # Swap mode active?
+
+# Background threads
+monitor_thread        = None  # Thread running the main auto-retile + border monitor
+
+# ==============================================================================
+# Workspace System
+# ==============================================================================
+
+def init_workspaces():
+    """Initialize workspace structure based on detected monitors"""
+    monitors = get_monitors()
+    ws = {}
+    for i in range(len(monitors)):
+        ws[i] = [{}, {}, {}]  # 3 workspaces per monitor
+    return ws
+
+workspaces = {}  # Will be initialized after monitor detection
+current_workspace = {}  # monitor_index → current ws index
 # ==============================================================================
 
 def remove_border(hwnd):
@@ -386,25 +409,45 @@ def smart_tile(temp=False):
 # ==============================================================================
 # Multi-monitor
 # ==============================================================================
-def move_all_tiled_to_next_monitor():
-    """Cycle every tiled window to the next physical monitor"""
-    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE
+def move_current_workspace_to_next_monitor():
+    """Move ONLY the current workspace to the next monitor (workspace-aware)"""
+    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace
+    
     if not grid_state:
-        print("[SWITCH] Nothing to move - no windows in grid")
+        print("[MOVE] Nothing to move - no windows in grid")
         return
     if len(MONITORS_CACHE) <= 1:
-        print("[SWITCH] Only one monitor detected")
+        print("[MOVE] Only one monitor detected")
         return
 
+    # Save current workspace before moving
+    old_mon = CURRENT_MONITOR_INDEX
+    old_ws = current_workspace.get(old_mon, 0)
+    save_workspace(old_mon)
+
+    # Calculate target monitor
+    new_mon = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
+    CURRENT_MONITOR_INDEX = new_mon
+    
+    mon = MONITORS_CACHE[new_mon]
+    mon_x, mon_y, mon_w, mon_h = mon
+    
+    # Get windows from current workspace on OLD monitor only
+    windows_to_move = [(hwnd, pos) for hwnd, pos in grid_state.items() 
+                       if pos[0] == old_mon and user32.IsWindow(hwnd)]
+    
+    if not windows_to_move:
+        print(f"[MOVE] No windows to move from monitor {old_mon+1}")
+        return
+    
+    count = len(windows_to_move)
+    layout, info = choose_layout(count)
+
+    # Clear borders before move
     clear_all_borders()
     time.sleep(0.05)
 
-    CURRENT_MONITOR_INDEX = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
-    mon = MONITORS_CACHE[CURRENT_MONITOR_INDEX]
-    mon_x, mon_y, mon_w, mon_h = mon
-    count = len(grid_state)
-    layout, info = choose_layout(count)
-
+    # Calculate new positions on target monitor
     positions = []
     if layout == "full":
         positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
@@ -432,23 +475,32 @@ def move_all_tiled_to_next_monitor():
                 positions.append((mon_x + EDGE_PADDING + c*(cell_w+GAP),
                                   mon_y + EDGE_PADDING + r*(cell_h+GAP), cell_w, cell_h))
 
+    # Move windows to new monitor
     new_grid = {}
-    for i, (hwnd, (old_idx, col, row)) in enumerate(grid_state.items()):
-        if not user32.IsWindow(hwnd):
-            continue
+    print(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
+    for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
         x, y, w, h = positions[i]
         force_tile_resizable(hwnd, x, y, w, h)
+        assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
         title = win32gui.GetWindowText(hwnd)
         print(f"   -> {title[:50]}")
-        assign_grid_position(new_grid, hwnd, CURRENT_MONITOR_INDEX, layout, info, i)
         time.sleep(0.03)
 
-    grid_state = new_grid
+    # Update grid_state (remove old entries, add new ones)
+    for hwnd, _ in windows_to_move:
+        grid_state.pop(hwnd, None)
+    grid_state.update(new_grid)
+
     time.sleep(0.15)
     active = user32.GetForegroundWindow()
     if active and user32.IsWindowVisible(active):
         apply_border(active)
-    print(f"[SWITCH] {len(new_grid)} windows moved to monitor {CURRENT_MONITOR_INDEX + 1}")
+    
+    # Save to workspace on new monitor (same workspace number)
+    current_workspace[new_mon] = old_ws
+    save_workspace(new_mon)
+    
+    print(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
 
 # ==============================================================================
 # SWAP MODE
@@ -776,11 +828,14 @@ def register_hotkeys():
     user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
     user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
     user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
+    user32.RegisterHotKey(None, HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1'))
+    user32.RegisterHotKey(None, HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2'))
+    user32.RegisterHotKey(None, HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3'))
 
 def unregister_hotkeys():
     """Unregister all main global hotkeys (cleanup on exit)"""
     for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
-               HOTKEY_SWAP_MODE):
+               HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3):
         try: user32.UnregisterHotKey(None, hk)
         except: pass
 
@@ -1014,15 +1069,153 @@ def handle_snap_drop(source_hwnd, cursor_pos):
 
     apply_grid_state()
 
+def save_workspace(monitor_idx):
+    """Save current window layout to workspace (with grid positions!)"""
+    global workspaces, grid_state
+
+    if monitor_idx not in workspaces:
+        return
+    
+    ws = current_workspace[monitor_idx]
+    workspaces[monitor_idx][ws] = {}
+
+    for hwnd, (mon, col, row) in grid_state.items():
+        if mon != monitor_idx or not user32.IsWindow(hwnd):
+            continue
+
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            continue
+
+        # ✅ Get frame borders to calculate TRUE client area
+        lb, tb, rb, bb = get_frame_borders(hwnd)
+        
+        # ✅ Save position WITHOUT invisible borders (pure client area)
+        x = rect.left + lb
+        y = rect.top + tb
+        w = rect.right - rect.left - lb - rb
+        h = rect.bottom - rect.top - tb - bb
+
+        # Save both physical position AND grid coordinates
+        workspaces[monitor_idx][ws][hwnd] = {
+            'pos': (x, y, w, h),  # ✅ Clean dimensions
+            'grid': (col, row)
+        }
+
+    print(f"[WS] ✓ Workspace {ws+1} saved on monitor {monitor_idx+1} ({len(workspaces[monitor_idx][ws])} windows)")
+
+def load_workspace(monitor_idx, ws_idx):
+    """Restore workspace layout - handles dead/minimized windows gracefully"""
+    global grid_state, workspaces
+
+    if monitor_idx not in workspaces or ws_idx >= len(workspaces[monitor_idx]):
+        return
+
+    layout = workspaces[monitor_idx][ws_idx]
+    
+    if not layout:
+        print(f"[WS] Workspace {ws_idx+1} is empty")
+        return
+    
+    print(f"[WS] Loading workspace {ws_idx+1} for monitor {monitor_idx+1}...")
+    restored = 0
+
+    for hwnd, data in layout.items():
+        # Skip dead windows
+        if not user32.IsWindow(hwnd):
+            continue
+
+        x, y, w, h = data['pos']
+        col, row = data['grid']
+
+        # Restore minimized windows
+        if win32gui.IsIconic(hwnd):
+            user32.ShowWindowAsync(hwnd, SW_RESTORE)
+            time.sleep(0.08)
+
+        # Restore hidden windows
+        if not user32.IsWindowVisible(hwnd):
+            user32.ShowWindowAsync(hwnd, SW_SHOWNORMAL)
+            time.sleep(0.08)
+
+        # Reposition window
+        force_tile_resizable(hwnd, x, y, w, h)
+        
+        # Restore grid position
+        grid_state[hwnd] = (monitor_idx, col, row)
+        
+        restored += 1
+        time.sleep(0.04)
+
+    time.sleep(0.15)
+    
+    # Apply green border to active window
+    active = user32.GetForegroundWindow()
+    if active and user32.IsWindowVisible(active) and active in grid_state:
+        apply_border(active)
+    
+    print(f"[WS] ✓ Restored {restored}/{len(layout)} windows")
+
+def ws_switch(ws_idx):
+    """Switch to another workspace (smooth transition)"""
+    global current_workspace, grid_state, is_active, last_visible_count
+    
+    mon = CURRENT_MONITOR_INDEX
+
+    if mon not in workspaces:
+        print(f"[WS] ✗ Monitor {mon} not initialized")
+        return
+
+    if ws_idx == current_workspace.get(mon, 0):
+        print(f"[WS] Already on workspace {ws_idx+1}")
+        return
+
+    # ✅ FREEZE AUTO-RETILE during workspace switch
+    was_active = is_active
+    is_active = False
+    
+    # 1) Save current workspace
+    save_workspace(mon)
+
+    # 2) Hide windows from current workspace (smooth - no minimize animation)
+    hidden = 0
+    for hwnd, (mon_idx, col, row) in list(grid_state.items()):
+        if mon_idx == mon and user32.IsWindow(hwnd):
+            user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
+            del grid_state[hwnd]
+            hidden += 1
+    
+    print(f"[WS] Hidden {hidden} windows from workspace {current_workspace.get(mon, 0)+1}")
+
+    # 3) Update current workspace index
+    current_workspace[mon] = ws_idx
+
+    # 4) Load new workspace
+    time.sleep(0.1)
+    load_workspace(mon, ws_idx)
+    
+    # ✅ UPDATE last_visible_count to prevent immediate re-tile
+    visible_windows = get_visible_windows()
+    last_visible_count = len(visible_windows)
+    
+    # ✅ RESTORE AUTO-RETILE state
+    time.sleep(0.2)  # Let windows settle
+    is_active = was_active
+    
+    print(f"[WS] ✓ Switched to workspace {ws_idx+1}")
+
 if __name__ == "__main__":
     print("="*70)
     print("   SMARTGRID - Intelligent layouts + green border + SWAP MODE")
     print("="*70)
     print("Ctrl + Alt + T     → Toggle persistent tiling mode (on/off)")
     print("Ctrl + Alt + R     → Force re-tile all visible windows now")
-    print("Ctrl + Alt + M     → Move all tiled windows to next monitor")
+    print("Ctrl + Alt + M     → Move current workspace to next monitor (merges if target workspace has windows)")
     print("Ctrl + Alt + S     → Enter SWAP MODE (red border + arrow keys) to exchange window positions")
     print("                     ↳ Use ← → ↑ ↓ to navigate, Enter or Ctrl+Alt+S to exit")
+    print("")
+    print("WORKSPACES         → Ctrl + Alt + 1/2/3 to switch workspace")
+    print("                     ↳ Each monitor has 3 independent workspaces")
     print("")
     print("DRAG & DROP SNAP   → Grab any tiled window by title bar")
     print("                     ↳ Drop it anywhere → it snaps perfectly (swap or move)")
@@ -1034,6 +1227,18 @@ if __name__ == "__main__":
     clear_all_borders()
     time.sleep(0.05)
 
+    # Initialize monitors and workspaces
+    monitors = get_monitors()
+    print(f"Detected {len(monitors)} monitor(s)")
+    
+    # Initialize workspace structure dynamically
+    workspaces = init_workspaces()
+    current_workspace = {i: 0 for i in range(len(monitors))}
+    print(f"Initialized {len(monitors)} × 3 workspaces")
+    
+    if len(monitors) > 1:
+        print("Ctrl+Alt+M -> cycle tiled windows across monitors")
+
     # Background services ----------------------------------------------------
     threading.Thread(target=monitor, daemon=True).start()
     # → Watches for new/minimized/restored windows, auto-retiles, manages green border
@@ -1043,11 +1248,6 @@ if __name__ == "__main__":
     # ------------------------------------------------------------------------
     register_hotkeys()
 
-    monitors = get_monitors()
-    print(f"Detected {len(monitors)} monitor(s)")
-    if len(monitors) > 1:
-        print("Ctrl+Alt+M -> cycle tiled windows across monitors")
-
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
         if msg.message == win32con.WM_HOTKEY:
@@ -1056,7 +1256,7 @@ if __name__ == "__main__":
             elif msg.wParam == HOTKEY_RETILE:
                 threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()
             elif msg.wParam == HOTKEY_MOVE_MONITOR:
-                threading.Thread(target=move_all_tiled_to_next_monitor, daemon=True).start()
+                threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()
             elif msg.wParam == HOTKEY_QUIT:
                 break
             elif msg.wParam == HOTKEY_SWAP_MODE:
@@ -1075,6 +1275,12 @@ if __name__ == "__main__":
                     navigate_swap("down")
                 elif msg.wParam == HOTKEY_SWAP_CONFIRM:
                     exit_swap_mode()
+            elif msg.wParam == HOTKEY_WS1:
+                ws_switch(0)
+            elif msg.wParam == HOTKEY_WS2:
+                ws_switch(1)
+            elif msg.wParam == HOTKEY_WS3:
+                    ws_switch(2)
 
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))

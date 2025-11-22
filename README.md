@@ -13,13 +13,23 @@ No config. No bullshit. Just press one key and live in perfect harmony.
   2 → perfect side-by-side  
   3 → master + stack  
   4+ → intelligent grid (up to 5×3)
+- **Workspaces per monitor** — 3 independent workspaces on each screen  
+  → Switch instantly with `Ctrl+Alt+1/2/3`  
+  → Each workspace remembers its layout **perfectly** (position + grid coords)  
+  → Hidden windows restore automatically (even from taskbar)  
+  → Smooth transitions with **zero flickering**
 - **Drag & Drop Snap** — Grab any tiled window by the title bar → drop it anywhere → **it snaps perfectly**  
   → Works **across monitors**  
   → Automatically **swaps** if target cell is occupied  
   → **Zero hotkeys needed** — pure mouse bliss
-- **SWAP Mode** — `Ctrl+Alt+S` → red border → arrow keys → press Enter → instant position exchange
+- **SWAP Mode** — `Ctrl+Alt+S` → red border → arrow keys → **direct swap** with adjacent windows
+  → Navigate with ← → ↑ ↓  
+  → The red window **follows your movements**  
+  → Press Enter or `Ctrl+Alt+S` to exit
 - **Green border** that **always** follows the active window
-- **One-key multi-monitor cycling** — `Ctrl+Alt+M` → entire layout jumps to next monitor, perfectly resized
+- **Workspace-aware monitor cycling** — `Ctrl+Alt+M` → current workspace jumps to next monitor  
+  → Other workspaces stay intact  
+  → Merges smoothly if target workspace has windows
 - Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 
 ## Hotkeys
@@ -28,9 +38,12 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 |:-----------------|---------------------------------------------------------------------------|
 | `Ctrl + Alt + T` | Toggle persistent tiling mode (on/off)                                    |
 | `Ctrl + Alt + R` | Force re-tile all visible windows now                                     |
-| `Ctrl + Alt + M` | Move all tiled windows to next monitor                                    |
+| `Ctrl + Alt + M` | Move current workspace to next monitor                                    |
 | `Ctrl + Alt + S` | Enter SWAP MODE (red border + arrow keys) to exchange window positions   |
 |                  | ↳ Use ← → ↑ ↓ to navigate, Enter or Ctrl+Alt+S to exit                    |
+| `Ctrl + Alt + 1` | Switch to workspace 1 (current monitor)                                   |
+| `Ctrl + Alt + 2` | Switch to workspace 2 (current monitor)                                   |
+| `Ctrl + Alt + 3` | Switch to workspace 3 (current monitor)                                   |
 | `Ctrl + Alt + Q` | Quit SmartGrid                                                            |
 
 > **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
@@ -42,6 +55,33 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 - From now on: restore a window, minimize one, open Firefox → layout updates **automatically**
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
+
+## Workspace System
+
+SmartGrid gives you **3 independent workspaces per monitor** — like having multiple virtual desktops, but better.
+
+**How it works:**
+1. Tile your windows on workspace 1 (default)
+2. Press `Ctrl+Alt+2` → workspace 1 windows **hide instantly** (no minimize animation)
+3. Tile different windows on workspace 2
+4. Press `Ctrl+Alt+1` → back to your first context, **pixel-perfect**
+
+**Smart features:**
+- ✅ Restores **exact positions** (no layout recalculation)
+- ✅ Brings back **minimized windows** from taskbar
+- ✅ Shows **hidden windows** automatically
+- ✅ Skips **dead windows** (closed apps)
+- ✅ **Smooth transitions** (no flickering)
+- ✅ Works **independently** on each monitor
+
+**Example workflow:**
+```
+Monitor 1, Workspace 1: [Browser, VSCode, Terminal]  ← Dev environment
+Monitor 1, Workspace 2: [Spotify, Discord, OBS]      ← Entertainment/Streaming
+Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
+
+→ Switch contexts instantly without cluttering your taskbar!
+```
 
 ## Drag & Drop Snap Feature
 
@@ -59,11 +99,16 @@ This is the one that makes people go **"wait… how?!"**
 
 ## Multi-Monitor Workflow
 
-1. Tile your windows on monitor 1
-2. Press `Ctrl + Alt + M` → everything jumps to monitor 2, perfectly resized
-3. Press again → back to monitor 1 (or to monitor 3, 4… fully cyclic)
+**Move current workspace to another screen:**
+1. Tile your windows on monitor 1, workspace 1
+2. Press `Ctrl + Alt + M` → workspace 1 jumps to monitor 2, perfectly resized
+3. Press again → continues cycling (monitor 3, back to 1...)
 
-No manual dragging. No resizing. Just one key.
+**Important:** Only the **current workspace** moves. Other workspaces stay on their monitors.
+
+**What happens if target workspace has windows?**  
+→ They **merge** and re-tile together (like i3/Sway behavior)
+
 
 ## Requirements
 
