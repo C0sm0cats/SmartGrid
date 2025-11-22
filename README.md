@@ -36,7 +36,6 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 - **Workspace-aware monitor cycling** — `Ctrl+Alt+M` → current workspace jumps to next monitor  
   → Other workspaces stay intact  
   → Merges smoothly if target workspace has windows
-- Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 - **System Tray Icon + Menu**
   → Quick access to :
     → Toggle tiling ON/OFF  
@@ -45,6 +44,8 @@ No config. No bullshit. Just press one key and live in perfect harmony.
     → Toggle Swap Mode ON/OFF  
     → Move workspace to next monitor  
     → Quick access to hotkeys cheatsheet and quit
+- Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
+
 ## Hotkeys
 
 | Shortcut         | Action                                                                    |
