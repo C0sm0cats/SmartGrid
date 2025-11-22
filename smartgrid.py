@@ -207,6 +207,8 @@ def is_useful_window(title, class_name=""):
 
 def get_visible_windows():
     """Enumerate all visible, non-minimized, useful windows"""
+    global overlay_hwnd  # ✅ Ajoute cette ligne en haut
+    
     monitors = get_monitors()
     windows = []
     def enum(hwnd, _):
@@ -221,6 +223,10 @@ def get_visible_windows():
                     title = title_buf.value or ""
                     class_name = win32gui.GetClassName(hwnd)
 
+                    # ✅ SKIP OVERLAY WINDOW
+                    if overlay_hwnd and hwnd == overlay_hwnd:
+                        return True
+                    
                     if is_useful_window(title, class_name):
                         overlap = sum(
                             max(0, min(rect.right, mx + mw) - max(rect.left, mx)) *
@@ -1122,38 +1128,58 @@ def create_overlay_window():
     
     class_name = "SmartGridOverlay"
     
+    # ✅ Properly define DefWindowProc with correct signature
+    DefWindowProc = ctypes.windll.user32.DefWindowProcW
+    DefWindowProc.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    DefWindowProc.restype = wintypes.LPARAM
+    
+    # ✅ Define WNDPROCTYPE properly
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(
+        wintypes.LPARAM,    # Return type (changed from c_long)
+        wintypes.HWND,      # hwnd
+        ctypes.c_uint,      # msg
+        wintypes.WPARAM,    # wparam
+        wintypes.LPARAM     # lparam
+    )
+    
     # Window procedure for overlay
+    @WNDPROCTYPE
     def wnd_proc(hwnd, msg, wparam, lparam):
-        if msg == win32con.WM_PAINT:
-            ps = PAINTSTRUCT()
-            hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+        try:
+            if msg == win32con.WM_PAINT:
+                ps = PAINTSTRUCT()
+                hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+                
+                if preview_rect:
+                    x, y, w, h = preview_rect
+                    
+                    # Create semi-transparent brush (blue with 30% opacity)
+                    brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
+                    pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
+                    
+                    old_brush = win32gui.SelectObject(hdc, brush)
+                    old_pen = win32gui.SelectObject(hdc, pen)
+                    
+                    # Draw rectangle
+                    win32gui.Rectangle(hdc, x, y, x + w, y + h)
+                    
+                    win32gui.SelectObject(hdc, old_brush)
+                    win32gui.SelectObject(hdc, old_pen)
+                    win32gui.DeleteObject(brush)
+                    win32gui.DeleteObject(pen)
+                
+                user32.EndPaint(hwnd, ctypes.byref(ps))
+                return 0
             
-            if preview_rect:
-                x, y, w, h = preview_rect
-                
-                # Create semi-transparent brush (blue with 30% opacity)
-                # We use a hatch pattern for transparency effect
-                brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
-                pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
-                
-                old_brush = win32gui.SelectObject(hdc, brush)
-                old_pen = win32gui.SelectObject(hdc, pen)
-                
-                # Draw rectangle
-                win32gui.Rectangle(hdc, x, y, x + w, y + h)
-                
-                win32gui.SelectObject(hdc, old_brush)
-                win32gui.SelectObject(hdc, old_pen)
-                win32gui.DeleteObject(brush)
-                win32gui.DeleteObject(pen)
+            elif msg == win32con.WM_DESTROY:
+                return 0
             
-            user32.EndPaint(hwnd, ctypes.byref(ps))
-            return 0
+            # ✅ Use properly typed DefWindowProc
+            return DefWindowProc(hwnd, msg, wparam, lparam)
         
-        elif msg == win32con.WM_DESTROY:
+        except Exception as e:
+            print(f"[OVERLAY] Error in wnd_proc: {e}")
             return 0
-        
-        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
     
     # Register window class
     wc = win32gui.WNDCLASS()
