@@ -1,4 +1,10 @@
-# SmartGrid 
+# SmartGrid
+
+[![Release](https://img.shields.io/github/v/release/C0sm0cats/SmartGrid)](https://github.com/C0sm0cats/SmartGrid/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/C0sm0cats/SmartGrid/total)](https://github.com/C0sm0cats/SmartGrid/releases)
+[![License](https://img.shields.io/github/license/C0sm0cats/SmartGrid)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/C0sm0cats/SmartGrid)
+
 ## Powerful Pure-Python Dynamic Tiling Window Manager for Windows
 
 **SmartGrid** is not just a tiler.
