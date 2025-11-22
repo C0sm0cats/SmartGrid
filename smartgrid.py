@@ -1,6 +1,3 @@
-# pip install pywin32
-# pip install pystray
-
 import os
 import ctypes
 from ctypes import wintypes
@@ -69,7 +66,8 @@ HOTKEY_WS3 = 9103
 # Window tracking
 current_hwnd         = None   # Window with green border (active)
 selected_hwnd        = None   # Window with red border (swap mode)
-grid_state          = {}      # hwnd → (monitor_idx, col, row)
+grid_state           = {}     # hwnd → (monitor_idx, col, row)
+last_active_hwnd     = None   # Last known active/focused tiled window (preserved when focus is temporarily lost,
 
 # Monitor state
 CURRENT_MONITOR_INDEX = 0     # Target monitor when cycling with Ctrl+Alt+M
@@ -223,7 +221,7 @@ def is_useful_window(title, class_name=""):
 
 def get_visible_windows():
     """Enumerate all visible, non-minimized, useful windows"""
-    global overlay_hwnd  # ✅ Ajoute cette ligne en haut
+    global overlay_hwnd  # Ajoute cette ligne en haut
     
     monitors = get_monitors()
     windows = []
@@ -239,7 +237,7 @@ def get_visible_windows():
                     title = title_buf.value or ""
                     class_name = win32gui.GetClassName(hwnd)
 
-                    # ✅ SKIP OVERLAY WINDOW
+                    # SKIP OVERLAY WINDOW
                     if overlay_hwnd and hwnd == overlay_hwnd:
                         return True
                     
@@ -416,16 +414,26 @@ def smart_tile(temp=False):
         x, y, w, h = positions[i]
         force_tile_resizable(hwnd, x, y, w, h)
         print(f"   -> {title[:60]}")
-        time.sleep(0.04 + i * 0.006)
+        time.sleep(0.015 + i * 0.003)
 
         assign_grid_position(new_grid, hwnd, 0, layout, info, i)
 
     grid_state = new_grid
 
-    time.sleep(0.15)
-    active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active):
-        apply_border(active)
+    time.sleep(0.06)
+    # Preserve border after tiling/snap operations
+    #    • If swap mode is active → keep RED border on the selected window
+    #    • Otherwise → apply normal GREEN border to the currently active window
+    if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
+        color_val = ctypes.c_uint(0x000000FF)
+        dwmapi.DwmSetWindowAttribute(
+            selected_hwnd, DWMWA_BORDER_COLOR,
+            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+        )
+    else:
+        active = user32.GetForegroundWindow()
+        if active and user32.IsWindowVisible(active):
+            apply_border(active)
 
 # ==============================================================================
 # Multi-monitor
@@ -505,7 +513,7 @@ def move_current_workspace_to_next_monitor():
         assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
         title = win32gui.GetWindowText(hwnd)
         print(f"   -> {title[:50]}")
-        time.sleep(0.03)
+        time.sleep(0.015)
 
     # Update grid_state (remove old entries, add new ones)
     for hwnd, _ in windows_to_move:
@@ -644,9 +652,9 @@ def swap_windows(hwnd1, hwnd2):
     
     # Physically move the windows (SWAPPING positions, not sizes)
     force_tile_resizable(hwnd1, x2, y2, w2, h2)
-    time.sleep(0.08)
+    time.sleep(0.04)
     force_tile_resizable(hwnd2, x1, y1, w1, h1)
-    time.sleep(0.08)
+    time.sleep(0.04)
     
     # Clear the borders again after the swap
     remove_border(hwnd1)
@@ -656,10 +664,10 @@ def swap_windows(hwnd1, hwnd2):
 
 def enter_swap_mode():
     """Activate swap mode with red border and arrow-key navigation"""
-    global swap_mode, selected_hwnd
+    global swap_mode, selected_hwnd, current_hwnd, last_active_hwnd
     
     # Wait a tiny bit for the tiling to stabilize
-    time.sleep(0.15)
+    time.sleep(0.05)
     
     # Force a quick update of grid_state in case it's empty or updating
     if not grid_state:
@@ -668,22 +676,35 @@ def enter_swap_mode():
             if hwnd not in grid_state:
                 grid_state[hwnd] = (0, 0, 0)
         print(f"[SWAP] grid_state was empty → rebuilt with {len(grid_state)} windows")
-    if not grid_state:
-        print("[SWAP] No tiled windows detected. First press Ctrl+Alt+T or Ctrl+Alt+R")
+        if not grid_state:
+            print("[SWAP] No tiled windows detected. First press Ctrl+Alt+T or Ctrl+Alt+R")
+            return
 
+    # SMART SELECTION LOGIC FOR SWAP MODE (priority order)
+    candidate = None
+    
+    # 1. Highest priority: last known active tiled window (preserves selection even if focus is temporarily lost)
+    if last_active_hwnd and user32.IsWindow(last_active_hwnd) and last_active_hwnd in grid_state:
+        candidate = last_active_hwnd
+    # 2. Fallback: currently foreground window (if it's tiled)
+    elif user32.GetForegroundWindow() in grid_state:
+        candidate = user32.GetForegroundWindow()
+    # 3. Last resort: first window in the current grid
+    else:
+        candidate = next(iter(grid_state.keys()), None)
+
+    if not candidate:
+        print("[SWAP] No valid window to select")
         return
-    
-    # Get the active window
-    active = user32.GetForegroundWindow()
-    if not active or active not in grid_state:
-        # Take the first window from grid_state
-        active = next(iter(grid_state.keys()))
-    
+
     swap_mode = True
-    selected_hwnd = active
-    
-    remove_border(selected_hwnd)
-    time.sleep(0.05)
+    selected_hwnd = candidate
+
+    # Clean up any existing green border if the selected window was previously active
+    if current_hwnd == selected_hwnd:
+        remove_border(current_hwnd)
+
+    # Apply red border
     color_val = ctypes.c_uint(0x000000FF)  # Bright red (BGR format)
     dwmapi.DwmSetWindowAttribute(
         selected_hwnd, DWMWA_BORDER_COLOR,
@@ -702,7 +723,7 @@ def enter_swap_mode():
     print("  The red window FOLLOWS your movements and swaps its position!")
     print("━" * 60)
     register_swap_hotkeys()
-    # ✅ Refresh tray menu
+    # Refresh tray menu
     update_tray_menu()
 
 def navigate_swap(direction):
@@ -725,9 +746,9 @@ def navigate_swap(direction):
             # selected_hwnd logically remains the same, but physically it has changed position
             
             # Clear and reapply the red border on the window that moved
-            time.sleep(0.1)
+            time.sleep(0.04)
             remove_border(selected_hwnd)
-            time.sleep(0.05)
+            time.sleep(0.04)
             color_val = ctypes.c_uint(0x000000FF)
             dwmapi.DwmSetWindowAttribute(
                 selected_hwnd, DWMWA_BORDER_COLOR,
@@ -767,7 +788,7 @@ def exit_swap_mode():
     # First, clear ALL borders
     print("[SWAP MODE] Clearing borders...")
     clear_all_borders()
-    time.sleep(0.15)
+    time.sleep(0.06)
     
     swap_mode = False
     unregister_swap_hotkeys()
@@ -787,7 +808,7 @@ def exit_swap_mode():
         print(f"[SWAP MODE] Green border restored on active window")
     
     print("[SWAP MODE] ✓ Deactivated\n")
-    # ✅ Refresh tray menu
+    # Refresh tray menu
     update_tray_menu()
 
 # ==============================================================================
@@ -795,7 +816,7 @@ def exit_swap_mode():
 # ==============================================================================
 def monitor():
     """Background loop: auto-retile on window events + track active window border"""
-    global current_hwnd, grid_state, last_visible_count
+    global current_hwnd, grid_state, last_visible_count, last_active_hwnd
 
     while True:
         if is_active:
@@ -823,18 +844,51 @@ def monitor():
                 last_visible_count = current_count
                 time.sleep(0.2)
 
-        # Update border on active window (except in swap mode)
-        if not swap_mode:
+        # Border management – completely different behavior depending on mode
+        if swap_mode:
+            if selected_hwnd and user32.IsWindow(selected_hwnd):
+                # Read current border color from DWM
+                current_color = ctypes.c_uint()
+                result = dwmapi.DwmGetWindowAttribute(
+                    selected_hwnd,
+                    DWMWA_BORDER_COLOR,
+                    ctypes.byref(current_color),
+                    ctypes.sizeof(current_color)
+                )
+                # If reading failed OR color is not red → Windows has removed it → reapply
+                if result != 0 or current_color.value != 0x000000FF:
+                    color_val = ctypes.c_uint(0x000000FF)
+                    dwmapi.DwmSetWindowAttribute(
+                        selected_hwnd, DWMWA_BORDER_COLOR,
+                        ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+                    )
+        else:
+            # === NORMAL MODE: green border never disappears, even when clicking the systray ===
             active = user32.GetForegroundWindow()
-            if active and user32.IsWindowVisible(active):
-                if active != current_hwnd:
-                    apply_border(active, color=0x0000FF00)  # Green
+
+            # Case 1: a real tiled window has focus → follow it normally
+            if active and active in grid_state and user32.IsWindowVisible(active):
+                last_active_hwnd = active
+                apply_border(active, 0x0000FF00)        # apply immediately
+                current_hwnd = active
+
+            # Case 2: focus lost (systray, Alt+Tab, menu, etc.)
+            # → forcefully keep the green border on the last known tiled window, every loop
+            elif (last_active_hwnd
+                  and user32.IsWindow(last_active_hwnd)
+                  and user32.IsWindowVisible(last_active_hwnd)
+                  and last_active_hwnd in grid_state):
+                # Re-apply every cycle → Windows can't remove it
+                apply_border(last_active_hwnd, 0x0000FF00)
+                current_hwnd = last_active_hwnd
+
+            # Case 3: nothing valid left → clean up
             else:
                 if current_hwnd:
                     remove_border(current_hwnd)
                     current_hwnd = None
-
-        time.sleep(0.35)
+                    last_active_hwnd = None
+        time.sleep(0.06)
 
 # ==============================================================================
 # Toggle Persistent Auto-Tiling
@@ -846,7 +900,7 @@ def toggle_persistent():
     print(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
     if is_active:
         smart_tile(temp=False)
-    # ✅ Refresh tray menu
+    # Refresh tray menu
     update_tray_menu()
 
 # ==============================================================================
@@ -971,13 +1025,23 @@ def apply_grid_state():
             if key in pos_dict:
                 x, y, w, h = pos_dict[key]
                 force_tile_resizable(hwnd, x, y, w, h)
-                time.sleep(0.015)
+                time.sleep(0.008)
     
-    # Apply green border to the active window
-    time.sleep(0.08)
-    active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active) and active in grid_state:
-        apply_border(active)
+    # Restore appropriate border after snap (green if normal mode, red if swap mode)
+    time.sleep(0.03)
+    if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
+        # Swap mode active → keep (or restore) the RED border on the selected window
+        color_val = ctypes.c_uint(0x000000FF)  # rouge
+        dwmapi.DwmSetWindowAttribute(
+            selected_hwnd, DWMWA_BORDER_COLOR,
+            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+        )
+        print(f"[SNAP] Red border restored on selected window during swap mode")
+    else:
+        # Normal mode → green border on the currently active window
+        active = user32.GetForegroundWindow()
+        if active and user32.IsWindowVisible(active) and active in grid_state:
+            apply_border(active)
 
 def is_window_maximized(hwnd):
     """Return True if window is maximized – prevents false drags on internal splits"""
@@ -1040,7 +1104,7 @@ def start_drag_snap_monitor():
                 preview_active = False
             
             was_down = down
-            time.sleep(0.015)
+            time.sleep(0.010)
         except Exception as e:
             hide_snap_preview()
             time.sleep(0.1)
@@ -1149,12 +1213,12 @@ def create_overlay_window():
     
     class_name = "SmartGridOverlay"
     
-    # ✅ Properly define DefWindowProc with correct signature
+    # Properly define DefWindowProc with correct signature
     DefWindowProc = ctypes.windll.user32.DefWindowProcW
     DefWindowProc.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
     DefWindowProc.restype = wintypes.LPARAM
     
-    # ✅ Define WNDPROCTYPE properly
+    # Define WNDPROCTYPE properly
     WNDPROCTYPE = ctypes.WINFUNCTYPE(
         wintypes.LPARAM,    # Return type (changed from c_long)
         wintypes.HWND,      # hwnd
@@ -1195,7 +1259,7 @@ def create_overlay_window():
             elif msg == win32con.WM_DESTROY:
                 return 0
             
-            # ✅ Use properly typed DefWindowProc
+            # Use properly typed DefWindowProc
             return DefWindowProc(hwnd, msg, wparam, lparam)
         
         except Exception as e:
@@ -1365,10 +1429,10 @@ def save_workspace(monitor_idx):
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             continue
 
-        # ✅ Get frame borders to calculate TRUE client area
+        # Get frame borders to calculate TRUE client area
         lb, tb, rb, bb = get_frame_borders(hwnd)
         
-        # ✅ Save position WITHOUT invisible borders (pure client area)
+        # Save position WITHOUT invisible borders (pure client area)
         x = rect.left + lb
         y = rect.top + tb
         w = rect.right - rect.left - lb - rb
@@ -1376,7 +1440,7 @@ def save_workspace(monitor_idx):
 
         # Save both physical position AND grid coordinates
         workspaces[monitor_idx][ws][hwnd] = {
-            'pos': (x, y, w, h),  # ✅ Clean dimensions
+            'pos': (x, y, w, h),  # Clean dimensions
             'grid': (col, row)
         }
 
@@ -1423,7 +1487,7 @@ def load_workspace(monitor_idx, ws_idx):
         grid_state[hwnd] = (monitor_idx, col, row)
         
         restored += 1
-        time.sleep(0.04)
+        time.sleep(0.015)
 
     time.sleep(0.15)
     
@@ -1448,7 +1512,7 @@ def ws_switch(ws_idx):
         print(f"[WS] Already on workspace {ws_idx+1}")
         return
 
-    # ✅ FREEZE AUTO-RETILE during workspace switch
+    # FREEZE AUTO-RETILE during workspace switch
     was_active = is_active
     is_active = False
     
@@ -1472,11 +1536,11 @@ def ws_switch(ws_idx):
     time.sleep(0.1)
     load_workspace(mon, ws_idx)
     
-    # ✅ UPDATE last_visible_count to prevent immediate re-tile
+    # UPDATE last_visible_count to prevent immediate re-tile
     visible_windows = get_visible_windows()
     last_visible_count = len(visible_windows)
     
-    # ✅ RESTORE AUTO-RETILE state
+    # RESTORE AUTO-RETILE state
     time.sleep(0.2)  # Let windows settle
     is_active = was_active
     
@@ -1558,7 +1622,7 @@ def on_quit_from_tray(icon, item):
     
     # Force exit the entire process
     print("[EXIT] SmartGrid stopped.")
-    os._exit(0)  # ✅ Force exit (kills all threads)
+    os._exit(0)  # Force exit (kills all threads)
 
 def show_hotkeys_tooltip():
     """Show a notification with hotkeys"""
@@ -1579,16 +1643,6 @@ def show_hotkeys_tooltip():
         "SmartGrid Hotkeys",
         0x40  # MB_ICONINFORMATION
     )
-
-def toggle_swap_mode_from_tray():
-    """Toggle swap mode and show notification"""
-    if swap_mode:
-        exit_swap_mode()
-    else:
-        enter_swap_mode()
-
-    # ✅ Refresh tray menu after toggle
-    update_tray_menu()
 
 def start_systray():
     """Start the system tray icon"""
@@ -1688,7 +1742,10 @@ if __name__ == "__main__":
             elif msg.wParam == HOTKEY_WS3:
                     ws_switch(2)
         elif msg.message == CUSTOM_TOGGLE_SWAP:
-            toggle_swap_mode_from_tray()
+            if swap_mode:
+                exit_swap_mode()
+            else:
+                enter_swap_mode()
 
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
