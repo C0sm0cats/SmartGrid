@@ -145,7 +145,7 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 ## Why This Script Exists
 
 Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
-Plus, it adds **workspace management** that most Windows tiling tools don't have **and a system tray icon with a context menu for quick access to all major features**.
+Plus, it adds **workspace management** that most Windows tiling tools don't have and a **system tray icon** with a **context menu** for quick access to all major features.
 
 ## Author
 
