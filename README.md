@@ -94,7 +94,8 @@ This is the one that makes people go **"wait… how?!"**
 → **BAM**. It snaps perfectly.  
 → If you dropped on another window → they **swap instantly**  
 → If you dropped in empty space → it **moves** there  
-→ Works **across monitors**  
+→ Works **across monitors**
+→ Works **across workspaces**
 → No keys. No thinking. Pure flow.
 
 ## Multi-Monitor Workflow
@@ -130,6 +131,7 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 ## Why This Script Exists
 
 Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
+Plus, it adds **workspace management** that most Windows tiling tools don't have.
 
 ## Author
 
