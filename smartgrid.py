@@ -955,14 +955,16 @@ def is_window_maximized(hwnd):
     return bool(style & WS_MAXIMIZE)
 
 def start_drag_snap_monitor():
-    """Background thread: detects title-bar drag → enables instant snap on drop"""
+    """Background thread: detects title-bar drag → shows preview → snaps on drop"""
     was_down = False
     drag_hwnd = None
     drag_start = None
+    preview_active = False
 
     while True:
         try:
             down = win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
+            
             if down and not was_down:
                 hwnd = user32.GetForegroundWindow()
                 # Ignore drag if window is maximized (prevents interference with internal splits)
@@ -972,17 +974,43 @@ def start_drag_snap_monitor():
                 if hwnd and hwnd in grid_state and user32.IsWindowVisible(hwnd):
                     drag_hwnd = hwnd
                     drag_start = win32api.GetCursorPos()
+                    preview_active = False
+            
+            elif down and drag_hwnd:
+                # Dragging in progress
+                cursor_pos = win32api.GetCursorPos()
+                if drag_start:
+                    dx = abs(cursor_pos[0] - drag_start[0])
+                    dy = abs(cursor_pos[1] - drag_start[1])
+                    
+                    # Show preview after 20px movement
+                    if (dx > 20 or dy > 20) and not preview_active:
+                        preview_active = True
+                    
+                    # Update preview during drag
+                    if preview_active:
+                        target_rect = calculate_target_rect(drag_hwnd, cursor_pos)
+                        if target_rect:
+                            show_snap_preview(*target_rect)
+            
             elif not down and was_down and drag_hwnd:
+                # Drop detected
+                hide_snap_preview()
+                
                 if drag_start:
                     dx = abs(win32api.GetCursorPos()[0] - drag_start[0])
                     dy = abs(win32api.GetCursorPos()[1] - drag_start[1])
                     if dx > 20 or dy > 20:
                         handle_snap_drop(drag_hwnd, win32api.GetCursorPos())
+                
                 drag_hwnd = None
                 drag_start = None
+                preview_active = False
+            
             was_down = down
             time.sleep(0.015)
-        except:
+        except Exception as e:
+            hide_snap_preview()
             time.sleep(0.1)
 
 def handle_snap_drop(source_hwnd, cursor_pos):
@@ -1068,6 +1096,210 @@ def handle_snap_drop(source_hwnd, cursor_pos):
 
     apply_grid_state()
 
+# ==============================================================================
+# DRAG & DROP SNAP WITH PREVIEW OVERLAY
+# ==============================================================================
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wintypes.HDC),
+        ("fErase", wintypes.BOOL),
+        ("rcPaint", wintypes.RECT),
+        ("fRestore", wintypes.BOOL),
+        ("fIncUpdate", wintypes.BOOL),
+        ("rgbReserved", ctypes.c_char * 32)
+    ]
+
+# Global overlay window
+overlay_hwnd = None
+preview_rect = None  # (x, y, w, h) of preview rectangle
+
+def create_overlay_window():
+    """Create transparent overlay window for snap preview"""
+    global overlay_hwnd
+    
+    if overlay_hwnd:
+        return overlay_hwnd
+    
+    class_name = "SmartGridOverlay"
+    
+    # Window procedure for overlay
+    def wnd_proc(hwnd, msg, wparam, lparam):
+        if msg == win32con.WM_PAINT:
+            ps = PAINTSTRUCT()
+            hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+            
+            if preview_rect:
+                x, y, w, h = preview_rect
+                
+                # Create semi-transparent brush (blue with 30% opacity)
+                # We use a hatch pattern for transparency effect
+                brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
+                pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
+                
+                old_brush = win32gui.SelectObject(hdc, brush)
+                old_pen = win32gui.SelectObject(hdc, pen)
+                
+                # Draw rectangle
+                win32gui.Rectangle(hdc, x, y, x + w, y + h)
+                
+                win32gui.SelectObject(hdc, old_brush)
+                win32gui.SelectObject(hdc, old_pen)
+                win32gui.DeleteObject(brush)
+                win32gui.DeleteObject(pen)
+            
+            user32.EndPaint(hwnd, ctypes.byref(ps))
+            return 0
+        
+        elif msg == win32con.WM_DESTROY:
+            return 0
+        
+        return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+    
+    # Register window class
+    wc = win32gui.WNDCLASS()
+    wc.lpfnWndProc = wnd_proc
+    wc.lpszClassName = class_name
+    wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+    
+    try:
+        win32gui.RegisterClass(wc)
+    except:
+        pass  # Class already registered
+    
+    # Create layered window (for transparency)
+    overlay_hwnd = win32gui.CreateWindowEx(
+        win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
+        class_name,
+        "SmartGrid Preview",
+        win32con.WS_POPUP,
+        0, 0, 1, 1,  # Will be resized
+        0, 0, 0, None
+    )
+    
+    # Set 30% opacity
+    win32gui.SetLayeredWindowAttributes(overlay_hwnd, 0, int(255 * 0.3), win32con.LWA_ALPHA)
+    
+    return overlay_hwnd
+
+def show_snap_preview(x, y, w, h):
+    """Show preview rectangle at specified position"""
+    global preview_rect, overlay_hwnd
+    
+    if not overlay_hwnd:
+        create_overlay_window()
+    
+    preview_rect = (x, y, w, h)
+    
+    # Position and show overlay window
+    win32gui.SetWindowPos(
+        overlay_hwnd, win32con.HWND_TOPMOST,
+        x, y, w, h,
+        win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
+    )
+    
+    # Force redraw
+    win32gui.InvalidateRect(overlay_hwnd, None, True)
+    win32gui.UpdateWindow(overlay_hwnd)
+
+def hide_snap_preview():
+    """Hide preview overlay"""
+    global preview_rect, overlay_hwnd
+    
+    preview_rect = None
+    
+    if overlay_hwnd:
+        win32gui.ShowWindow(overlay_hwnd, win32con.SW_HIDE)
+
+def calculate_target_rect(source_hwnd, cursor_pos):
+    """Calculate where window will snap (returns rect for preview)"""
+    if source_hwnd not in grid_state:
+        return None
+    
+    monitors = get_monitors()
+    cx, cy = cursor_pos
+    
+    # Find target monitor
+    target_mon_idx = 0
+    for i, (mx, my, mw, mh) in enumerate(monitors):
+        if mx <= cx < mx + mw and my <= cy < my + mh:
+            target_mon_idx = i
+            break
+    
+    mon_x, mon_y, mon_w, mon_h = monitors[target_mon_idx]
+    
+    # Get windows currently on this monitor
+    wins_on_mon = [h for h, (m, _, _) in grid_state.items() 
+                   if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
+    count_including_source = len(wins_on_mon) + 1
+    current_layout, current_info = choose_layout(count_including_source)
+    
+    # Calculate target cell
+    target_col = target_row = 0
+    
+    if current_layout == "master_stack":
+        master_width = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+        master_right = mon_x + EDGE_PADDING + master_width + GAP//2
+        
+        if cx < master_right:
+            target_col, target_row = 0, 0
+            # Master pane dimensions
+            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                   master_width, mon_h - 2*EDGE_PADDING)
+        else:
+            # Stack pane
+            sw = mon_w - 2*EDGE_PADDING - master_width - GAP
+            sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
+            mid_y = mon_y + mon_h // 2
+            
+            if cy < mid_y:
+                # Top stack
+                return (mon_x + EDGE_PADDING + master_width + GAP, mon_y + EDGE_PADDING,
+                       sw, sh)
+            else:
+                # Bottom stack
+                return (mon_x + EDGE_PADDING + master_width + GAP, 
+                       mon_y + EDGE_PADDING + sh + GAP, sw, sh)
+    
+    elif current_layout == "side_by_side":
+        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
+        if cx < mon_x + mon_w // 2:
+            # Left side
+            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, 
+                   cw, mon_h - 2*EDGE_PADDING)
+        else:
+            # Right side
+            return (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING,
+                   cw, mon_h - 2*EDGE_PADDING)
+    
+    elif current_layout == "full":
+        return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+               mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)
+    
+    else:  # grid
+        cols, rows = current_info if current_info else (2, 2)
+        max_c = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        max_r = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        cols = max(cols, max_c + 1)
+        rows = max(rows, max_r + 1)
+        
+        cell_w = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
+        cell_h = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
+        
+        rel_x = cx - mon_x - EDGE_PADDING
+        rel_y = cy - mon_y - EDGE_PADDING
+        target_col = min(max(0, rel_x // (cell_w + GAP)), cols - 1)
+        target_row = min(max(0, rel_y // (cell_h + GAP)), rows - 1)
+        
+        x = mon_x + EDGE_PADDING + target_col * (cell_w + GAP)
+        y = mon_y + EDGE_PADDING + target_row * (cell_h + GAP)
+        
+        return (x, y, cell_w, cell_h)
+    
+    return None
+
+# ==============================================================================
+# WORKSPACE MANAGEMENT
+# ==============================================================================
 def save_workspace(monitor_idx):
     """Save current window layout to workspace (with grid positions!)"""
     global workspaces, grid_state
@@ -1203,6 +1435,9 @@ def ws_switch(ws_idx):
     
     print(f"[WS] ✓ Switched to workspace {ws_idx+1}")
 
+# ==============================================================================
+# MAIN
+# ==============================================================================
 if __name__ == "__main__":
     print("="*70)
     print("   SMARTGRID - Intelligent layouts + green border + SWAP MODE")
