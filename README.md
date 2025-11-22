@@ -87,13 +87,13 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 
 This is the one that makes people go **"wait… how?!"**
 
-1. You have 6 windows tiled  
-2. You grab **one** by the title bar  
-3. You drag it over another monitor, or over an empty cell, or over another window  
-4. You **drop**  
-→ **BAM**. It snaps perfectly.  
-→ If you dropped on another window → they **swap instantly**  
-→ If you dropped in empty space → it **moves** there  
+1. You have 6 windows tiled
+2. You grab **one** by the title bar 
+3. **A blue preview rectangle appears** showing exactly where it will snap
+4. You **drop**
+→ **BAM**. It snaps perfectly to the previewed position.
+→ If you dropped on another window → they **swap instantly**
+→ If you dropped in empty space → it **moves** there
 → Works **across monitors**
 → Works **across workspaces**
 → No keys. No thinking. Pure flow.
