@@ -1061,20 +1061,23 @@ def start_drag_snap_monitor():
         try:
             down = win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
             
+            # ----------- MOUSE DOWN -----------
             if down and not was_down:
                 hwnd = user32.GetForegroundWindow()
                 # Ignore drag if window is maximized (prevents interference with internal splits)
                 if hwnd and is_window_maximized(hwnd):
                     was_down = True
                     continue
+
                 if hwnd and hwnd in grid_state and user32.IsWindowVisible(hwnd):
                     drag_hwnd = hwnd
                     drag_start = win32api.GetCursorPos()
                     preview_active = False
             
+            # ----------- DRAG IN PROGRESS -----------
             elif down and drag_hwnd:
-                # Dragging in progress
                 cursor_pos = win32api.GetCursorPos()
+
                 if drag_start:
                     dx = abs(cursor_pos[0] - drag_start[0])
                     dy = abs(cursor_pos[1] - drag_start[1])
@@ -1089,22 +1092,36 @@ def start_drag_snap_monitor():
                         if target_rect:
                             show_snap_preview(*target_rect)
             
+            # ----------- MOUSE UP (DROP) -----------
             elif not down and was_down and drag_hwnd:
-                # Drop detected
+
                 hide_snap_preview()
-                
+
+                cursor_pos = win32api.GetCursorPos()
+
+                moved = False
                 if drag_start:
-                    dx = abs(win32api.GetCursorPos()[0] - drag_start[0])
-                    dy = abs(win32api.GetCursorPos()[1] - drag_start[1])
-                    if dx > 20 or dy > 20:
-                        handle_snap_drop(drag_hwnd, win32api.GetCursorPos())
-                
+                    dx = abs(cursor_pos[0] - drag_start[0])
+                    dy = abs(cursor_pos[1] - drag_start[1])
+                    moved = (dx > 20 or dy > 20)
+
+                if moved:
+                    # Delegate all snapping logic to the central function
+                    # which already computes target monitor/col/row and updates grid_state.
+                    handle_snap_drop(drag_hwnd, cursor_pos)
+                    # handle_snap_drop must ensure re-application even when position unchanged
+                else:
+                    # released without movement → force re-apply positions so the window
+                    # snaps perfectly back to its stored cell
+                    apply_grid_state()
+
                 drag_hwnd = None
                 drag_start = None
                 preview_active = False
             
             was_down = down
             time.sleep(0.010)
+
         except Exception as e:
             hide_snap_preview()
             time.sleep(0.1)
@@ -1173,6 +1190,8 @@ def handle_snap_drop(source_hwnd, cursor_pos):
     new_pos = (target_mon_idx, target_col, target_row)
 
     if old_pos == new_pos:
+        # Force re-apply so window returns perfectly to its cell (magnetic return)
+        apply_grid_state()
         return
 
     # Find if the target cell is occupied
