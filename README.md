@@ -142,6 +142,11 @@ python smartgrid.py
 
 Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 
+## Known Issues
+
+- Minimize / Maximize with tiled windows
+Currently, minimizing or maximizing a window in a tiled layout may cause unexpected behavior or slight layout glitches.
+
 ## Why This Script Exists
 
 Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
