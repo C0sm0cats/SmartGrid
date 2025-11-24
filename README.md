@@ -145,6 +145,7 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 ## Known Issues
 
 - Minimize / Maximize with tiled windows
+
 Currently, minimizing or maximizing a window in a tiled layout may cause unexpected behavior or slight layout glitches.
 
 ## Why This Script Exists
