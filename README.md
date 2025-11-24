@@ -145,9 +145,11 @@ Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
 ## Known Issues
 
 - **Minimize / Maximize with tiled windows**  
-  Currently, minimizing or maximizing a window in a tiled layout may cause unexpected behavior or slight layout glitches.
+  Currently, minimizing or maximizing a window in a tiled layout may cause unexpected behavior or slight layout glitches.  
+  This can have a major impact on all layouts.  
+  I’m actively trying to debug and fix this, but it’s not trivial for me…
 
-> If you have ideas to improve SmartGrid, your code & feedback is always welcome!
+> If you have ideas to improve SmartGrid, your code and feedback are always welcome!
 
 ## Why This Script Exists
 
