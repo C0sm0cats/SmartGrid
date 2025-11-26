@@ -1,153 +1,127 @@
+"""
+SmartGrid – Advanced Windows Tiling Manager
+Features: intelligent layouts, drag & drop snap, swap mode, workspaces per monitor,
+          colored DWM borders, multi-monitor, systray, hotkeys
+Author: C0sm0cats (2025)
+"""
+
 import os
+import sys
 import ctypes
-from ctypes import wintypes
 import time
 import threading
-import win32con
+import winsound
+from ctypes import wintypes
 import win32gui
 import win32api
+import win32con
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
 
 # ==============================================================================
-# Constants & config
+# CONFIGURATION & CONSTANTS
 # ==============================================================================
-# Win32 API
-user32 = ctypes.WinDLL('user32', use_last_error=True)   # Main Windows API
-dwmapi = ctypes.WinDLL('dwmapi')  # Desktop Window Manager (for colored borders)
 
-# Cached monitor work areas
-MONITORS_CACHE = []
+DEBUG = 0  # Set to 1 for verbose logging during development
 
-# Layout appearance
-GAP          = 8      # Space between tiled windows
-EDGE_PADDING = 8      # Margin from screen edges
+def log(*args, **kwargs):
+    if DEBUG:
+        print("[SmartGrid]", *args, **kwargs)
 
-# DWM (Desktop Window Manager) attributes
-DWMWA_BORDER_COLOR          = 34
-DWMWA_COLOR_NONE            = 0xFFFFFFFF
+# Layout & appearance
+GAP = 8           # Gap between tiled windows
+EDGE_PADDING = 8  # Margin from screen edges
+
+# DWM attributes
+DWMWA_BORDER_COLOR = 34
+DWMWA_COLOR_NONE = 0xFFFFFFFF
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
-# Win32 window styles & flags
+# Window styles
 GWL_STYLE = -16
 WS_THICKFRAME = 0x00040000
 WS_MAXIMIZE = 0x01000000
 
 # ShowWindow commands
-SW_RESTORE    = 9    # Restores a minimized or maximized window
+SW_RESTORE = 9    # Restores a minimized or maximized window
 SW_SHOWNORMAL = 1    # Activates and displays window (or restores if minimized)
 
 # SetWindowPos flags (used in force_tile_resizable)
-SWP_NOZORDER      = 0x0004  # Ignores Z-order
-SWP_NOMOVE        = 0x0002  # Don't change position
-SWP_NOSIZE        = 0x0001  # Don't change size
-SWP_NOACTIVATE    = 0x0010  # Don't activate the window
-SWP_FRAMECHANGED  = 0x0020  # Force WM_NCCALCSIZE recalculation (border refresh)
+SWP_NOZORDER = 0x0004  # Ignores Z-order
+SWP_NOMOVE = 0x0002  # Don't change position
+SWP_NOSIZE = 0x0001  # Don't change size
+SWP_NOACTIVATE = 0x0010  # Don't activate the window
+SWP_FRAMECHANGED = 0x0020  # Force WM_NCCALCSIZE recalculation (border refresh)
 SWP_NOSENDCHANGING = 0x0400 # Prevent WM_WINDOWPOSCHANGING (avoids conflicts)
 
-# Hotkey identifiers
+# Hotkey IDs
 HOTKEY_TOGGLE = 9001
 HOTKEY_RETILE = 9002
 HOTKEY_QUIT = 9003
 HOTKEY_MOVE_MONITOR = 9004
 HOTKEY_SWAP_MODE = 9005
+HOTKEY_WS1 = 9101
+HOTKEY_WS2 = 9102
+HOTKEY_WS3 = 9103
+
+# Swap mode arrow keys
 HOTKEY_SWAP_LEFT = 9006
 HOTKEY_SWAP_RIGHT = 9007
 HOTKEY_SWAP_UP = 9008
 HOTKEY_SWAP_DOWN = 9009
 HOTKEY_SWAP_CONFIRM = 9010
-HOTKEY_WS1 = 9101
-HOTKEY_WS2 = 9102
-HOTKEY_WS3 = 9103
+
+CUSTOM_TOGGLE_SWAP = 0x9000
+
+# Win32 API
+user32 = ctypes.WinDLL('user32', use_last_error=True)   # Main Windows API
+dwmapi = ctypes.WinDLL('dwmapi')  # Desktop Window Manager (for colored borders)
 
 # ==============================================================================
-# Application State
+# GLOBAL STATE
 # ==============================================================================
+
 # Window tracking
-current_hwnd         = None   # Window with green border (active)
-selected_hwnd        = None   # Window with red border (swap mode)
-grid_state           = {}     # hwnd → (monitor_idx, col, row)
-last_active_hwnd     = None   # Last known active/focused tiled window (preserved when focus is temporarily lost,
+grid_state = {}     # hwnd → (monitor_idx, col, row)
+minimized_windows = {}  # hwnd → (monitor, col, row) - saved positions
+maximized_windows = {}  # hwnd → (monitor, col, row) - saved positions
+current_hwnd = None   # Window with green border (active)
+selected_hwnd = None   # Window with red border (swap mode)
+last_active_hwnd = None   # Last known active/focused tiled window (preserved when focus is temporarily lost,
 
-# Monitor state
-CURRENT_MONITOR_INDEX = 0     # Target monitor when cycling with Ctrl+Alt+M
+border_lock_owner = None   # "swap" ou "normal"
 
 # Runtime flags
+is_active = False          # Persistent tiling enabled?
+swap_mode = False          # Swap mode active?
+retile_locked = False      # Block auto-retile during swap/drag
+drag_in_progress = False   # Block retile during drag & drop
+border_locked = False      # Prevent border thread interference
+ignore_retile_until = 0.0  # Grace period after state changes
+
 last_visible_count  = 0
-is_active           = False   # Persistent tiling enabled?
-swap_mode           = False   # Swap mode active?
 
 # Background threads
 monitor_thread        = None  # Thread running the main auto-retile + border monitor
 
-# Global overlay window
+# Multi-monitor & workspaces
+MONITORS_CACHE = []
+CURRENT_MONITOR_INDEX = 0
+workspaces = {}
+current_workspace = {}
+
+# Overlay & systray
 overlay_hwnd = None
 preview_rect = None  # (x, y, w, h) of preview rectangle
-
-# Global systray icon
 tray_icon = None
-
-# Custom Windows message sent from the systray thread to the main thread
-# (used to trigger swap mode toggle safely in the message loop thread)
-CUSTOM_TOGGLE_SWAP = 0x9000
+main_thread_id = win32api.GetCurrentThreadId()
 
 # ==============================================================================
-# Workspace System
+# UTILITY FUNCTIONS
 # ==============================================================================
-def init_workspaces():
-    """Initialize workspace structure based on detected monitors"""
-    monitors = get_monitors()
-    ws = {}
-    for i in range(len(monitors)):
-        ws[i] = [{}, {}, {}]  # 3 workspaces per monitor
-    return ws
-
-workspaces = {}  # Will be initialized after monitor detection
-current_workspace = {}  # monitor_index → current ws index
-# ==============================================================================
-
-def remove_border(hwnd):
-    """Remove custom DWM border – restores default window frame"""
-    if hwnd:
-        try:
-            dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_BORDER_COLOR,
-                ctypes.byref(ctypes.c_uint(DWMWA_COLOR_NONE)),
-                ctypes.sizeof(ctypes.c_uint)
-            )
-        except:
-            pass
-
-def apply_border(hwnd, color=0x0000FF00):
-    """Apply colored DWM border – green = active, red = swap mode"""
-    global current_hwnd
-    if current_hwnd and current_hwnd != hwnd:
-        remove_border(current_hwnd)
-    if hwnd:
-        color_val = ctypes.c_uint(color)
-        dwmapi.DwmSetWindowAttribute(
-            hwnd, DWMWA_BORDER_COLOR,
-            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-        )
-        current_hwnd = hwnd
-
-def get_frame_borders(hwnd):
-    """Return (left, top, right, bottom) invisible border/shadow thickness"""
-    rect = wintypes.RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return 0, 0, 0, 0
-    try:
-        ext = wintypes.RECT()
-        if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
-                                        ctypes.byref(ext), ctypes.sizeof(ext)) == 0:
-            return (ext.left - rect.left, ext.top - rect.top,
-                    rect.right - ext.right, rect.bottom - ext.bottom)
-    except:
-        pass
-    return 0, 0, 0, 0
 
 def get_monitors():
-    """Return cached list of work-area rectangles for all monitors"""
+    """Return cached list of work area rectangles (x, y, w, h) for all monitors."""
     global MONITORS_CACHE
     if MONITORS_CACHE:
         return MONITORS_CACHE
@@ -170,6 +144,61 @@ def get_monitors():
     MONITORS_CACHE = monitors
     return monitors
 
+def get_window_state(hwnd):
+    """Return window state: 'normal', 'minimized', 'maximized', or 'hidden'"""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return None
+    
+    if not user32.IsWindowVisible(hwnd):
+        return 'hidden'
+    
+    if win32gui.IsIconic(hwnd):
+        return 'minimized'
+    
+    style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+    if style & WS_MAXIMIZE:
+        return 'maximized'
+    
+    return 'normal'
+
+def get_frame_borders(hwnd):
+    """Return (left, top, right, bottom) invisible border/shadow thickness"""
+    rect = wintypes.RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return 0, 0, 0, 0
+    try:
+        ext = wintypes.RECT()
+        if dwmapi.DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS,
+                                        ctypes.byref(ext), ctypes.sizeof(ext)) == 0:
+            return (ext.left - rect.left, ext.top - rect.top,
+                    rect.right - ext.right, rect.bottom - ext.bottom)
+    except:
+        pass
+    return 0, 0, 0, 0
+
+def set_window_border(hwnd, color):
+    """Unique function to apply (or remove) a colored DWM border."""
+    global border_locked, border_lock_owner
+    
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+        
+    try:
+        if color is None:
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(ctypes.c_uint(DWMWA_COLOR_NONE)),
+                ctypes.sizeof(ctypes.c_uint)
+            )
+        else:
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, DWMWA_BORDER_COLOR,
+                ctypes.byref(ctypes.c_uint(color)),
+                ctypes.sizeof(ctypes.c_uint)
+            )
+    except:
+        pass
+
 def is_useful_window(title, class_name=""):
     """Filter out overlays, PIPs, taskbar, notifications, etc."""
     if not title:
@@ -177,6 +206,22 @@ def is_useful_window(title, class_name=""):
 
     title_lower = title.lower()
     class_lower = class_name.lower() if class_name else ""
+
+    # === SPECIAL CASE: Microsoft Teams ===
+    if "teams" in title_lower:
+        # Keep the main Teams window (class TeamsWebView)
+        if class_lower == "teamswebview":
+            return True
+
+        # Exclude popups, notifications, calls, and meeting windows
+        bad_substrings = [
+            "notification", "notif", "toast", "popup",
+            "appel", "call", "calling", "incoming", "entrant",
+            "réunion", "meeting", "join", "rejoindre",
+            "|",   # Teams often uses "|" in popup window titles
+        ]
+        if any(bad in title_lower for bad in bad_substrings):
+            return False
 
     # === HARD EXCLUDE BY TITLE ===
     bad_titles = [
@@ -220,13 +265,22 @@ def is_useful_window(title, class_name=""):
     return True
 
 def get_visible_windows():
-    """Enumerate all visible, non-minimized, useful windows"""
-    global overlay_hwnd  # Ajoute cette ligne en haut
-    
+    """Enumerate visible, non-minimized, non-maximized, tileable windows"""
+    global overlay_hwnd
+
     monitors = get_monitors()
     windows = []
+    
     def enum(hwnd, _):
         if user32.IsWindowVisible(hwnd):
+            state = get_window_state(hwnd)
+            
+            # Skip minimized/maximized
+            if state in ('minimized', 'maximized'):
+                return True
+            elif state != 'normal':
+                return True
+            
             rect = wintypes.RECT()
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 w = rect.right - rect.left
@@ -237,7 +291,6 @@ def get_visible_windows():
                     title = title_buf.value or ""
                     class_name = win32gui.GetClassName(hwnd)
 
-                    # SKIP OVERLAY WINDOW
                     if overlay_hwnd and hwnd == overlay_hwnd:
                         return True
                     
@@ -256,18 +309,194 @@ def get_visible_windows():
     )
     return windows
 
+# ==============================================================================
+# LAYOUT ENGINE
+# ==============================================================================
+
+def choose_layout(count):
+    """Choose optimal layout based on window count (full → side-by-side → grid)"""
+    if count == 1: return "full", None
+    if count == 2: return "side_by_side", None
+    if count == 3: return "master_stack", None
+    if count == 4: return "grid", (2, 2)
+    if count <= 6: return "grid", (3, 2)
+    if count <= 9: return "grid", (3, 3)
+    if count <= 12: return "grid", (4, 3)
+    return "grid", (5, 3)
+
+def smart_tile_with_restore():
+    """Smart tiling that respects saved grid positions"""
+    global grid_state, ignore_retile_until
+
+    if time.time() < ignore_retile_until:
+        return
+    
+    monitors = get_monitors()
+
+    # Clean grid_state BEFORE enumerating visible windows
+    for hwnd in list(grid_state.keys()):
+        state = get_window_state(hwnd)
+        if not user32.IsWindow(hwnd) or state in ('minimized', 'maximized'):
+            grid_state.pop(hwnd, None)
+
+    visible_windows = get_visible_windows()
+    
+    if not visible_windows:
+        log("[TILE] No windows detected.")
+        return
+
+    # Clean grid_state again BEFORE splitting windows by monitor
+    for hwnd in list(grid_state.keys()):
+        state = get_window_state(hwnd)
+        if not user32.IsWindow(hwnd) or state in ('minimized', 'maximized'):
+            grid_state.pop(hwnd, None)
+
+    # Separate windows by monitor
+    wins_by_monitor = {}
+    for hwnd, title, rect in visible_windows:
+        # Check if window has a saved position (was minimized/maximized)
+        if hwnd in minimized_windows:
+            mon_idx, col, row = minimized_windows[hwnd]
+            # Remove from minimized tracking
+            del minimized_windows[hwnd]
+            log(f"[RESTORE] Restoring minimized window to ({col},{row}): {title[:40]}")
+        elif hwnd in maximized_windows:
+            mon_idx, col, row = maximized_windows[hwnd]
+            del maximized_windows[hwnd]
+            log(f"[RESTORE] Restoring maximized window to ({col},{row}): {title[:40]}")
+        elif hwnd in grid_state:
+            # Keep existing position
+            mon_idx, col, row = grid_state[hwnd]
+        else:
+            # New window - will be assigned below
+            mon_idx = 0
+            col, row = 0, 0
+        
+        wins_by_monitor.setdefault(mon_idx, []).append((hwnd, title, rect, col, row))
+    
+    # Process each monitor
+    new_grid = {}
+    
+    for mon_idx, windows in wins_by_monitor.items():
+        if mon_idx >= len(monitors):
+            continue
+            
+        mon_x, mon_y, mon_w, mon_h = monitors[mon_idx]
+        
+        count = len(windows)
+        layout, info = choose_layout(count)
+        
+        log(f"\n[TILE] Monitor {mon_idx+1}: {count} windows -> {layout} layout")
+        
+        # Build position map based on current layout
+        if layout == "full":
+            positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                         mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
+            grid_coords = [(0, 0)]
+            
+        elif layout == "side_by_side":
+            cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
+            positions = [
+                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
+                (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)
+            ]
+            grid_coords = [(0, 0), (1, 0)]
+            
+        elif layout == "master_stack":
+            mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+            sw = mon_w - 2*EDGE_PADDING - mw - GAP
+            sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
+            positions = [
+                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)
+            ]
+            grid_coords = [(0, 0), (1, 0), (1, 1)]
+            
+        else:  # grid
+            cols, rows = info
+            total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
+            total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
+            cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
+            cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
+            
+            positions = []
+            grid_coords = []
+            for r in range(rows):
+                for c in range(cols):
+                    if len(positions) >= count:
+                        break
+                    x = mon_x + EDGE_PADDING + c * (cell_w + GAP)
+                    y = mon_y + EDGE_PADDING + r * (cell_h + GAP)
+                    positions.append((x, y, cell_w, cell_h))
+                    grid_coords.append((c, r))
+        
+        # Create position lookup
+        pos_map = dict(zip(grid_coords, positions))
+        
+        # SMART ASSIGNMENT: Try to restore saved positions first
+        assigned = set()
+        unassigned_windows = []
+        
+        # Phase 1: Assign windows that have saved positions
+        for hwnd, title, rect, saved_col, saved_row in windows:
+            target_coords = (saved_col, saved_row)
+            
+            # Check if saved position is valid in current layout
+            if target_coords in pos_map and target_coords not in assigned:
+                # Perfect - restore to exact position
+                x, y, w, h = pos_map[target_coords]
+                force_tile_resizable(hwnd, x, y, w, h)
+                new_grid[hwnd] = (mon_idx, saved_col, saved_row)
+                assigned.add(target_coords)
+                log(f"   ✓ RESTORED to ({saved_col},{saved_row}): {title[:50]}")
+                time.sleep(0.015)
+            else:
+                # Saved position doesn't exist in current layout - reassign later
+                unassigned_windows.append((hwnd, title, rect))
+        
+        # Phase 2: Assign remaining windows to available positions
+        available_positions = [coord for coord in grid_coords if coord not in assigned]
+        
+        for i, (hwnd, title, rect) in enumerate(unassigned_windows):
+            if i < len(available_positions):
+                col, row = available_positions[i]
+                x, y, w, h = pos_map[(col, row)]
+                force_tile_resizable(hwnd, x, y, w, h)
+                new_grid[hwnd] = (mon_idx, col, row)
+                log(f"   → NEW position ({col},{row}): {title[:50]}")
+                time.sleep(0.015)
+    
+    grid_state = new_grid
+    
+    time.sleep(0.06)
+
 def force_tile_resizable(hwnd, x, y, w, h):
-    """Move and resize window with pixel-perfect accuracy (border/shadow aware)"""
+    """Move and resize window to exact coordinates, handling borders and restore from min/max states."""
+    state = get_window_state(hwnd)
+    if state in ('minimized', 'maximized'):
+        return
+
     style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-    user32.SetWindowLongW(hwnd, GWL_STYLE, (style | WS_THICKFRAME) & ~WS_MAXIMIZE)
-    user32.ShowWindowAsync(hwnd, SW_RESTORE)
+    if not (style & WS_MAXIMIZE):
+        user32.SetWindowLongW(hwnd, GWL_STYLE, (style | WS_THICKFRAME) & ~WS_MAXIMIZE)
+
+    if state != 'normal':
+        user32.ShowWindowAsync(hwnd, SW_RESTORE)
+        for _ in range(10):
+            if get_window_state(hwnd) == 'normal':
+                break
+            time.sleep(0.02)
+
     time.sleep(0.012)
     user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
 
+    # Mandatory initialization step
     lb, tb, rb, bb = get_frame_borders(hwnd)
     ax, ay = x - lb, y - tb
     aw, ah = w + lb + rb, h + tb + bb
+
     flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING
 
     for _ in range(10):
@@ -293,261 +522,227 @@ def force_tile_resizable(hwnd, x, y, w, h):
     final_h = rect.bottom - rect.top - tb - bb
     if abs(final_w - w) > 15 or abs(final_h - h) > 15:
         title = win32gui.GetWindowText(hwnd)
-        print(f"   [NUKE] MoveWindow forced on -> {title[:60]}")
+        log(f"   [NUKE] MoveWindow forced on -> {title[:60]}")
         win32gui.MoveWindow(hwnd, int(x), int(y), int(w), int(h), True)
 
-# ==============================================================================
-# Smart layout chooser
-# ==============================================================================
-def choose_layout(count):
-    """Choose optimal layout based on window count (full → side-by-side → grid)"""
-    if count == 1: return "full", None
-    if count == 2: return "side_by_side", None
-    if count == 3: return "master_stack", None
-    if count == 4: return "grid", (2, 2)
-    if count <= 6: return "grid", (3, 2)
-    if count <= 9: return "grid", (3, 3)
-    if count <= 12: return "grid", (4, 3)
-    return "grid", (5, 3)
-
-def clear_all_borders():
-    """Remove custom colored borders from all windows (cleanup utility)"""
-    def enum_callback(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            try:
-                none = ctypes.c_uint(DWMWA_COLOR_NONE)
-                dwmapi.DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR,
-                                             ctypes.byref(none), ctypes.sizeof(ctypes.c_uint))
-            except:
-                pass
-        return True
+def force_immediate_retile():
+    """Ctrl+Alt+R → force immediate re-tile (bypass all grace delays)."""
+    global ignore_retile_until, last_visible_count, retile_locked
     
-    enum_proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum_callback)
-    user32.EnumWindows(enum_proc, 0)
-
-# ==============================================================================
-# smart_tile with intelligent layouts + your grid fallback
-# ==============================================================================
-def assign_grid_position(grid_dict, hwnd, monitor_idx, layout, info, index):
-    """
-    Assigns true grid coordinates (column, row) to a window.
-    Critical for perfect Drag & Drop Snap behavior — especially in master/stack layouts.
-    """
-    if layout == "full":
-        grid_dict[hwnd] = (monitor_idx, 0, 0)          # Full-screen → single cell
-    elif layout == "side_by_side":
-        col = 0 if index == 0 else 1
-        grid_dict[hwnd] = (monitor_idx, col, 0)        # Two equal columns side by side
-    elif layout == "master_stack":
-        if index == 0:
-            grid_dict[hwnd] = (monitor_idx, 0, 0)      # Master pane (left, full heigh)
-        elif index == 1:
-            grid_dict[hwnd] = (monitor_idx, 1, 0)      # Stack pane → top-right
-        elif index == 2:
-            grid_dict[hwnd] = (monitor_idx, 1, 1)      # Stack pane → bottom-right
-    else:  # grid
-        cols, rows = info
-        grid_dict[hwnd] = (monitor_idx, index % cols, index // cols) # Classic grid layout
-
-def smart_tile(temp=False):
-    """Full retile: detect windows → choose layout → assign grid positions"""
-    global grid_state
-    
-    if temp:
-        clear_all_borders()
-        time.sleep(0.05)
-    
-    monitors = get_monitors()
-    visible_windows = get_visible_windows()
-    if not visible_windows:
-        print("[TILE] No windows detected.")
+    if retile_locked:  # swap mode actif → on ne touche pas
         return
+        
+    log("\n[FORCE RETILE] Ctrl+Alt+R → Immediate full re-tile (bypasses all grace periods)")
+    ignore_retile_until = 0          # Bypass the usual 0.6s grace period
+    last_visible_count = 0           # Force change detection on next cycle
+    try:
+        winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+    except:
+        pass
+    smart_tile_with_restore()
 
-    count = len(visible_windows)
-    mon_x, mon_y, mon_w, mon_h = monitors[0]
-    layout, info = choose_layout(count)
+# ==============================================================================
+# BORDER MANAGEMENT
+# ==============================================================================
 
-    positions = []
+def apply_border(hwnd):
+    """Central wrapper for green active window border."""
+    if not hwnd or not user32.IsWindow(hwnd):
+        return
+    set_window_border(hwnd, 0x0000FF00)  # vert
+    global current_hwnd
+    current_hwnd = hwnd
 
-    if layout == "full":
-        x = mon_x + EDGE_PADDING
-        y = mon_y + EDGE_PADDING
-        w = mon_w - 2 * EDGE_PADDING
-        h = mon_h - 2 * EDGE_PADDING
-        positions = [(x, y, w, h)]
+def lock_borders(owner="normal"):
+    """Lock border thread while swap mode handles borders."""
+    global border_locked, border_lock_owner
+    border_locked = True
+    border_lock_owner = owner
 
-    elif layout == "side_by_side":
-        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-        ch = mon_h - 2*EDGE_PADDING
-        positions = [
-            (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, ch),
-            (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, ch)
-        ]
+def unlock_borders():
+    """Unlock border thread – resume normal border handling."""
+    global border_locked, border_lock_owner
+    border_locked = False
+    border_lock_owner = None
 
-    elif layout == "master_stack":
-        mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
-        sw = mon_w - 2*EDGE_PADDING - mw - GAP
-        sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-        positions = [
-            (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
-            (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
-            (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)
-        ]
+def update_active_border():
+    """Update green border: only one window at a time."""
+    global current_hwnd
 
-    else:
-        cols, rows = info
-        total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
-        total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
-        cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
-        cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
-        for r in range(rows):
-            for c in range(cols):
-                if len(positions) >= count:
-                    break
-                x = mon_x + EDGE_PADDING + c * (cell_w + GAP)
-                y = mon_y + EDGE_PADDING + r * (cell_h + GAP)
-                positions.append((x, y, cell_w, cell_h))
-
-    print(f"\n[TILE] {count} windows -> {layout} layout (temp={temp})")
-    new_grid = {}
-    for i, (hwnd, title, _) in enumerate(visible_windows[:len(positions)]):
-        x, y, w, h = positions[i]
-        force_tile_resizable(hwnd, x, y, w, h)
-        print(f"   -> {title[:60]}")
-        time.sleep(0.015 + i * 0.003)
-
-        assign_grid_position(new_grid, hwnd, 0, layout, info, i)
-
-    grid_state = new_grid
-
-    time.sleep(0.06)
-    # Preserve border after tiling/snap operations
-    #    • If swap mode is active → keep RED border on the selected window
-    #    • Otherwise → apply normal GREEN border to the currently active window
+    # If swap mode is active → DO NOT TOUCH ANYTHING, the red border is sacred
     if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
-        color_val = ctypes.c_uint(0x000000FF)
-        dwmapi.DwmSetWindowAttribute(
-            selected_hwnd, DWMWA_BORDER_COLOR,
-            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-        )
-    else:
-        active = user32.GetForegroundWindow()
-        if active and user32.IsWindowVisible(active):
-            apply_border(active)
-
-# ==============================================================================
-# Multi-monitor
-# ==============================================================================
-def move_current_workspace_to_next_monitor():
-    """Move ONLY the current workspace to the next monitor (workspace-aware)"""
-    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace
-    
-    if not grid_state:
-        print("[MOVE] Nothing to move - no windows in grid")
-        return
-    if len(MONITORS_CACHE) <= 1:
-        print("[MOVE] Only one monitor detected")
         return
 
-    # Save current workspace before moving
-    old_mon = CURRENT_MONITOR_INDEX
-    old_ws = current_workspace.get(old_mon, 0)
-    save_workspace(old_mon)
-
-    # Calculate target monitor
-    new_mon = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
-    CURRENT_MONITOR_INDEX = new_mon
-    
-    mon = MONITORS_CACHE[new_mon]
-    mon_x, mon_y, mon_w, mon_h = mon
-    
-    # Get windows from current workspace on OLD monitor only
-    windows_to_move = [(hwnd, pos) for hwnd, pos in grid_state.items() 
-                       if pos[0] == old_mon and user32.IsWindow(hwnd)]
-    
-    if not windows_to_move:
-        print(f"[MOVE] No windows to move from monitor {old_mon+1}")
+    if border_locked:           # Swap mode (or other lock) → do not touch borders
         return
-    
-    count = len(windows_to_move)
-    layout, info = choose_layout(count)
 
-    # Clear borders before move
-    clear_all_borders()
-    time.sleep(0.05)
-
-    # Calculate new positions on target monitor
-    positions = []
-    if layout == "full":
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-                      mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
-    elif layout == "side_by_side":
-        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
-                     (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)]
-    elif layout == "master_stack":
-        mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
-        sw = mon_w - 2*EDGE_PADDING - mw - GAP
-        sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
-                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
-                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)]
-    else:
-        cols, rows = info
-        total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
-        total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
-        cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
-        cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
-        for r in range(rows):
-            for c in range(cols):
-                if len(positions) >= count: break
-                positions.append((mon_x + EDGE_PADDING + c*(cell_w+GAP),
-                                  mon_y + EDGE_PADDING + r*(cell_h+GAP), cell_w, cell_h))
-
-    # Move windows to new monitor
-    new_grid = {}
-    print(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
-    for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
-        x, y, w, h = positions[i]
-        force_tile_resizable(hwnd, x, y, w, h)
-        assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
-        title = win32gui.GetWindowText(hwnd)
-        print(f"   -> {title[:50]}")
-        time.sleep(0.015)
-
-    # Update grid_state (remove old entries, add new ones)
-    for hwnd, _ in windows_to_move:
-        grid_state.pop(hwnd, None)
-    grid_state.update(new_grid)
-
-    time.sleep(0.15)
     active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active):
-        apply_border(active)
-    
-    # Save to workspace on new monitor (same workspace number)
-    current_workspace[new_mon] = old_ws
-    save_workspace(new_mon)
-    
-    print(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
+
+    # Case 1: A real tiled window is currently in the foreground
+    if (active
+        and active in grid_state
+        and user32.IsWindowVisible(active)
+        and get_window_state(active) == 'normal'):
+
+        if current_hwnd != active:
+            # Remove previous green border
+            if current_hwnd and user32.IsWindow(current_hwnd):
+                set_window_border(current_hwnd, None)
+            # Apply green border to the new active window
+            apply_border(active)
+            current_hwnd = active
+
+    # Case 2: No tiled window is active anymore → remove the green border
+    elif current_hwnd and user32.IsWindow(current_hwnd):
+        set_window_border(current_hwnd, None)
+        current_hwnd = None
 
 # ==============================================================================
 # SWAP MODE
 # ==============================================================================
-def get_window_position_info(hwnd):
-    """Return (center_x, center_y, monitor_index, grid_col, grid_row) for a tiled window"""
-    if hwnd not in grid_state:
-        return None
+
+def enter_swap_mode():
+    """Enter swap mode: red border + arrow keys to swap window positions."""
+    global swap_mode, selected_hwnd, last_active_hwnd, border_locked, retile_locked
     
-    rect = wintypes.RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
+    # Wait a tiny bit for the tiling to stabilize
+    time.sleep(0.05)
     
-    x_center = (rect.left + rect.right) // 2
-    y_center = (rect.top + rect.bottom) // 2
-    mon_idx, col, row = grid_state[hwnd]
+    # Force a quick update of grid_state in case it's empty or updating
+    if not grid_state:
+        visible_windows = get_visible_windows()
+        for hwnd, title, _ in visible_windows:
+            if hwnd not in grid_state:
+                grid_state[hwnd] = (0, 0, 0)
+        log(f"[SWAP] grid_state was empty → rebuilt with {len(grid_state)} windows")
+        if not grid_state:
+            log("[SWAP] No tiled windows detected. First press Ctrl+Alt+T or Ctrl+Alt+R")
+            return
+
+    # SMART SELECTION LOGIC FOR SWAP MODE (priority order)
+    candidate = None
     
-    return (x_center, y_center, mon_idx, col, row)
+    # 1. Highest priority: last known active tiled window (preserves selection even if focus is temporarily lost)
+    if last_active_hwnd and user32.IsWindow(last_active_hwnd) and last_active_hwnd in grid_state:
+        candidate = last_active_hwnd
+    # 2. Fallback: currently foreground window (if it's tiled)
+    elif user32.GetForegroundWindow() in grid_state:
+        candidate = user32.GetForegroundWindow()
+    # 3. Last resort: first window in the current grid
+    else:
+        candidate = next(iter(grid_state.keys()), None)
+
+    if not candidate:
+        log("[SWAP] No valid window to select")
+        return
+
+    swap_mode = True
+    selected_hwnd = candidate
+
+    lock_borders("swap")          # Lock border updates (blocks monitor() thread interference)
+    retile_locked = True          # Prevent automatic re-tiling during swap mode
+    time.sleep(0.05)
+    set_window_border(selected_hwnd, 0x000000FF)  # Red
+
+    log(f"[SWAP] Swap mode enabled — target window marked with solid red border")
+    register_swap_hotkeys()
+    update_tray_menu()
+    
+    title = win32gui.GetWindowText(selected_hwnd)[:50]
+    log(f"\n[SWAP] ✓ Activated - Selected window: '{title}'")
+    log(f"[SWAP] Selected hwnd: {selected_hwnd}")
+    log("━" * 60)
+    log("  DIRECT SWAP with arrow keys:")
+    log("    ← → ↑ ↓  : Swap with adjacent window")
+    log("    Enter     : Confirm selection")
+    log("    Ctrl+Alt+S : Exit swap mode")
+    log("  ")
+    log("  The red window FOLLOWS your movements and swaps its position!")
+    log("━" * 60)
+    register_swap_hotkeys()
+    # Refresh tray menu
+    update_tray_menu()
+
+def navigate_swap(direction):
+    """Handle arrow key press in swap mode → find and swap with adjacent window"""
+    global selected_hwnd
+    
+    if not swap_mode or not selected_hwnd:
+        log("[SWAP] Mode not active or no window selected")
+        return
+    
+    log(f"[SWAP] Attempting to swap {direction}...")
+    
+    # Find the window in the specified direction
+    target = find_window_in_direction(selected_hwnd, direction)
+    
+    if target:
+        # DIRECT SWAP!
+        if swap_windows(selected_hwnd, target):
+            # The selected window (red) has moved, we follow it
+            # selected_hwnd logically remains the same, but physically it has changed position
+            
+            # Clear and reapply the red border on the window that moved
+            time.sleep(0.04)
+            set_window_border(selected_hwnd, None)
+            time.sleep(0.04)
+            set_window_border(selected_hwnd, 0x000000FF)
+            
+            title = win32gui.GetWindowText(selected_hwnd)[:50]
+            log(f"[SWAP] ✓ '{title}' swapped {direction}")
+            
+            # Focus on the window that moved
+            user32.SetForegroundWindow(selected_hwnd)
+        else:
+            log(f"[SWAP] ✗ Swap failed")
+    else:
+        log(f"[SWAP] ✗ No window in the {direction} direction (grid limit)")
+
+def confirm_swap():
+    """Confirm current swap selection and exit swap mode (bound to Enter)"""
+    global swap_mode, selected_hwnd
+
+    if not swap_mode or not selected_hwnd:
+        log("[SWAP] Swap mode not active or no window selected")
+        return
+
+    log(f"[SWAP] Confirming swap for hwnd {selected_hwnd}")
+
+    exit_swap_mode()
+    log("[SWAP] ✓ Swap confirmed and mode exited")
+
+def exit_swap_mode():
+    """Exit swap mode, clean borders, restore normal green border on active window."""
+    global swap_mode, selected_hwnd, current_hwnd, retile_locked
+    
+    if not swap_mode:
+        return
+    
+    # First, clear ALL borders
+    log("[SWAP] Clearing borders...")
+    if selected_hwnd and user32.IsWindow(selected_hwnd):
+        set_window_border(selected_hwnd, None)
+    selected_hwnd = None
+    time.sleep(0.06)
+    
+    unlock_borders()
+    retile_locked = False
+
+    swap_mode = False
+    unregister_swap_hotkeys()
+    old_selected = selected_hwnd
+    selected_hwnd = None
+    current_hwnd = None
+    
+    # Restore the green border on the active window
+    active = user32.GetForegroundWindow()
+    if active and user32.IsWindowVisible(active) and active in grid_state:
+        apply_border(active)
+        log(f"[SWAP] Green border restored on active window")
+    
+    log("[SWAP] ✓ Deactivated\n")
+    # Refresh tray menu
+    update_tray_menu()
 
 def find_window_in_direction(from_hwnd, direction):
     """Find the closest tiled window in the specified direction (left/right/up/down)"""
@@ -618,8 +813,8 @@ def swap_windows(hwnd1, hwnd2):
         return False
     
     # First clear all borders
-    remove_border(hwnd1)
-    remove_border(hwnd2)
+    set_window_border(hwnd1, None)
+    set_window_border(hwnd2, None)
     time.sleep(0.05)
     
     # Retrieve the current positions
@@ -645,7 +840,7 @@ def swap_windows(hwnd1, hwnd2):
     
     title1 = win32gui.GetWindowText(hwnd1)[:40]
     title2 = win32gui.GetWindowText(hwnd2)[:40]
-    print(f"[SWAP] '{title1}' ↔ '{title2}'")
+    log(f"[SWAP] '{title1}' ↔ '{title2}'")
     
     # Swap the positions in grid_state
     grid_state[hwnd1], grid_state[hwnd2] = grid_state[hwnd2], grid_state[hwnd1]
@@ -655,296 +850,229 @@ def swap_windows(hwnd1, hwnd2):
     time.sleep(0.04)
     force_tile_resizable(hwnd2, x1, y1, w1, h1)
     time.sleep(0.04)
-    
-    # Clear the borders again after the swap
-    remove_border(hwnd1)
-    remove_border(hwnd2)
-    
     return True
 
-def enter_swap_mode():
-    """Activate swap mode with red border and arrow-key navigation"""
-    global swap_mode, selected_hwnd, current_hwnd, last_active_hwnd
+# ==============================================================================
+# DRAG & DROP SNAP + PREVIEW
+# ==============================================================================
+
+class PAINTSTRUCT(ctypes.Structure):
+    _fields_ = [
+        ("hdc", wintypes.HDC),
+        ("fErase", wintypes.BOOL),
+        ("rcPaint", wintypes.RECT),
+        ("fRestore", wintypes.BOOL),
+        ("fIncUpdate", wintypes.BOOL),
+        ("rgbReserved", ctypes.c_char * 32)
+    ]
+
+def create_overlay_window():
+    """Create transparent topmost overlay for drag-and-drop snap preview."""
+    global overlay_hwnd
     
-    # Wait a tiny bit for the tiling to stabilize
-    time.sleep(0.05)
+    if overlay_hwnd:
+        return overlay_hwnd
     
-    # Force a quick update of grid_state in case it's empty or updating
-    if not grid_state:
-        visible_windows = get_visible_windows()
-        for hwnd, title, _ in visible_windows:
-            if hwnd not in grid_state:
-                grid_state[hwnd] = (0, 0, 0)
-        print(f"[SWAP] grid_state was empty → rebuilt with {len(grid_state)} windows")
-        if not grid_state:
-            print("[SWAP] No tiled windows detected. First press Ctrl+Alt+T or Ctrl+Alt+R")
-            return
-
-    # SMART SELECTION LOGIC FOR SWAP MODE (priority order)
-    candidate = None
+    class_name = "SmartGridOverlay"
     
-    # 1. Highest priority: last known active tiled window (preserves selection even if focus is temporarily lost)
-    if last_active_hwnd and user32.IsWindow(last_active_hwnd) and last_active_hwnd in grid_state:
-        candidate = last_active_hwnd
-    # 2. Fallback: currently foreground window (if it's tiled)
-    elif user32.GetForegroundWindow() in grid_state:
-        candidate = user32.GetForegroundWindow()
-    # 3. Last resort: first window in the current grid
-    else:
-        candidate = next(iter(grid_state.keys()), None)
-
-    if not candidate:
-        print("[SWAP] No valid window to select")
-        return
-
-    swap_mode = True
-    selected_hwnd = candidate
-
-    # Clean up any existing green border if the selected window was previously active
-    if current_hwnd == selected_hwnd:
-        remove_border(current_hwnd)
-
-    # Apply red border
-    color_val = ctypes.c_uint(0x000000FF)  # Bright red (BGR format)
-    dwmapi.DwmSetWindowAttribute(
-        selected_hwnd, DWMWA_BORDER_COLOR,
-        ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
+    # Properly define DefWindowProc with correct signature
+    DefWindowProc = ctypes.windll.user32.DefWindowProcW
+    DefWindowProc.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
+    DefWindowProc.restype = wintypes.LPARAM
+    
+    # Define WNDPROCTYPE properly
+    WNDPROCTYPE = ctypes.WINFUNCTYPE(
+        wintypes.LPARAM,    # Return type (changed from c_long)
+        wintypes.HWND,      # hwnd
+        ctypes.c_uint,      # msg
+        wintypes.WPARAM,    # wparam
+        wintypes.LPARAM     # lparam
     )
     
-    title = win32gui.GetWindowText(selected_hwnd)[:50]
-    print(f"\n[SWAP MODE] ✓ Activated - Selected window: '{title}'")
-    print(f"[SWAP MODE] Selected hwnd: {selected_hwnd}")
-    print("━" * 60)
-    print("  DIRECT SWAP with arrow keys:")
-    print("    ← → ↑ ↓  : Swap with adjacent window")
-    print("    Enter     : Confirm selection")
-    print("    Ctrl+Alt+S : Exit swap mode")
-    print("  ")
-    print("  The red window FOLLOWS your movements and swaps its position!")
-    print("━" * 60)
-    register_swap_hotkeys()
-    # Refresh tray menu
-    update_tray_menu()
-
-def navigate_swap(direction):
-    """Handle arrow key press in swap mode → find and swap with adjacent window"""
-    global selected_hwnd
-    
-    if not swap_mode or not selected_hwnd:
-        print("[SWAP] Mode not active or no window selected")
-        return
-    
-    print(f"[SWAP] Attempting to swap {direction}...")
-    
-    # Find the window in the specified direction
-    target = find_window_in_direction(selected_hwnd, direction)
-    
-    if target:
-        # DIRECT SWAP!
-        if swap_windows(selected_hwnd, target):
-            # The selected window (red) has moved, we follow it
-            # selected_hwnd logically remains the same, but physically it has changed position
-            
-            # Clear and reapply the red border on the window that moved
-            time.sleep(0.04)
-            remove_border(selected_hwnd)
-            time.sleep(0.04)
-            color_val = ctypes.c_uint(0x000000FF)
-            dwmapi.DwmSetWindowAttribute(
-                selected_hwnd, DWMWA_BORDER_COLOR,
-                ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-            )
-            
-            title = win32gui.GetWindowText(selected_hwnd)[:50]
-            print(f"[SWAP] ✓ '{title}' swapped {direction}")
-            
-            # Focus on the window that moved
-            user32.SetForegroundWindow(selected_hwnd)
-        else:
-            print(f"[SWAP] ✗ Swap failed")
-    else:
-        print(f"[SWAP] ✗ No window in the {direction} direction (grid limit)")
-
-def confirm_swap():
-    """Confirm current swap selection and exit swap mode (bound to Enter)"""
-    global swap_mode, selected_hwnd
-
-    if not swap_mode or not selected_hwnd:
-        print("[SWAP] Swap mode not active or no window selected")
-        return
-
-    print(f"[SWAP] Confirming swap for hwnd {selected_hwnd}")
-
-    exit_swap_mode()
-    print("[SWAP] ✓ Swap confirmed and mode exited")
-
-def exit_swap_mode():
-    """Exit swap mode and restore normal green border on active window"""
-    global swap_mode, selected_hwnd, current_hwnd
-    
-    if not swap_mode:
-        return
-    
-    # First, clear ALL borders
-    print("[SWAP MODE] Clearing borders...")
-    clear_all_borders()
-    time.sleep(0.06)
-    
-    swap_mode = False
-    unregister_swap_hotkeys()
-    old_selected = selected_hwnd
-    selected_hwnd = None
-    current_hwnd = None
-    
-    # Restore the green border on the active window
-    active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active) and active in grid_state:
-        color_val = ctypes.c_uint(0x0000FF00)  # Vert
-        dwmapi.DwmSetWindowAttribute(
-            active, DWMWA_BORDER_COLOR,
-            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-        )
-        current_hwnd = active
-        print(f"[SWAP MODE] Green border restored on active window")
-    
-    print("[SWAP MODE] ✓ Deactivated\n")
-    # Refresh tray menu
-    update_tray_menu()
-
-# ==============================================================================
-# Polling monitor - Auto-retile when windows are shown/hidden/minimized/restored
-# ==============================================================================
-def monitor():
-    """Background loop: auto-retile on window events + track active window border"""
-    global current_hwnd, grid_state, last_visible_count, last_active_hwnd
-
-    while True:
-        if is_active:
-            # Clean dead windows
-            for hwnd in list(grid_state.keys()):
-                if not user32.IsWindow(hwnd):
-                    grid_state.pop(hwnd, None)
-
-            # Get currently visible windows
-            visible_windows = get_visible_windows()
-            current_count = len(visible_windows)
-            current_hwnds = {hwnd for hwnd, _, _ in visible_windows}
-
-            # Add newly visible windows to grid_state (so they get tiled)
-            updated = False
-            for hwnd, title, _ in visible_windows:
-                if hwnd not in grid_state:
-                    grid_state[hwnd] = (0, 0, 0)
-                    updated = True
-
-            # Auto-retile only if number of visible windows changed
-            if current_count != last_visible_count or updated:
-                print(f"[AUTO-RETILE] {last_visible_count} → {current_count} visible windows")
-                smart_tile(temp=True)
-                last_visible_count = current_count
-                time.sleep(0.2)
-
-        # Border management – completely different behavior depending on mode
-        if swap_mode:
-            if selected_hwnd and user32.IsWindow(selected_hwnd):
-                # Read current border color from DWM
-                current_color = ctypes.c_uint()
-                result = dwmapi.DwmGetWindowAttribute(
-                    selected_hwnd,
-                    DWMWA_BORDER_COLOR,
-                    ctypes.byref(current_color),
-                    ctypes.sizeof(current_color)
-                )
-                # If reading failed OR color is not red → Windows has removed it → reapply
-                if result != 0 or current_color.value != 0x000000FF:
-                    color_val = ctypes.c_uint(0x000000FF)
-                    dwmapi.DwmSetWindowAttribute(
-                        selected_hwnd, DWMWA_BORDER_COLOR,
-                        ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-                    )
-        else:
-            # === NORMAL MODE: green border never disappears, even when clicking the systray ===
-            active = user32.GetForegroundWindow()
-
-            # Case 1: a real tiled window has focus → follow it normally
-            if active and active in grid_state and user32.IsWindowVisible(active):
-                last_active_hwnd = active
-                apply_border(active, 0x0000FF00)        # apply immediately
-                current_hwnd = active
-
-            # Case 2: focus lost (systray, Alt+Tab, menu, etc.)
-            # → forcefully keep the green border on the last known tiled window, every loop
-            elif (last_active_hwnd
-                  and user32.IsWindow(last_active_hwnd)
-                  and user32.IsWindowVisible(last_active_hwnd)
-                  and last_active_hwnd in grid_state):
-                # Re-apply every cycle → Windows can't remove it
-                apply_border(last_active_hwnd, 0x0000FF00)
-                current_hwnd = last_active_hwnd
-
-            # Case 3: nothing valid left → clean up
-            else:
-                if current_hwnd:
-                    remove_border(current_hwnd)
-                    current_hwnd = None
-                    last_active_hwnd = None
-        time.sleep(0.06)
-
-# ==============================================================================
-# Toggle Persistent Auto-Tiling
-# ==============================================================================
-def toggle_persistent():
-    """Toggle persistent auto-tiling mode on/off"""
-    global is_active, monitor_thread
-    is_active = not is_active
-    print(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
-    if is_active:
-        smart_tile(temp=False)
-    # Refresh tray menu
-    update_tray_menu()
-
-# ==============================================================================
-# Hotkeys (Register / Unregister)
-# ==============================================================================
-def register_hotkeys():
-    """Register global hotkeys: Ctrl+Alt+T/R/Q/M/S for main features""" 
-    user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
-    user32.RegisterHotKey(None, HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R'))
-    user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
-    user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
-    user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
-    user32.RegisterHotKey(None, HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1'))
-    user32.RegisterHotKey(None, HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2'))
-    user32.RegisterHotKey(None, HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3'))
-
-def unregister_hotkeys():
-    """Unregister all main global hotkeys (cleanup on exit)"""
-    for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
-               HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3):
-        try: user32.UnregisterHotKey(None, hk)
-        except: pass
-
-def register_swap_hotkeys():
-    """Register arrow keys + Enter for navigation during swap mode"""   
-    user32.RegisterHotKey(None, HOTKEY_SWAP_LEFT,    0, win32con.VK_LEFT)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_RIGHT,   0, win32con.VK_RIGHT)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_UP,      0, win32con.VK_UP)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_DOWN,     0, win32con.VK_DOWN)
-    user32.RegisterHotKey(None, HOTKEY_SWAP_CONFIRM, 0, win32con.VK_RETURN)
-
-def unregister_swap_hotkeys():
-    """Unregister swap-mode hotkeys when leaving the mode"""
-    for id in (HOTKEY_SWAP_LEFT, HOTKEY_SWAP_RIGHT, HOTKEY_SWAP_UP, HOTKEY_SWAP_DOWN, HOTKEY_SWAP_CONFIRM):
+    # Window procedure for overlay
+    @WNDPROCTYPE
+    def wnd_proc(hwnd, msg, wparam, lparam):
         try:
-            user32.UnregisterHotKey(None, id)
-        except:
-            pass
+            if msg == win32con.WM_PAINT:
+                ps = PAINTSTRUCT()
+                hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
+                
+                if preview_rect:
+                    x, y, w, h = preview_rect
+                    
+                    # Create semi-transparent brush (blue with 30% opacity)
+                    brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
+                    pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
+                    
+                    old_brush = win32gui.SelectObject(hdc, brush)
+                    old_pen = win32gui.SelectObject(hdc, pen)
+                    
+                    # Draw rectangle
+                    win32gui.Rectangle(hdc, x, y, x + w, y + h)
+                    
+                    win32gui.SelectObject(hdc, old_brush)
+                    win32gui.SelectObject(hdc, old_pen)
+                    win32gui.DeleteObject(brush)
+                    win32gui.DeleteObject(pen)
+                
+                user32.EndPaint(hwnd, ctypes.byref(ps))
+                return 0
+            
+            elif msg == win32con.WM_DESTROY:
+                return 0
+            
+            # Use properly typed DefWindowProc
+            return DefWindowProc(hwnd, msg, wparam, lparam)
+        
+        except Exception as e:
+            log(f"[OVERLAY] Error in wnd_proc: {e}")
+            return 0
+    
+    # Register window class
+    wc = win32gui.WNDCLASS()
+    wc.lpfnWndProc = wnd_proc
+    wc.lpszClassName = class_name
+    wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
+    
+    try:
+        win32gui.RegisterClass(wc)
+    except:
+        pass  # Class already registered
+    
+    # Create layered window (for transparency)
+    overlay_hwnd = win32gui.CreateWindowEx(
+        win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
+        class_name,
+        "SmartGrid Preview",
+        win32con.WS_POPUP,
+        0, 0, 1, 1,  # Will be resized
+        0, 0, 0, None
+    )
+    
+    # Set 30% opacity
+    win32gui.SetLayeredWindowAttributes(overlay_hwnd, 0, int(255 * 0.3), win32con.LWA_ALPHA)
+    
+    return overlay_hwnd
 
-# ==============================================================================
-# DRAG & DROP SNAP
-# ==============================================================================
+def show_snap_preview(x, y, w, h):
+    """Show blue snap preview rectangle."""
+    global preview_rect, overlay_hwnd
+    
+    if not overlay_hwnd:
+        create_overlay_window()
+    
+    preview_rect = (x, y, w, h)
+    
+    # Position and show overlay window
+    win32gui.SetWindowPos(
+        overlay_hwnd, win32con.HWND_TOPMOST,
+        x, y, w, h,
+        win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
+    )
+    
+    # Force redraw
+    win32gui.InvalidateRect(overlay_hwnd, None, True)
+    win32gui.UpdateWindow(overlay_hwnd)
+
+def hide_snap_preview():
+    """Hide snap preview overlay."""
+    global preview_rect, overlay_hwnd
+    
+    preview_rect = None
+    
+    if overlay_hwnd:
+        win32gui.ShowWindow(overlay_hwnd, win32con.SW_HIDE)
+
+def calculate_target_rect(source_hwnd, cursor_pos):
+    """Compute target snap rectangle based on cursor position."""
+    
+    if source_hwnd not in grid_state:
+        return None
+   
+    monitors = get_monitors()
+    cx, cy = cursor_pos
+    
+    # Find target monitor
+    target_mon_idx = 0
+    for i, (mx, my, mw, mh) in enumerate(monitors):
+        if mx <= cx < mx + mw and my <= cy < my + mh:
+            target_mon_idx = i
+            break
+    
+    mon_x, mon_y, mon_w, mon_h = monitors[target_mon_idx]
+    
+    # Get windows currently on this monitor
+    wins_on_mon = [h for h, (m, _, _) in grid_state.items() 
+                   if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
+    count_including_source = len(wins_on_mon) + 1
+    current_layout, current_info = choose_layout(count_including_source)
+    
+    # Calculate target cell
+    target_col = target_row = 0
+    
+    if current_layout == "master_stack":
+        master_width = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+        master_right = mon_x + EDGE_PADDING + master_width + GAP//2
+        
+        if cx < master_right:
+            target_col, target_row = 0, 0
+            # Master pane dimensions
+            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                   master_width, mon_h - 2*EDGE_PADDING)
+        else:
+            # Stack pane
+            sw = mon_w - 2*EDGE_PADDING - master_width - GAP
+            sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
+            mid_y = mon_y + mon_h // 2
+            
+            if cy < mid_y:
+                # Top stack
+                return (mon_x + EDGE_PADDING + master_width + GAP, mon_y + EDGE_PADDING,
+                       sw, sh)
+            else:
+                # Bottom stack
+                return (mon_x + EDGE_PADDING + master_width + GAP, 
+                       mon_y + EDGE_PADDING + sh + GAP, sw, sh)
+    
+    elif current_layout == "side_by_side":
+        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
+        if cx < mon_x + mon_w // 2:
+            # Left side
+            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, 
+                   cw, mon_h - 2*EDGE_PADDING)
+        else:
+            # Right side
+            return (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING,
+                   cw, mon_h - 2*EDGE_PADDING)
+    
+    elif current_layout == "full":
+        return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+               mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)
+
+    else:  # grid
+        cols, rows = current_info if current_info else (2, 2)
+        max_c = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        max_r = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        cols = max(cols, max_c + 1)
+        rows = max(rows, max_r + 1)
+        
+        cell_w = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
+        cell_h = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
+        
+        rel_x = cx - mon_x - EDGE_PADDING
+        rel_y = cy - mon_y - EDGE_PADDING
+        target_col = min(max(0, rel_x // (cell_w + GAP)), cols - 1)
+        target_row = min(max(0, rel_y // (cell_h + GAP)), rows - 1)
+        
+        x = mon_x + EDGE_PADDING + target_col * (cell_w + GAP)
+        y = mon_y + EDGE_PADDING + target_row * (cell_h + GAP)
+        
+        return (x, y, cell_w, cell_h)
+
+    return None
+
 def apply_grid_state():
-    """Re-apply grid positions — FOR ALL LAYOUTS (full, side_by_side, master_stack, grid)"""
+    """Reapply all saved grid positions physically (used after snap, swap, or workspace change)."""
     global grid_state
     
     if not grid_state:
@@ -991,9 +1119,9 @@ def apply_grid_state():
             sw = mon_w - 2*EDGE_PADDING - mw - GAP
             sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
             positions = [
-                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),           # master
-                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),                   # Stack pane → top-right
-                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)        # Stack pane → bottom-right
+                (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),    # master
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),             # Stack pane → top-right
+                (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)   # Stack pane → bottom-right
             ]
             coord_list = [(0, 0), (1, 0), (1, 1)]
             
@@ -1027,37 +1155,24 @@ def apply_grid_state():
                 force_tile_resizable(hwnd, x, y, w, h)
                 time.sleep(0.008)
     
-    # Restore appropriate border after snap (green if normal mode, red if swap mode)
     time.sleep(0.03)
-    if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
-        # Swap mode active → keep (or restore) the RED border on the selected window
-        color_val = ctypes.c_uint(0x000000FF)  # rouge
-        dwmapi.DwmSetWindowAttribute(
-            selected_hwnd, DWMWA_BORDER_COLOR,
-            ctypes.byref(color_val), ctypes.sizeof(ctypes.c_uint)
-        )
-        print(f"[SNAP] Red border restored on selected window during swap mode")
-    else:
-        # Normal mode → green border on the currently active window
-        active = user32.GetForegroundWindow()
-        if active and user32.IsWindowVisible(active) and active in grid_state:
-            apply_border(active)
 
 def is_window_maximized(hwnd):
-    """Return True if window is maximized – prevents false drags on internal splits"""
+    """Return True if window is maximized. Used to block drag on maximized windows."""
     if not hwnd or not user32.IsWindow(hwnd):
         return False
     style = user32.GetWindowLongW(hwnd, GWL_STYLE)
     return bool(style & WS_MAXIMIZE)
 
 def start_drag_snap_monitor():
-    """Background thread: detects title-bar drag → shows preview → snaps on drop"""
+    """Background thread: real-time drag detection with live snap preview."""
     was_down = False
     drag_hwnd = None
     drag_start = None
     preview_active = False
 
     while True:
+        global drag_in_progress
         try:
             down = win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
             
@@ -1073,7 +1188,8 @@ def start_drag_snap_monitor():
                     drag_hwnd = hwnd
                     drag_start = win32api.GetCursorPos()
                     preview_active = False
-            
+                    drag_in_progress = True
+
             # ----------- DRAG IN PROGRESS -----------
             elif down and drag_hwnd:
                 cursor_pos = win32api.GetCursorPos()
@@ -1082,23 +1198,25 @@ def start_drag_snap_monitor():
                     dx = abs(cursor_pos[0] - drag_start[0])
                     dy = abs(cursor_pos[1] - drag_start[1])
                     
-                    # Show preview after 20px movement
-                    if (dx > 20 or dy > 20) and not preview_active:
+                    # Show preview after 10px movement
+                    if (dx > 10 or dy > 10) and not preview_active:    
                         preview_active = True
                     
                     # Update preview during drag
                     if preview_active:
                         target_rect = calculate_target_rect(drag_hwnd, cursor_pos)
                         if target_rect:
+                            last_valid_rect = target_rect
                             show_snap_preview(*target_rect)
+                        elif last_valid_rect:
+                            show_snap_preview(*last_valid_rect)
+                        else:
+                            hide_snap_preview()
             
             # ----------- MOUSE UP (DROP) -----------
             elif not down and was_down and drag_hwnd:
-
                 hide_snap_preview()
-
                 cursor_pos = win32api.GetCursorPos()
-
                 moved = False
                 if drag_start:
                     dx = abs(cursor_pos[0] - drag_start[0])
@@ -1115,19 +1233,21 @@ def start_drag_snap_monitor():
                     # snaps perfectly back to its stored cell
                     apply_grid_state()
 
+                drag_in_progress = False
                 drag_hwnd = None
                 drag_start = None
                 preview_active = False
             
             was_down = down
-            time.sleep(0.010)
+            time.sleep(0.005)
 
         except Exception as e:
             hide_snap_preview()
+            drag_in_progress = False
             time.sleep(0.1)
 
 def handle_snap_drop(source_hwnd, cursor_pos):
-    """Handle drop: swap or move window to target cell"""
+    """Handle window drop during drag → snap to target cell (swap or move) and reapply layout."""
     if source_hwnd not in grid_state:
         return
 
@@ -1202,236 +1322,31 @@ def handle_snap_drop(source_hwnd, cursor_pos):
             break
 
     if target_hwnd:
-        print(f"[SNAP] SWAP with '{win32gui.GetWindowText(target_hwnd)[:40]}'")
+        log(f"[SNAP] SWAP with '{win32gui.GetWindowText(target_hwnd)[:40]}'")
         grid_state[source_hwnd] = new_pos
         grid_state[target_hwnd] = old_pos
     else:
-        print(f"[SNAP] MOVE to cell ({target_col},{target_row}) on monitor {target_mon_idx+1}")
+        log(f"[SNAP] MOVE to cell ({target_col},{target_row}) on monitor {target_mon_idx+1}")
         grid_state[source_hwnd] = new_pos
 
     apply_grid_state()
 
 # ==============================================================================
-# DRAG & DROP SNAP WITH PREVIEW OVERLAY
+# WORKSPACES
 # ==============================================================================
-class PAINTSTRUCT(ctypes.Structure):
-    _fields_ = [
-        ("hdc", wintypes.HDC),
-        ("fErase", wintypes.BOOL),
-        ("rcPaint", wintypes.RECT),
-        ("fRestore", wintypes.BOOL),
-        ("fIncUpdate", wintypes.BOOL),
-        ("rgbReserved", ctypes.c_char * 32)
-    ]
-def create_overlay_window():
-    """Create transparent overlay window for snap preview"""
-    global overlay_hwnd
-    
-    if overlay_hwnd:
-        return overlay_hwnd
-    
-    class_name = "SmartGridOverlay"
-    
-    # Properly define DefWindowProc with correct signature
-    DefWindowProc = ctypes.windll.user32.DefWindowProcW
-    DefWindowProc.argtypes = [wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM]
-    DefWindowProc.restype = wintypes.LPARAM
-    
-    # Define WNDPROCTYPE properly
-    WNDPROCTYPE = ctypes.WINFUNCTYPE(
-        wintypes.LPARAM,    # Return type (changed from c_long)
-        wintypes.HWND,      # hwnd
-        ctypes.c_uint,      # msg
-        wintypes.WPARAM,    # wparam
-        wintypes.LPARAM     # lparam
-    )
-    
-    # Window procedure for overlay
-    @WNDPROCTYPE
-    def wnd_proc(hwnd, msg, wparam, lparam):
-        try:
-            if msg == win32con.WM_PAINT:
-                ps = PAINTSTRUCT()
-                hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
-                
-                if preview_rect:
-                    x, y, w, h = preview_rect
-                    
-                    # Create semi-transparent brush (blue with 30% opacity)
-                    brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
-                    pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
-                    
-                    old_brush = win32gui.SelectObject(hdc, brush)
-                    old_pen = win32gui.SelectObject(hdc, pen)
-                    
-                    # Draw rectangle
-                    win32gui.Rectangle(hdc, x, y, x + w, y + h)
-                    
-                    win32gui.SelectObject(hdc, old_brush)
-                    win32gui.SelectObject(hdc, old_pen)
-                    win32gui.DeleteObject(brush)
-                    win32gui.DeleteObject(pen)
-                
-                user32.EndPaint(hwnd, ctypes.byref(ps))
-                return 0
-            
-            elif msg == win32con.WM_DESTROY:
-                return 0
-            
-            # Use properly typed DefWindowProc
-            return DefWindowProc(hwnd, msg, wparam, lparam)
-        
-        except Exception as e:
-            print(f"[OVERLAY] Error in wnd_proc: {e}")
-            return 0
-    
-    # Register window class
-    wc = win32gui.WNDCLASS()
-    wc.lpfnWndProc = wnd_proc
-    wc.lpszClassName = class_name
-    wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
-    
-    try:
-        win32gui.RegisterClass(wc)
-    except:
-        pass  # Class already registered
-    
-    # Create layered window (for transparency)
-    overlay_hwnd = win32gui.CreateWindowEx(
-        win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
-        class_name,
-        "SmartGrid Preview",
-        win32con.WS_POPUP,
-        0, 0, 1, 1,  # Will be resized
-        0, 0, 0, None
-    )
-    
-    # Set 30% opacity
-    win32gui.SetLayeredWindowAttributes(overlay_hwnd, 0, int(255 * 0.3), win32con.LWA_ALPHA)
-    
-    return overlay_hwnd
 
-def show_snap_preview(x, y, w, h):
-    """Show preview rectangle at specified position"""
-    global preview_rect, overlay_hwnd
-    
-    if not overlay_hwnd:
-        create_overlay_window()
-    
-    preview_rect = (x, y, w, h)
-    
-    # Position and show overlay window
-    win32gui.SetWindowPos(
-        overlay_hwnd, win32con.HWND_TOPMOST,
-        x, y, w, h,
-        win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
-    )
-    
-    # Force redraw
-    win32gui.InvalidateRect(overlay_hwnd, None, True)
-    win32gui.UpdateWindow(overlay_hwnd)
-
-def hide_snap_preview():
-    """Hide preview overlay"""
-    global preview_rect, overlay_hwnd
-    
-    preview_rect = None
-    
-    if overlay_hwnd:
-        win32gui.ShowWindow(overlay_hwnd, win32con.SW_HIDE)
-
-def calculate_target_rect(source_hwnd, cursor_pos):
-    """Calculate where window will snap (returns rect for preview)"""
-    if source_hwnd not in grid_state:
-        return None
-    
+def init_workspaces():
+    """Initialize per-monitor workspace containers (3 workspaces each)."""
     monitors = get_monitors()
-    cx, cy = cursor_pos
-    
-    # Find target monitor
-    target_mon_idx = 0
-    for i, (mx, my, mw, mh) in enumerate(monitors):
-        if mx <= cx < mx + mw and my <= cy < my + mh:
-            target_mon_idx = i
-            break
-    
-    mon_x, mon_y, mon_w, mon_h = monitors[target_mon_idx]
-    
-    # Get windows currently on this monitor
-    wins_on_mon = [h for h, (m, _, _) in grid_state.items() 
-                   if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
-    count_including_source = len(wins_on_mon) + 1
-    current_layout, current_info = choose_layout(count_including_source)
-    
-    # Calculate target cell
-    target_col = target_row = 0
-    
-    if current_layout == "master_stack":
-        master_width = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
-        master_right = mon_x + EDGE_PADDING + master_width + GAP//2
-        
-        if cx < master_right:
-            target_col, target_row = 0, 0
-            # Master pane dimensions
-            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-                   master_width, mon_h - 2*EDGE_PADDING)
-        else:
-            # Stack pane
-            sw = mon_w - 2*EDGE_PADDING - master_width - GAP
-            sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-            mid_y = mon_y + mon_h // 2
-            
-            if cy < mid_y:
-                # Top stack
-                return (mon_x + EDGE_PADDING + master_width + GAP, mon_y + EDGE_PADDING,
-                       sw, sh)
-            else:
-                # Bottom stack
-                return (mon_x + EDGE_PADDING + master_width + GAP, 
-                       mon_y + EDGE_PADDING + sh + GAP, sw, sh)
-    
-    elif current_layout == "side_by_side":
-        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-        if cx < mon_x + mon_w // 2:
-            # Left side
-            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, 
-                   cw, mon_h - 2*EDGE_PADDING)
-        else:
-            # Right side
-            return (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING,
-                   cw, mon_h - 2*EDGE_PADDING)
-    
-    elif current_layout == "full":
-        return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-               mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)
-    
-    else:  # grid
-        cols, rows = current_info if current_info else (2, 2)
-        max_c = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
-        max_r = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
-        cols = max(cols, max_c + 1)
-        rows = max(rows, max_r + 1)
-        
-        cell_w = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
-        cell_h = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
-        
-        rel_x = cx - mon_x - EDGE_PADDING
-        rel_y = cy - mon_y - EDGE_PADDING
-        target_col = min(max(0, rel_x // (cell_w + GAP)), cols - 1)
-        target_row = min(max(0, rel_y // (cell_h + GAP)), rows - 1)
-        
-        x = mon_x + EDGE_PADDING + target_col * (cell_w + GAP)
-        y = mon_y + EDGE_PADDING + target_row * (cell_h + GAP)
-        
-        return (x, y, cell_w, cell_h)
-    
-    return None
+    ws = {}
+    current = {}
+    for i in range(len(monitors)):
+        ws[i] = [{}, {}, {}]
+        current[i] = 0
+    return ws, current
 
-# ==============================================================================
-# WORKSPACE MANAGEMENT
-# ==============================================================================
 def save_workspace(monitor_idx):
-    """Save current window layout to workspace (with grid positions!)"""
+    """Save current workspace (positions + min/max states)."""
     global workspaces, grid_state
 
     if monitor_idx not in workspaces:
@@ -1440,6 +1355,7 @@ def save_workspace(monitor_idx):
     ws = current_workspace[monitor_idx]
     workspaces[monitor_idx][ws] = {}
 
+    # Save normal windows
     for hwnd, (mon, col, row) in grid_state.items():
         if mon != monitor_idx or not user32.IsWindow(hwnd):
             continue
@@ -1448,26 +1364,42 @@ def save_workspace(monitor_idx):
         if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
             continue
 
-        # Get frame borders to calculate TRUE client area
         lb, tb, rb, bb = get_frame_borders(hwnd)
-        
-        # Save position WITHOUT invisible borders (pure client area)
         x = rect.left + lb
         y = rect.top + tb
         w = rect.right - rect.left - lb - rb
         h = rect.bottom - rect.top - tb - bb
 
-        # Save both physical position AND grid coordinates
         workspaces[monitor_idx][ws][hwnd] = {
-            'pos': (x, y, w, h),  # Clean dimensions
-            'grid': (col, row)
+            'pos': (x, y, w, h),
+            'grid': (col, row),
+            'state': 'normal'
         }
+    
+    # Save minimized windows
+    for hwnd, (mon, col, row) in minimized_windows.items():
+        if mon == monitor_idx and user32.IsWindow(hwnd):
+            workspaces[monitor_idx][ws][hwnd] = {
+                'pos': (0, 0, 800, 600),  # Dummy pos
+                'grid': (col, row),
+                'state': 'minimized'
+            }
+    
+    # Save maximized windows
+    for hwnd, (mon, col, row) in maximized_windows.items():
+        if mon == monitor_idx and user32.IsWindow(hwnd):
+            workspaces[monitor_idx][ws][hwnd] = {
+                'pos': (0, 0, 800, 600),  # Dummy pos
+                'grid': (col, row),
+                'state': 'maximized'
+            }
 
-    print(f"[WS] ✓ Workspace {ws+1} saved on monitor {monitor_idx+1} ({len(workspaces[monitor_idx][ws])} windows)")
+    log(f"[WS] ✓ Workspace {ws+1} saved ({len(workspaces[monitor_idx][ws])} windows)")
 
 def load_workspace(monitor_idx, ws_idx):
-    """Restore workspace layout - handles dead/minimized windows gracefully"""
+    """Load workspace and restore window positions intelligently."""
     global grid_state, workspaces
+    global minimized_windows, maximized_windows
 
     if monitor_idx not in workspaces or ws_idx >= len(workspaces[monitor_idx]):
         return
@@ -1475,60 +1407,56 @@ def load_workspace(monitor_idx, ws_idx):
     layout = workspaces[monitor_idx][ws_idx]
     
     if not layout:
-        print(f"[WS] Workspace {ws_idx+1} is empty")
+        log(f"[WS] Workspace {ws_idx+1} is empty")
         return
     
-    print(f"[WS] Loading workspace {ws_idx+1} for monitor {monitor_idx+1}...")
-    restored = 0
+    log(f"[WS] Loading workspace {ws_idx+1}...")
+    
+    ignore_retile_until = time.time() + 2.0
 
     for hwnd, data in layout.items():
-        # Skip dead windows
         if not user32.IsWindow(hwnd):
             continue
 
         x, y, w, h = data['pos']
         col, row = data['grid']
+        saved_state = data.get('state', 'normal')
 
-        # Restore minimized windows
-        if win32gui.IsIconic(hwnd):
-            user32.ShowWindowAsync(hwnd, SW_RESTORE)
-            time.sleep(0.08)
-
-        # Restore hidden windows
-        if not user32.IsWindowVisible(hwnd):
-            user32.ShowWindowAsync(hwnd, SW_SHOWNORMAL)
-            time.sleep(0.08)
-
-        # Reposition window
-        force_tile_resizable(hwnd, x, y, w, h)
+        if saved_state == 'minimized':
+            user32.ShowWindowAsync(hwnd, win32con.SW_MINIMIZE)
+            minimized_windows[hwnd] = (monitor_idx, col, row)
+        elif saved_state == 'maximized':
+            user32.ShowWindowAsync(hwnd, win32con.SW_MAXIMIZE)
+            maximized_windows[hwnd] = (monitor_idx, col, row)
+        else:
+            if win32gui.IsIconic(hwnd):
+                user32.ShowWindowAsync(hwnd, SW_RESTORE)
+                time.sleep(0.08)
+            if not user32.IsWindowVisible(hwnd):
+                user32.ShowWindowAsync(hwnd, SW_SHOWNORMAL)
+                time.sleep(0.08)
+            grid_state[hwnd] = (monitor_idx, col, row)
         
-        # Restore grid position
-        grid_state[hwnd] = (monitor_idx, col, row)
-        
-        restored += 1
         time.sleep(0.015)
 
     time.sleep(0.15)
+    smart_tile_with_restore()
     
-    # Apply green border to active window
-    active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active) and active in grid_state:
-        apply_border(active)
-    
-    print(f"[WS] ✓ Restored {restored}/{len(layout)} windows")
+    log(f"[WS] ✓ Workspace {ws_idx+1} restored")
+    ignore_retile_until = time.time() + 2.0
 
 def ws_switch(ws_idx):
-    """Switch to another workspace (smooth transition)"""
+    """Switch to specified workspace (0-2) on current monitor. Saves old, hides its windows, loads new."""
     global current_workspace, grid_state, is_active, last_visible_count
     
     mon = CURRENT_MONITOR_INDEX
 
     if mon not in workspaces:
-        print(f"[WS] ✗ Monitor {mon} not initialized")
+        log(f"[WS] ✗ Monitor {mon} not initialized")
         return
 
     if ws_idx == current_workspace.get(mon, 0):
-        print(f"[WS] Already on workspace {ws_idx+1}")
+        log(f"[WS] Already on workspace {ws_idx+1}")
         return
 
     # FREEZE AUTO-RETILE during workspace switch
@@ -1546,7 +1474,7 @@ def ws_switch(ws_idx):
             del grid_state[hwnd]
             hidden += 1
     
-    print(f"[WS] Hidden {hidden} windows from workspace {current_workspace.get(mon, 0)+1}")
+    log(f"[WS] Hidden {hidden} windows from workspace {current_workspace.get(mon, 0)+1}")
 
     # 3) Update current workspace index
     current_workspace[mon] = ws_idx
@@ -1563,11 +1491,155 @@ def ws_switch(ws_idx):
     time.sleep(0.2)  # Let windows settle
     is_active = was_active
     
-    print(f"[WS] ✓ Switched to workspace {ws_idx+1}")
+    log(f"[WS] ✓ Switched to workspace {ws_idx+1}")
+
+def assign_grid_position(grid_dict, hwnd, monitor_idx, layout, info, index):
+    """Assign true grid coordinates (col, row) based on layout (critical for correct snapping/swapping)."""
+    if layout == "full":
+        grid_dict[hwnd] = (monitor_idx, 0, 0)          # Full-screen → single cell
+    elif layout == "side_by_side":
+        col = 0 if index == 0 else 1
+        grid_dict[hwnd] = (monitor_idx, col, 0)        # Two equal columns side by side
+    elif layout == "master_stack":
+        if index == 0:
+            grid_dict[hwnd] = (monitor_idx, 0, 0)      # Master pane (left, full heigh)
+        elif index == 1:
+            grid_dict[hwnd] = (monitor_idx, 1, 0)      # Stack pane → top-right
+        elif index == 2:
+            grid_dict[hwnd] = (monitor_idx, 1, 1)      # Stack pane → bottom-right
+    else:  # grid
+        cols, rows = info
+        grid_dict[hwnd] = (monitor_idx, index % cols, index // cols) # Classic grid layout
+
+def move_current_workspace_to_next_monitor():
+    """Move all windows from current workspace to the next monitor (circular). Keeps layout and workspace index."""
+    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace
+    
+    if not grid_state:
+        log("[MOVE] Nothing to move - no windows in grid")
+        return
+    if len(MONITORS_CACHE) <= 1:
+        log("[MOVE] Only one monitor detected")
+        return
+
+    # Save current workspace before moving
+    old_mon = CURRENT_MONITOR_INDEX
+    old_ws = current_workspace.get(old_mon, 0)
+    save_workspace(old_mon)
+
+    # Calculate target monitor
+    new_mon = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
+    CURRENT_MONITOR_INDEX = new_mon
+    
+    mon = MONITORS_CACHE[new_mon]
+    mon_x, mon_y, mon_w, mon_h = mon
+    
+    # Get windows from current workspace on OLD monitor only
+    windows_to_move = [(hwnd, pos) for hwnd, pos in grid_state.items() 
+                       if pos[0] == old_mon and user32.IsWindow(hwnd)]
+    
+    if not windows_to_move:
+        log(f"[MOVE] No windows to move from monitor {old_mon+1}")
+        return
+    
+    count = len(windows_to_move)
+    layout, info = choose_layout(count)
+
+    time.sleep(0.05)
+
+    # Calculate new positions on target monitor
+    positions = []
+    if layout == "full":
+        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                      mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
+    elif layout == "side_by_side":
+        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
+        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
+                     (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)]
+    elif layout == "master_stack":
+        mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+        sw = mon_w - 2*EDGE_PADDING - mw - GAP
+        sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
+        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
+                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
+                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)]
+    else:
+        cols, rows = info
+        total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
+        total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
+        cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
+        cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
+        for r in range(rows):
+            for c in range(cols):
+                if len(positions) >= count: break
+                positions.append((mon_x + EDGE_PADDING + c*(cell_w+GAP),
+                                  mon_y + EDGE_PADDING + r*(cell_h+GAP), cell_w, cell_h))
+
+    # Move windows to new monitor
+    new_grid = {}
+    log(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
+    for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
+        x, y, w, h = positions[i]
+        force_tile_resizable(hwnd, x, y, w, h)
+        assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
+        title = win32gui.GetWindowText(hwnd)
+        log(f"   -> {title[:50]}")
+        time.sleep(0.015)
+
+    # Update grid_state (remove old entries, add new ones)
+    for hwnd, _ in windows_to_move:
+        grid_state.pop(hwnd, None)
+    grid_state.update(new_grid)
+
+    time.sleep(0.15)
+    active = user32.GetForegroundWindow()
+    if active and user32.IsWindowVisible(active):
+        apply_border(active)
+    
+    # Save to workspace on new monitor (same workspace number)
+    current_workspace[new_mon] = old_ws
+    save_workspace(new_mon)
+    
+    log(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
 
 # ==============================================================================
-# SYSTEM TRAY ICON
+# HOTKEYS & SYSTRAY
 # ==============================================================================
+
+def register_hotkeys():
+    """Register global hotkeys: Ctrl+Alt+T/R/Q/M/S for main features""" 
+    user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
+    user32.RegisterHotKey(None, HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R'))
+    user32.RegisterHotKey(None, HOTKEY_QUIT,   win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
+    user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
+    user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
+    user32.RegisterHotKey(None, HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1'))
+    user32.RegisterHotKey(None, HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2'))
+    user32.RegisterHotKey(None, HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3'))
+
+def unregister_hotkeys():
+    """Unregister all main global hotkeys (cleanup on exit)"""
+    for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
+               HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3):
+        try: user32.UnregisterHotKey(None, hk)
+        except: pass
+
+def register_swap_hotkeys():
+    """Register arrow keys + Enter for navigation during swap mode"""   
+    user32.RegisterHotKey(None, HOTKEY_SWAP_LEFT,    0, win32con.VK_LEFT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_RIGHT,   0, win32con.VK_RIGHT)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_UP,      0, win32con.VK_UP)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_DOWN,     0, win32con.VK_DOWN)
+    user32.RegisterHotKey(None, HOTKEY_SWAP_CONFIRM, 0, win32con.VK_RETURN)
+
+def unregister_swap_hotkeys():
+    """Unregister swap-mode hotkeys when leaving the mode"""
+    for id in (HOTKEY_SWAP_LEFT, HOTKEY_SWAP_RIGHT, HOTKEY_SWAP_UP, HOTKEY_SWAP_DOWN, HOTKEY_SWAP_CONFIRM):
+        try:
+            user32.UnregisterHotKey(None, id)
+        except:
+            pass
+
 def create_icon_image():
     """Create SmartGrid icon (green square with white grid)"""
     width = 64
@@ -1588,11 +1660,21 @@ def create_icon_image():
     return image
 
 def update_tray_menu():
-    """Update tray icon menu (refresh checkmarks)"""
+    """Refresh system tray menu with correct checkmarks (tiling state, swap mode)."""
     global tray_icon
     if tray_icon:
         tray_icon.menu = create_tray_menu()
         tray_icon.update_menu()
+
+def toggle_persistent():
+    """Toggle persistent auto-tiling mode on/off"""
+    global is_active, monitor_thread
+    is_active = not is_active
+    log(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
+    if is_active:
+        smart_tile_with_restore()
+    # Refresh tray menu
+    update_tray_menu()
 
 def create_tray_menu():
     """Create the context menu structure"""
@@ -1609,7 +1691,8 @@ def create_tray_menu():
             MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)', lambda: ws_switch(2)),
         )),
         Menu.SEPARATOR,
-        MenuItem('Force Re-tile All Windows (Ctrl+Alt+R)', lambda: threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()),
+        MenuItem('Force Re-tile All Windows (Ctrl+Alt+R)', 
+         lambda: threading.Thread(target=force_immediate_retile, daemon=True).start()),
         MenuItem(
             f"Swap Mode: {'ON' if swap_mode else 'OFF'} (Ctrl+Alt+S)",
             lambda: user32.PostThreadMessageW(main_thread_id, CUSTOM_TOGGLE_SWAP, 0, 0),
@@ -1625,7 +1708,7 @@ def create_tray_menu():
 def on_quit_from_tray(icon, item):
     """Quit from systray menu"""
     global tray_icon
-    print("[TRAY] Quit requested from systray")
+    log("[TRAY] Quit requested from systray")
     
     # Stop the tray icon first
     if tray_icon:
@@ -1633,14 +1716,16 @@ def on_quit_from_tray(icon, item):
     
     # Clean up borders
     if current_hwnd:
-        remove_border(current_hwnd)
-    clear_all_borders()
+        set_window_border(current_hwnd, None)
     
+    if swap_mode:
+        exit_swap_mode()
+
     # Unregister hotkeys
     unregister_hotkeys()
     
     # Force exit the entire process
-    print("[EXIT] SmartGrid stopped.")
+    log("[EXIT] SmartGrid stopped.")
     os._exit(0)  # Force exit (kills all threads)
 
 def show_hotkeys_tooltip():
@@ -1648,15 +1733,14 @@ def show_hotkeys_tooltip():
     ctypes.windll.user32.MessageBoxW(
         0,
         "---------- MAIN HOTKEYS\n\n"
-        "Ctrl+Alt+T  →  Toggle tiling ON/OFF\n"
-        "Ctrl+Alt+R  →  Force re-tile all windows\n"
-        "Ctrl+Alt+S  →  Enter Swap Mode\n"
+        "Ctrl+Alt+T  →  Toggle tiling on/off\n"
+        "Ctrl+Alt+R  →  Force re-tile all windows now\n"
+        "Ctrl+Alt+S  →  Enter Swap Mode (red border + arrows)\n"
         "Ctrl+Alt+M  →  Move workspace to next monitor\n\n"
         "---------- WORKSPACES\n\n"
         "Ctrl+Alt+1/2/3  →  Switch workspace\n\n"
         "---------- DRAG & DROP\n\n"
-        "Drag any window by title bar → snap anywhere!\n"
-        "Blue preview shows where it will snap.\n\n"
+        "Drag title bar → Snap with preview (works across monitors)\n\n"
         "---------- EXIT\n\n"
         "Ctrl+Alt+Q  →  Quit",
         "SmartGrid Hotkeys",
@@ -1675,55 +1759,85 @@ def start_systray():
     tray_icon.run()
 
 # ==============================================================================
-# MAIN
+# MAIN LOOP & THREADS
 # ==============================================================================
-main_thread_id = win32api.GetCurrentThreadId()
-if __name__ == "__main__":
-    print("="*70)
-    print("   SMARTGRID - Intelligent layouts + green border + SWAP MODE")
-    print("="*70)
-    print("Ctrl + Alt + T     → Toggle persistent tiling mode (on/off)")
-    print("Ctrl + Alt + R     → Force re-tile all visible windows now")
-    print("Ctrl + Alt + M     → Move current workspace to next monitor (merges if target workspace has windows)")
-    print("Ctrl + Alt + S     → Enter Swap Mode (red border + arrow keys) to exchange window positions")
-    print("                     ↳ Use ← → ↑ ↓ to swap with adjacent window, Enter to confirm")
-    print("")
-    print("WORKSPACES         → Ctrl + Alt + 1/2/3 to switch workspace")
-    print("                     ↳ Each monitor has 3 independent workspaces")
-    print("")
-    print("DRAG & DROP SNAP   → Grab any tiled window by title bar")
-    print("                     ↳ Drop it anywhere → it snaps perfectly (swap or move)")
-    print("                     ↳ Works even across monitors!")
-    print("")
-    print("SYSTEM TRAY        → Right-click tray icon for quick access")
-    print("")
-    print("Ctrl + Alt + Q     → Quit SmartGrid")
-    print("-"*70)
 
-    clear_all_borders()
+def monitor():
+    """Background loop: auto-retile + border tracking"""
+    global current_hwnd, grid_state, last_visible_count, last_active_hwnd
+    global ignore_retile_until, retile_locked, drag_in_progress
+
+    retile_locked = False
+    drag_in_progress = False
+
+    while True:
+        if retile_locked or drag_in_progress:
+            time.sleep(0.1)
+            continue
+        if is_active:
+            # Clean dead or minimized or maximizec windows
+            for hwnd in list(grid_state.keys()):
+                if not user32.IsWindow(hwnd):
+                    grid_state.pop(hwnd, None)
+                elif get_window_state(hwnd) in ("minimized", "maximized"):
+                    grid_state.pop(hwnd, None)
+
+            visible_windows = get_visible_windows()
+            current_count = len(visible_windows)
+
+            # Add new windows
+            updated = False
+            for hwnd, title, _ in visible_windows:
+                if hwnd not in grid_state:
+                    grid_state[hwnd] = (0, 0, 0)
+                    updated = True
+
+            # Auto-retile with smart restore
+            if time.time() >= ignore_retile_until and current_count > 0:
+                log(f"[AUTO-RETILE] {last_visible_count} → {current_count} windows")
+                smart_tile_with_restore()
+                last_visible_count = current_count
+                time.sleep(0.2)
+
+        # Gestion unique de la bordure verte
+        update_active_border()
+
+        time.sleep(0.06)
+
+if __name__ == "__main__":
+    log("="*70)
+    log(" SMARTGRID — Advanced Windows Tiling Manager")
+    log("="*70)
+    log("Ctrl+Alt+T  → Toggle tiling on/off")
+    log("Ctrl+Alt+R  → Force re-tile all windows now")
+    log("Ctrl+Alt+S  → Enter Swap Mode (red border + arrows)")
+    log("Ctrl+Alt+M  → Move workspace to next monitor")
+    log("Ctrl+Alt+1/2/3 → Switch workspace")
+    log("Drag title bar → Snap with preview (works across monitors)")
+    log("Ctrl+Alt+Q  → Quit")
+    log("-"*70)
+
     time.sleep(0.05)
 
     # Initialize monitors and workspaces
     monitors = get_monitors()
-    print(f"Detected {len(monitors)} monitor(s)")
+    log(f"Detected {len(monitors)} monitor(s)")
     
     # Initialize workspace structure dynamically
-    workspaces = init_workspaces()
+    workspaces, current_workspace = init_workspaces()
     current_workspace = {i: 0 for i in range(len(monitors))}
-    print(f"Initialized {len(monitors)} × 3 workspaces")
+    log(f"Initialized {len(monitors)} × 3 workspaces")
     
     if len(monitors) > 1:
-        print("Ctrl+Alt+M -> cycle tiled windows across monitors")
+        log("Ctrl+Alt+M -> cycle tiled windows across monitors")
 
     # Background services ----------------------------------------------------
-    threading.Thread(target=monitor, daemon=True).start()
     # → Watches for new/minimized/restored windows, auto-retiles, manages green border
-
-    threading.Thread(target=start_drag_snap_monitor, daemon=True).start()
+    threading.Thread(target=monitor, daemon=True).start()
     # → Real-time drag detection: enables snap on drop (with swap/move)
-
-    threading.Thread(target=start_systray, daemon=True).start()
+    threading.Thread(target=start_drag_snap_monitor, daemon=True).start()
     # → System tray icon with context menu
+    threading.Thread(target=start_systray, daemon=True).start()
     # ------------------------------------------------------------------------
     register_hotkeys()
 
@@ -1733,7 +1847,7 @@ if __name__ == "__main__":
             if msg.wParam == HOTKEY_TOGGLE:
                 toggle_persistent()
             elif msg.wParam == HOTKEY_RETILE:
-                threading.Thread(target=smart_tile, kwargs={"temp": True}, daemon=True).start()
+                threading.Thread(target=force_immediate_retile, daemon=True).start()
             elif msg.wParam == HOTKEY_MOVE_MONITOR:
                 threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()
             elif msg.wParam == HOTKEY_QUIT:
@@ -1770,12 +1884,11 @@ if __name__ == "__main__":
         user32.DispatchMessageW(ctypes.byref(msg))
 
     if current_hwnd:
-        remove_border(current_hwnd)
-    clear_all_borders()
+        set_window_border(current_hwnd, None)
 
     # Stop systray icon
     if tray_icon:
         tray_icon.stop()
 
     unregister_hotkeys()
-    print("[EXIT] SmartGrid stopped.")
+    log("[EXIT] SmartGrid stopped.")

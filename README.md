@@ -8,7 +8,7 @@
 ## Powerful Pure-Python Dynamic Tiling Window Manager for Windows
 
 **SmartGrid** is not just a tiler.
-It’s a **real, living, breathing dynamic tiling window manager** for Windows 10 & 11 — written in pure Python.
+It’s a **real, living, breathing dynamic tiling window manager** for Windows — written in pure Python.
 
 No config. No bullshit. Just press one key and live in perfect harmony.
 
@@ -48,17 +48,16 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 ## Hotkeys
 
-| Shortcut         | Action                                                                    |
-|:-----------------|---------------------------------------------------------------------------|
-| `Ctrl + Alt + T` | Toggle persistent tiling mode (on/off)                                    |
-| `Ctrl + Alt + R` | Force re-tile all visible windows now                                     |
-| `Ctrl + Alt + M` | Move current workspace to next monitor                                    |
-| `Ctrl + Alt + S` | Enter Swap Mode (red border + arrow keys) to exchange window positions    |
-|                  | ↳ Use ← → ↑ ↓ to swap with adjacent window, Enter to confirm             |
-| `Ctrl + Alt + 1` | Switch to workspace 1 (current monitor)                                   |
-| `Ctrl + Alt + 2` | Switch to workspace 2 (current monitor)                                   |
-| `Ctrl + Alt + 3` | Switch to workspace 3 (current monitor)                                   |
-| `Ctrl + Alt + Q` | Quit SmartGrid                                                            |
+| Shortcut         | Action                                                                     |
+|:-----------------|----------------------------------------------------------------------------|
+| `Ctrl + Alt + T` | Toggle tiling (on/off)                                                     |
+| `Ctrl + Alt + R` | Force re-tile all windows now                                              |
+| `Ctrl + Alt + S` | Enter Swap Mode (red border + arrows)                                      |
+| `Ctrl + Alt + M` | Move current workspace to next monitor                                     |
+| `Ctrl + Alt + 1` | Switch to workspace 1 (current monitor)                                    |
+| `Ctrl + Alt + 2` | Switch to workspace 2 (current monitor)                                    |
+| `Ctrl + Alt + 3` | Switch to workspace 3 (current monitor)                                    |
+| `Ctrl + Alt + Q` | Quit SmartGrid                                                             |
 
 > **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
 
@@ -141,13 +140,6 @@ python smartgrid.py
 ```
 
 Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
-
-## Known Issues
-
-- **Minimize / Maximize with tiled windows**  
-  Currently, minimizing or maximizing a window in a tiled layout may cause unexpected behavior or slight layout glitches.  
-  This can have a major impact on all layouts.  
-  I’m actively trying to debug and fix this, but it’s not trivial for me…
 
 > If you have ideas to improve SmartGrid, your code and feedback are always welcome!
 
