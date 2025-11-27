@@ -89,14 +89,11 @@ current_hwnd = None   # Window with green border (active)
 selected_hwnd = None   # Window with red border (swap mode)
 last_active_hwnd = None   # Last known active/focused tiled window (preserved when focus is temporarily lost,
 
-border_lock_owner = None   # "swap" ou "normal"
-
 # Runtime flags
 is_active = False          # Persistent tiling enabled?
 swap_mode = False          # Swap mode active?
 retile_locked = False      # Block auto-retile during swap/drag
 drag_in_progress = False   # Block retile during drag & drop
-border_locked = False      # Prevent border thread interference
 ignore_retile_until = 0.0  # Grace period after state changes
 
 last_visible_count  = 0
@@ -178,8 +175,6 @@ def get_frame_borders(hwnd):
 
 def set_window_border(hwnd, color):
     """Unique function to apply (or remove) a colored DWM border."""
-    global border_locked, border_lock_owner
-    
     if not hwnd or not user32.IsWindow(hwnd):
         return
         
@@ -553,49 +548,49 @@ def apply_border(hwnd):
     global current_hwnd
     current_hwnd = hwnd
 
-def lock_borders(owner="normal"):
-    """Lock border thread while swap mode handles borders."""
-    global border_locked, border_lock_owner
-    border_locked = True
-    border_lock_owner = owner
-
-def unlock_borders():
-    """Unlock border thread – resume normal border handling."""
-    global border_locked, border_lock_owner
-    border_locked = False
-    border_lock_owner = None
-
 def update_active_border():
-    """Update green border: only one window at a time."""
-    global current_hwnd
+    """
+    Manage colored DWM borders for visual feedback.
+    - Green border: marks the currently active tiled window
+    - Red border: marks the selected window in swap mode
+    Continuously reapplies borders as Windows DWM can remove them automatically.
+    """
+    global current_hwnd, last_active_hwnd
 
-    # If swap mode is active → DO NOT TOUCH ANYTHING, the red border is sacred
+    # SWAP MODE: Continuously reapply red border (Windows erases it)
     if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
-        return
-
-    if border_locked:           # Swap mode (or other lock) → do not touch borders
+        set_window_border(selected_hwnd, 0x000000FF)  # Red - forced reapplication
         return
 
     active = user32.GetForegroundWindow()
 
-    # Case 1: A real tiled window is currently in the foreground
-    if (active
-        and active in grid_state
-        and user32.IsWindowVisible(active)
-        and get_window_state(active) == 'normal'):
+    # If active window is tiled → apply/maintain green border
+    if active in grid_state and user32.IsWindow(active):
+        # Save as last active tiled window
+        last_active_hwnd = active
 
+        # Only change if active window is different
         if current_hwnd != active:
-            # Remove previous green border
+            # Remove border from previous tiled window
             if current_hwnd and user32.IsWindow(current_hwnd):
                 set_window_border(current_hwnd, None)
-            # Apply green border to the new active window
+
+            # Apply border to new window
             apply_border(active)
             current_hwnd = active
+        else:
+            # REAPPLY border even if same window
+            # (Windows may have removed it automatically)
+            set_window_border(current_hwnd, 0x0000FF00)
 
-    # Case 2: No tiled window is active anymore → remove the green border
-    elif current_hwnd and user32.IsWindow(current_hwnd):
-        set_window_border(current_hwnd, None)
-        current_hwnd = None
+        return
+
+    # If foreground is NON-tiled (taskbar, systray, menu, icon, popup)
+    # → MAINTAIN green border on last known tiled window
+    if last_active_hwnd and user32.IsWindow(last_active_hwnd) and last_active_hwnd in grid_state:
+        # Continuously reapply border (Windows often removes it)
+        set_window_border(last_active_hwnd, 0x0000FF00)
+        current_hwnd = last_active_hwnd
 
 # ==============================================================================
 # SWAP MODE
@@ -603,7 +598,7 @@ def update_active_border():
 
 def enter_swap_mode():
     """Enter swap mode: red border + arrow keys to swap window positions."""
-    global swap_mode, selected_hwnd, last_active_hwnd, border_locked, retile_locked
+    global swap_mode, selected_hwnd, last_active_hwnd, retile_locked
     
     # Wait a tiny bit for the tiling to stabilize
     time.sleep(0.05)
@@ -639,7 +634,6 @@ def enter_swap_mode():
     swap_mode = True
     selected_hwnd = candidate
 
-    lock_borders("swap")          # Lock border updates (blocks monitor() thread interference)
     retile_locked = True          # Prevent automatic re-tiling during swap mode
     time.sleep(0.05)
     set_window_border(selected_hwnd, 0x000000FF)  # Red
@@ -725,7 +719,6 @@ def exit_swap_mode():
     selected_hwnd = None
     time.sleep(0.06)
     
-    unlock_borders()
     retile_locked = False
 
     swap_mode = False
@@ -1771,6 +1764,8 @@ def monitor():
     drag_in_progress = False
 
     while True:
+        update_active_border()
+
         if retile_locked or drag_in_progress:
             time.sleep(0.1)
             continue
@@ -1798,9 +1793,6 @@ def monitor():
                 smart_tile_with_restore()
                 last_visible_count = current_count
                 time.sleep(0.2)
-
-        # Gestion unique de la bordure verte
-        update_active_border()
 
         time.sleep(0.06)
 
