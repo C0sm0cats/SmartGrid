@@ -90,11 +90,12 @@ selected_hwnd = None   # Window with red border (swap mode)
 last_active_hwnd = None   # Last known active/focused tiled window (preserved when focus is temporarily lost,
 
 # Runtime flags
-is_active = False          # Persistent tiling enabled?
-swap_mode = False          # Swap mode active?
-retile_locked = False      # Block auto-retile during swap/drag
-drag_in_progress = False   # Block retile during drag & drop
-ignore_retile_until = 0.0  # Grace period after state changes
+is_active = False            # Persistent tiling enabled?
+swap_mode_lock = False        # Block auto-retile during swap
+move_monitor_lock = False    # Block auto-retile during monitor move (Ctrl+Alt+M)
+workspace_switching_lock = False  # Block auto-retile during workspace switch (Ctrl+Alt+1/2/3)
+drag_drop_lock = False       # Block auto-retile during drag & drop
+ignore_retile_until = 0.0    # Grace period after state changes
 
 last_visible_count  = 0
 
@@ -220,7 +221,7 @@ def is_useful_window(title, class_name=""):
 
     # === HARD EXCLUDE BY TITLE ===
     bad_titles = [
-        "spotify", "discord", "steam", "call", "meeting", "join", "incoming call",
+        "zscaler","spotify", "discord", "steam", "call", "meeting", "join", "incoming call",
         "obs", "streamlabs", "twitch studio", "nvidia overlay", "geforce experience",
         "shadowplay", "radeon software", "amd relive", "rainmeter", "wallpaper engine",
         "lively wallpaper", "msi afterburner", "rtss", "rivatuner", "hwinfo", "hwmonitor",
@@ -522,9 +523,9 @@ def force_tile_resizable(hwnd, x, y, w, h):
 
 def force_immediate_retile():
     """Ctrl+Alt+R → force immediate re-tile (bypass all grace delays)."""
-    global ignore_retile_until, last_visible_count, retile_locked
+    global ignore_retile_until, last_visible_count, swap_mode_lock
     
-    if retile_locked:  # swap mode actif → on ne touche pas
+    if swap_mode_lock:  # swap mode enabled → we don't retile
         return
         
     log("\n[FORCE RETILE] Ctrl+Alt+R → Immediate full re-tile (bypasses all grace periods)")
@@ -558,7 +559,7 @@ def update_active_border():
     global current_hwnd, last_active_hwnd
 
     # SWAP MODE: Continuously reapply red border (Windows erases it)
-    if swap_mode and selected_hwnd and user32.IsWindow(selected_hwnd):
+    if swap_mode_lock and selected_hwnd and user32.IsWindow(selected_hwnd):
         set_window_border(selected_hwnd, 0x000000FF)  # Red - forced reapplication
         return
 
@@ -598,7 +599,7 @@ def update_active_border():
 
 def enter_swap_mode():
     """Enter swap mode: red border + arrow keys to swap window positions."""
-    global swap_mode, selected_hwnd, last_active_hwnd, retile_locked
+    global selected_hwnd, last_active_hwnd, swap_mode_lock
     
     # Wait a tiny bit for the tiling to stabilize
     time.sleep(0.05)
@@ -631,10 +632,9 @@ def enter_swap_mode():
         log("[SWAP] No valid window to select")
         return
 
-    swap_mode = True
+    swap_mode_lock = True          # Prevent automatic re-tiling during swap mode
     selected_hwnd = candidate
 
-    retile_locked = True          # Prevent automatic re-tiling during swap mode
     time.sleep(0.05)
     set_window_border(selected_hwnd, 0x000000FF)  # Red
 
@@ -661,7 +661,7 @@ def navigate_swap(direction):
     """Handle arrow key press in swap mode → find and swap with adjacent window"""
     global selected_hwnd
     
-    if not swap_mode or not selected_hwnd:
+    if not swap_mode_lock or not selected_hwnd:
         log("[SWAP] Mode not active or no window selected")
         return
     
@@ -694,9 +694,9 @@ def navigate_swap(direction):
 
 def confirm_swap():
     """Confirm current swap selection and exit swap mode (bound to Enter)"""
-    global swap_mode, selected_hwnd
+    global swap_mode_lock, selected_hwnd
 
-    if not swap_mode or not selected_hwnd:
+    if not swap_mode_lock or not selected_hwnd:
         log("[SWAP] Swap mode not active or no window selected")
         return
 
@@ -707,9 +707,9 @@ def confirm_swap():
 
 def exit_swap_mode():
     """Exit swap mode, clean borders, restore normal green border on active window."""
-    global swap_mode, selected_hwnd, current_hwnd, retile_locked
+    global selected_hwnd, current_hwnd, swap_mode_lock
     
-    if not swap_mode:
+    if not swap_mode_lock:
         return
     
     # First, clear ALL borders
@@ -719,11 +719,9 @@ def exit_swap_mode():
     selected_hwnd = None
     time.sleep(0.06)
     
-    retile_locked = False
+    swap_mode_lock = False
 
-    swap_mode = False
     unregister_swap_hotkeys()
-    old_selected = selected_hwnd
     selected_hwnd = None
     current_hwnd = None
     
@@ -1159,29 +1157,63 @@ def is_window_maximized(hwnd):
 
 def start_drag_snap_monitor():
     """Background thread: real-time drag detection with live snap preview."""
+    global drag_drop_lock
+    
     was_down = False
     drag_hwnd = None
     drag_start = None
     preview_active = False
+    last_valid_rect = None
 
     while True:
-        global drag_in_progress
         try:
             down = win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
             
             # ----------- MOUSE DOWN -----------
             if down and not was_down:
-                hwnd = user32.GetForegroundWindow()
-                # Ignore drag if window is maximized (prevents interference with internal splits)
+
+                # fetch cursor position
+                pt = win32api.GetCursorPos()
+
+                # Try window under cursor
+                hwnd = win32gui.WindowFromPoint(pt)
+
+                # If our overlay is hit, fallback to foreground window
+                if 'overlay_hwnd' in globals() and overlay_hwnd and hwnd == overlay_hwnd:
+                    hwnd = user32.GetForegroundWindow()
+
+                # Climb to top-level (WindowFromPoint returns child controls)
+                try:
+                    GA_ROOT = 2  # GA_ROOT
+                    top = ctypes.windll.user32.GetAncestor(hwnd, GA_ROOT)
+                    if top:
+                        hwnd = top
+                except Exception:
+                    # fallback parent climb
+                    try:
+                        while True:
+                            parent = win32gui.GetParent(hwnd)
+                            if not parent:
+                                break
+                            hwnd = parent
+                    except Exception:
+                        pass
+
+                # If unusable (invisible, tool window), fallback to foreground
+                if not hwnd or not user32.IsWindowVisible(hwnd):
+                    hwnd = user32.GetForegroundWindow()
+
+                # Ignore maxed windows (original logic)
                 if hwnd and is_window_maximized(hwnd):
                     was_down = True
                     continue
 
+                # Only accept windows managed by SmartGrid
                 if hwnd and hwnd in grid_state and user32.IsWindowVisible(hwnd):
+                    drag_drop_lock = True
                     drag_hwnd = hwnd
-                    drag_start = win32api.GetCursorPos()
+                    drag_start = pt
                     preview_active = False
-                    drag_in_progress = True
 
             # ----------- DRAG IN PROGRESS -----------
             elif down and drag_hwnd:
@@ -1191,8 +1223,8 @@ def start_drag_snap_monitor():
                     dx = abs(cursor_pos[0] - drag_start[0])
                     dy = abs(cursor_pos[1] - drag_start[1])
                     
-                    # Show preview after 10px movement
-                    if (dx > 10 or dy > 10) and not preview_active:    
+                    # Show preview after 1px movement
+                    if (dx > 1 or dy > 1) and not preview_active:    
                         preview_active = True
                     
                     # Update preview during drag
@@ -1214,7 +1246,7 @@ def start_drag_snap_monitor():
                 if drag_start:
                     dx = abs(cursor_pos[0] - drag_start[0])
                     dy = abs(cursor_pos[1] - drag_start[1])
-                    moved = (dx > 20 or dy > 20)
+                    moved = (dx > 10 or dy > 10)
 
                 if moved:
                     # Delegate all snapping logic to the central function
@@ -1226,7 +1258,7 @@ def start_drag_snap_monitor():
                     # snaps perfectly back to its stored cell
                     apply_grid_state()
 
-                drag_in_progress = False
+                drag_drop_lock = False
                 drag_hwnd = None
                 drag_start = None
                 preview_active = False
@@ -1236,7 +1268,10 @@ def start_drag_snap_monitor():
 
         except Exception as e:
             hide_snap_preview()
-            drag_in_progress = False
+            drag_drop_lock = False
+            drag_hwnd = None
+            drag_start = None
+            preview_active = False
             time.sleep(0.1)
 
 def handle_snap_drop(source_hwnd, cursor_pos):
@@ -1440,51 +1475,55 @@ def load_workspace(monitor_idx, ws_idx):
 
 def ws_switch(ws_idx):
     """Switch to specified workspace (0-2) on current monitor. Saves old, hides its windows, loads new."""
-    global current_workspace, grid_state, is_active, last_visible_count
+    global current_workspace, grid_state, is_active, last_visible_count, workspace_switching_lock
     
-    mon = CURRENT_MONITOR_INDEX
+    workspace_switching_lock = True
+    try:
+        mon = CURRENT_MONITOR_INDEX
 
-    if mon not in workspaces:
-        log(f"[WS] ✗ Monitor {mon} not initialized")
-        return
+        if mon not in workspaces:
+            log(f"[WS] ✗ Monitor {mon} not initialized")
+            return
 
-    if ws_idx == current_workspace.get(mon, 0):
-        log(f"[WS] Already on workspace {ws_idx+1}")
-        return
+        if ws_idx == current_workspace.get(mon, 0):
+            log(f"[WS] Already on workspace {ws_idx+1}")
+            return
 
-    # FREEZE AUTO-RETILE during workspace switch
-    was_active = is_active
-    is_active = False
-    
-    # 1) Save current workspace
-    save_workspace(mon)
+        # FREEZE AUTO-RETILE during workspace switch
+        was_active = is_active
+        is_active = False
+        
+        # 1) Save current workspace
+        save_workspace(mon)
 
-    # 2) Hide windows from current workspace (smooth - no minimize animation)
-    hidden = 0
-    for hwnd, (mon_idx, col, row) in list(grid_state.items()):
-        if mon_idx == mon and user32.IsWindow(hwnd):
-            user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
-            del grid_state[hwnd]
-            hidden += 1
-    
-    log(f"[WS] Hidden {hidden} windows from workspace {current_workspace.get(mon, 0)+1}")
+        # 2) Hide windows from current workspace (smooth - no minimize animation)
+        hidden = 0
+        for hwnd, (mon_idx, col, row) in list(grid_state.items()):
+            if mon_idx == mon and user32.IsWindow(hwnd):
+                user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
+                del grid_state[hwnd]
+                hidden += 1
+        
+        log(f"[WS] Hidden {hidden} windows from workspace {current_workspace.get(mon, 0)+1}")
 
-    # 3) Update current workspace index
-    current_workspace[mon] = ws_idx
+        # 3) Update current workspace index
+        current_workspace[mon] = ws_idx
 
-    # 4) Load new workspace
-    time.sleep(0.1)
-    load_workspace(mon, ws_idx)
-    
-    # UPDATE last_visible_count to prevent immediate re-tile
-    visible_windows = get_visible_windows()
-    last_visible_count = len(visible_windows)
-    
-    # RESTORE AUTO-RETILE state
-    time.sleep(0.2)  # Let windows settle
-    is_active = was_active
-    
-    log(f"[WS] ✓ Switched to workspace {ws_idx+1}")
+        # 4) Load new workspace
+        time.sleep(0.1)
+        load_workspace(mon, ws_idx)
+        
+        # UPDATE last_visible_count to prevent immediate re-tile
+        visible_windows = get_visible_windows()
+        last_visible_count = len(visible_windows)
+        
+        # RESTORE AUTO-RETILE state
+        time.sleep(0.2)  # Let windows settle
+        is_active = was_active
+        
+        log(f"[WS] ✓ Switched to workspace {ws_idx+1}")
+    finally:
+        workspace_switching_lock = False
 
 def assign_grid_position(grid_dict, hwnd, monitor_idx, layout, info, index):
     """Assign true grid coordinates (col, row) based on layout (critical for correct snapping/swapping)."""
@@ -1506,94 +1545,98 @@ def assign_grid_position(grid_dict, hwnd, monitor_idx, layout, info, index):
 
 def move_current_workspace_to_next_monitor():
     """Move all windows from current workspace to the next monitor (circular). Keeps layout and workspace index."""
-    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace
+    global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace, move_monitor_lock
     
-    if not grid_state:
-        log("[MOVE] Nothing to move - no windows in grid")
-        return
-    if len(MONITORS_CACHE) <= 1:
-        log("[MOVE] Only one monitor detected")
-        return
+    move_monitor_lock = True
+    try:
+        if not grid_state:
+            log("[MOVE] Nothing to move - no windows in grid")
+            return
+        if len(MONITORS_CACHE) <= 1:
+            log("[MOVE] Only one monitor detected")
+            return
 
-    # Save current workspace before moving
-    old_mon = CURRENT_MONITOR_INDEX
-    old_ws = current_workspace.get(old_mon, 0)
-    save_workspace(old_mon)
+        # Save current workspace before moving
+        old_mon = CURRENT_MONITOR_INDEX
+        old_ws = current_workspace.get(old_mon, 0)
+        save_workspace(old_mon)
 
-    # Calculate target monitor
-    new_mon = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
-    CURRENT_MONITOR_INDEX = new_mon
-    
-    mon = MONITORS_CACHE[new_mon]
-    mon_x, mon_y, mon_w, mon_h = mon
-    
-    # Get windows from current workspace on OLD monitor only
-    windows_to_move = [(hwnd, pos) for hwnd, pos in grid_state.items() 
-                       if pos[0] == old_mon and user32.IsWindow(hwnd)]
-    
-    if not windows_to_move:
-        log(f"[MOVE] No windows to move from monitor {old_mon+1}")
-        return
-    
-    count = len(windows_to_move)
-    layout, info = choose_layout(count)
+        # Calculate target monitor
+        new_mon = (CURRENT_MONITOR_INDEX + 1) % len(MONITORS_CACHE)
+        CURRENT_MONITOR_INDEX = new_mon
+        
+        mon = MONITORS_CACHE[new_mon]
+        mon_x, mon_y, mon_w, mon_h = mon
+        
+        # Get windows from current workspace on OLD monitor only
+        windows_to_move = [(hwnd, pos) for hwnd, pos in grid_state.items() 
+                        if pos[0] == old_mon and user32.IsWindow(hwnd)]
+        
+        if not windows_to_move:
+            log(f"[MOVE] No windows to move from monitor {old_mon+1}")
+            return
+        
+        count = len(windows_to_move)
+        layout, info = choose_layout(count)
 
-    time.sleep(0.05)
+        time.sleep(0.05)
 
-    # Calculate new positions on target monitor
-    positions = []
-    if layout == "full":
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-                      mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
-    elif layout == "side_by_side":
-        cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
-                     (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)]
-    elif layout == "master_stack":
-        mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
-        sw = mon_w - 2*EDGE_PADDING - mw - GAP
-        sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-        positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
-                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
-                     (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)]
-    else:
-        cols, rows = info
-        total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
-        total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
-        cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
-        cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
-        for r in range(rows):
-            for c in range(cols):
-                if len(positions) >= count: break
-                positions.append((mon_x + EDGE_PADDING + c*(cell_w+GAP),
-                                  mon_y + EDGE_PADDING + r*(cell_h+GAP), cell_w, cell_h))
+        # Calculate new positions on target monitor
+        positions = []
+        if layout == "full":
+            positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
+                        mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)]
+        elif layout == "side_by_side":
+            cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
+            positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING),
+                        (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING, cw, mon_h - 2*EDGE_PADDING)]
+        elif layout == "master_stack":
+            mw = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+            sw = mon_w - 2*EDGE_PADDING - mw - GAP
+            sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
+            positions = [(mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, mw, mon_h - 2*EDGE_PADDING),
+                        (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING, sw, sh),
+                        (mon_x + EDGE_PADDING + mw + GAP, mon_y + EDGE_PADDING + sh + GAP, sw, sh)]
+        else:
+            cols, rows = info
+            total_gaps_w = GAP * (cols - 1) if cols > 1 else 0
+            total_gaps_h = GAP * (rows - 1) if rows > 1 else 0
+            cell_w = (mon_w - 2*EDGE_PADDING - total_gaps_w) // cols
+            cell_h = (mon_h - 2*EDGE_PADDING - total_gaps_h) // rows
+            for r in range(rows):
+                for c in range(cols):
+                    if len(positions) >= count: break
+                    positions.append((mon_x + EDGE_PADDING + c*(cell_w+GAP),
+                                    mon_y + EDGE_PADDING + r*(cell_h+GAP), cell_w, cell_h))
 
-    # Move windows to new monitor
-    new_grid = {}
-    log(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
-    for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
-        x, y, w, h = positions[i]
-        force_tile_resizable(hwnd, x, y, w, h)
-        assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
-        title = win32gui.GetWindowText(hwnd)
-        log(f"   -> {title[:50]}")
-        time.sleep(0.015)
+        # Move windows to new monitor
+        new_grid = {}
+        log(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
+        for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
+            x, y, w, h = positions[i]
+            force_tile_resizable(hwnd, x, y, w, h)
+            assign_grid_position(new_grid, hwnd, new_mon, layout, info, i)
+            title = win32gui.GetWindowText(hwnd)
+            log(f"   -> {title[:50]}")
+            time.sleep(0.015)
 
-    # Update grid_state (remove old entries, add new ones)
-    for hwnd, _ in windows_to_move:
-        grid_state.pop(hwnd, None)
-    grid_state.update(new_grid)
+        # Update grid_state (remove old entries, add new ones)
+        for hwnd, _ in windows_to_move:
+            grid_state.pop(hwnd, None)
+        grid_state.update(new_grid)
 
-    time.sleep(0.15)
-    active = user32.GetForegroundWindow()
-    if active and user32.IsWindowVisible(active):
-        apply_border(active)
-    
-    # Save to workspace on new monitor (same workspace number)
-    current_workspace[new_mon] = old_ws
-    save_workspace(new_mon)
-    
-    log(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
+        time.sleep(0.15)
+        active = user32.GetForegroundWindow()
+        if active and user32.IsWindowVisible(active):
+            apply_border(active)
+        
+        # Save to workspace on new monitor (same workspace number)
+        current_workspace[new_mon] = old_ws
+        save_workspace(new_mon)
+        
+        log(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
+    finally:
+        move_monitor_lock = False 
 
 # ==============================================================================
 # HOTKEYS & SYSTRAY
@@ -1687,9 +1730,9 @@ def create_tray_menu():
         MenuItem('Force Re-tile All Windows (Ctrl+Alt+R)', 
          lambda: threading.Thread(target=force_immediate_retile, daemon=True).start()),
         MenuItem(
-            f"Swap Mode: {'ON' if swap_mode else 'OFF'} (Ctrl+Alt+S)",
+            f"Swap Mode: {'ON' if swap_mode_lock else 'OFF'} (Ctrl+Alt+S)",
             lambda: user32.PostThreadMessageW(main_thread_id, CUSTOM_TOGGLE_SWAP, 0, 0),
-            checked=lambda item: swap_mode
+            checked=lambda item: swap_mode_lock
         ),
         MenuItem('Move Workspace to Next Monitor (Ctrl+Alt+M)', lambda: threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()),
         Menu.SEPARATOR,
@@ -1711,7 +1754,7 @@ def on_quit_from_tray(icon, item):
     if current_hwnd:
         set_window_border(current_hwnd, None)
     
-    if swap_mode:
+    if swap_mode_lock:
         exit_swap_mode()
 
     # Unregister hotkeys
@@ -1758,15 +1801,13 @@ def start_systray():
 def monitor():
     """Background loop: auto-retile + border tracking"""
     global current_hwnd, grid_state, last_visible_count, last_active_hwnd
-    global ignore_retile_until, retile_locked, drag_in_progress
-
-    retile_locked = False
-    drag_in_progress = False
+    global ignore_retile_until, swap_mode_lock, drag_drop_lock
+    global move_monitor_lock, workspace_switching_lock
 
     while True:
         update_active_border()
 
-        if retile_locked or drag_in_progress:
+        if swap_mode_lock or drag_drop_lock or move_monitor_lock or workspace_switching_lock:
             time.sleep(0.1)
             continue
         if is_active:
@@ -1845,11 +1886,11 @@ if __name__ == "__main__":
             elif msg.wParam == HOTKEY_QUIT:
                 break
             elif msg.wParam == HOTKEY_SWAP_MODE:
-                if swap_mode:
+                if swap_mode_lock:
                     exit_swap_mode()
                 else:
                     enter_swap_mode()
-            elif swap_mode:
+            elif swap_mode_lock:
                 if msg.wParam == HOTKEY_SWAP_LEFT:
                     navigate_swap("left")
                 elif msg.wParam == HOTKEY_SWAP_RIGHT:
@@ -1867,7 +1908,7 @@ if __name__ == "__main__":
             elif msg.wParam == HOTKEY_WS3:
                     ws_switch(2)
         elif msg.message == CUSTOM_TOGGLE_SWAP:
-            if swap_mode:
+            if swap_mode_lock:
                 exit_swap_mode()
             else:
                 enter_swap_mode()
