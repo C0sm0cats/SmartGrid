@@ -91,7 +91,7 @@ last_active_hwnd = None   # Last known active/focused tiled window (preserved wh
 
 # Runtime flags
 is_active = False            # Persistent tiling enabled?
-swap_mode_lock = False        # Block auto-retile during swap
+swap_mode_lock = False       # Block auto-retile during swap
 move_monitor_lock = False    # Block auto-retile during monitor move (Ctrl+Alt+M)
 workspace_switching_lock = False  # Block auto-retile during workspace switch (Ctrl+Alt+1/2/3)
 drag_drop_lock = False       # Block auto-retile during drag & drop
@@ -600,9 +600,9 @@ def update_active_border():
 def enter_swap_mode():
     """Enter swap mode: red border + arrow keys to swap window positions."""
     global selected_hwnd, last_active_hwnd, swap_mode_lock
-    
-    # Wait a tiny bit for the tiling to stabilize
-    time.sleep(0.05)
+
+    swap_mode_lock = True          # Prevent automatic re-tiling during swap mode
+    time.sleep(0.25)
     
     # Force a quick update of grid_state in case it's empty or updating
     if not grid_state:
@@ -632,7 +632,6 @@ def enter_swap_mode():
         log("[SWAP] No valid window to select")
         return
 
-    swap_mode_lock = True          # Prevent automatic re-tiling during swap mode
     selected_hwnd = candidate
 
     time.sleep(0.05)
@@ -718,8 +717,6 @@ def exit_swap_mode():
         set_window_border(selected_hwnd, None)
     selected_hwnd = None
     time.sleep(0.06)
-    
-    swap_mode_lock = False
 
     unregister_swap_hotkeys()
     selected_hwnd = None
@@ -730,7 +727,8 @@ def exit_swap_mode():
     if active and user32.IsWindowVisible(active) and active in grid_state:
         apply_border(active)
         log(f"[SWAP] Green border restored on active window")
-    
+
+    swap_mode_lock = False    
     log("[SWAP] ✓ Deactivated\n")
     # Refresh tray menu
     update_tray_menu()
@@ -1211,6 +1209,7 @@ def start_drag_snap_monitor():
                 # Only accept windows managed by SmartGrid
                 if hwnd and hwnd in grid_state and user32.IsWindowVisible(hwnd):
                     drag_drop_lock = True
+                    time.sleep(0.25) # Prevent automatic re-tiling during drag
                     drag_hwnd = hwnd
                     drag_start = pt
                     preview_active = False
@@ -1477,7 +1476,8 @@ def ws_switch(ws_idx):
     """Switch to specified workspace (0-2) on current monitor. Saves old, hides its windows, loads new."""
     global current_workspace, grid_state, is_active, last_visible_count, workspace_switching_lock
     
-    workspace_switching_lock = True
+    workspace_switching_lock = True # Prevent automatic re-tiling during workspace switch
+    time.sleep(0.25)
     try:
         mon = CURRENT_MONITOR_INDEX
 
@@ -1547,7 +1547,8 @@ def move_current_workspace_to_next_monitor():
     """Move all windows from current workspace to the next monitor (circular). Keeps layout and workspace index."""
     global grid_state, CURRENT_MONITOR_INDEX, MONITORS_CACHE, current_workspace, move_monitor_lock
     
-    move_monitor_lock = True
+    move_monitor_lock = True # Prevent automatic re-tiling during move
+    time.sleep(0.25)
     try:
         if not grid_state:
             log("[MOVE] Nothing to move - no windows in grid")
@@ -1806,10 +1807,10 @@ def monitor():
 
     while True:
         update_active_border()
-
-        if swap_mode_lock or drag_drop_lock or move_monitor_lock or workspace_switching_lock:
+        if (swap_mode_lock or drag_drop_lock or move_monitor_lock or workspace_switching_lock):
             time.sleep(0.1)
             continue
+
         if is_active:
             # Clean dead or minimized or maximizec windows
             for hwnd in list(grid_state.keys()):
@@ -1906,7 +1907,7 @@ if __name__ == "__main__":
             elif msg.wParam == HOTKEY_WS2:
                 ws_switch(1)
             elif msg.wParam == HOTKEY_WS3:
-                    ws_switch(2)
+                ws_switch(2)
         elif msg.message == CUSTOM_TOGGLE_SWAP:
             if swap_mode_lock:
                 exit_swap_mode()
