@@ -43,6 +43,7 @@ No config. No bullshit. Just press one key and live in perfect harmony.
     → Force re-tile all windows  
     → Toggle Swap Mode ON/OFF  
     → Move workspace to next monitor  
+    → Settings (Gap & Padding)  
     → Quick access to hotkeys cheatsheet and quit
 - Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 
