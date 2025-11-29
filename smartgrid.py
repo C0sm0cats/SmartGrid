@@ -1941,11 +1941,9 @@ def monitor():
             current_count = len(visible_windows)
 
             # Add new windows
-            updated = False
             for hwnd, title, _ in visible_windows:
                 if hwnd not in grid_state:
                     grid_state[hwnd] = (0, 0, 0)
-                    updated = True
 
             # Auto-retile with smart restore
             if time.time() >= ignore_retile_until and current_count > 0:
