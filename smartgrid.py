@@ -858,10 +858,10 @@ class PAINTSTRUCT(ctypes.Structure):
 def create_overlay_window():
     """Create transparent topmost overlay for drag-and-drop snap preview."""
     global overlay_hwnd
-    
+
     if overlay_hwnd:
         return overlay_hwnd
-    
+
     class_name = "SmartGridOverlay"
     
     # Properly define DefWindowProc with correct signature
@@ -871,11 +871,11 @@ def create_overlay_window():
     
     # Define WNDPROCTYPE properly
     WNDPROCTYPE = ctypes.WINFUNCTYPE(
-        wintypes.LPARAM,    # Return type (changed from c_long)
-        wintypes.HWND,      # hwnd
-        ctypes.c_uint,      # msg
-        wintypes.WPARAM,    # wparam
-        wintypes.LPARAM     # lparam
+        wintypes.LPARAM,
+        wintypes.HWND,
+        ctypes.c_uint,
+        wintypes.WPARAM,
+        wintypes.LPARAM
     )
     
     # Window procedure for overlay
@@ -885,77 +885,74 @@ def create_overlay_window():
             if msg == win32con.WM_PAINT:
                 ps = PAINTSTRUCT()
                 hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
-                
+
                 if preview_rect:
-                    x, y, w, h = preview_rect
-                    
-                    # Create semi-transparent brush (blue with 30% opacity)
-                    brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))  # Cornflower blue
-                    pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))  # Royal blue border
-                    
+                    _, _, w, h = preview_rect  # absolute coords kept, but drawing is local
+
+                    brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))
+                    pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))
+
                     old_brush = win32gui.SelectObject(hdc, brush)
                     old_pen = win32gui.SelectObject(hdc, pen)
-                    
-                    # Draw rectangle
-                    win32gui.Rectangle(hdc, x, y, x + w, y + h)
-                    
+
+                    # Draw in local client coords (0..w, 0..h)
+                    win32gui.Rectangle(hdc, 2, 2, w - 2, h - 2)
+
                     win32gui.SelectObject(hdc, old_brush)
                     win32gui.SelectObject(hdc, old_pen)
                     win32gui.DeleteObject(brush)
                     win32gui.DeleteObject(pen)
-                
+
                 user32.EndPaint(hwnd, ctypes.byref(ps))
                 return 0
-            
+
             elif msg == win32con.WM_DESTROY:
                 return 0
-            
-            # Use properly typed DefWindowProc
+
             return DefWindowProc(hwnd, msg, wparam, lparam)
-        
+
         except Exception as e:
             log(f"[OVERLAY] Error in wnd_proc: {e}")
             return 0
-    
-    # Register window class
+
     wc = win32gui.WNDCLASS()
     wc.lpfnWndProc = wnd_proc
     wc.lpszClassName = class_name
     wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
-    
+
     try:
         win32gui.RegisterClass(wc)
     except:
-        pass  # Class already registered
-    
-    # Create layered window (for transparency)
+        pass
+
     overlay_hwnd = win32gui.CreateWindowEx(
-        win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT | win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
+        win32con.WS_EX_LAYERED | win32con.WS_EX_TRANSPARENT |
+        win32con.WS_EX_TOPMOST | win32con.WS_EX_TOOLWINDOW,
         class_name,
         "SmartGrid Preview",
         win32con.WS_POPUP,
-        0, 0, 1, 1,  # Will be resized
+        0, 0, 1, 1,
         0, 0, 0, None
     )
-    
-    # Set 30% opacity
+
     win32gui.SetLayeredWindowAttributes(overlay_hwnd, 0, int(255 * 0.3), win32con.LWA_ALPHA)
-    
+
     return overlay_hwnd
+
 
 def show_snap_preview(x, y, w, h):
     """Show blue snap preview rectangle."""
     global preview_rect, overlay_hwnd
-    
+
     if not overlay_hwnd:
         create_overlay_window()
-    
+
     preview_rect = (x, y, w, h)
     
     # Position and show overlay window
     win32gui.SetWindowPos(
         overlay_hwnd, win32con.HWND_TOPMOST,
-        x, y, w, h,
+        int(x), int(y), int(w), int(h),
         win32con.SWP_SHOWWINDOW | win32con.SWP_NOACTIVATE
     )
     
@@ -966,18 +963,17 @@ def show_snap_preview(x, y, w, h):
 def hide_snap_preview():
     """Hide snap preview overlay."""
     global preview_rect, overlay_hwnd
-    
     preview_rect = None
-    
     if overlay_hwnd:
         win32gui.ShowWindow(overlay_hwnd, win32con.SW_HIDE)
 
+
 def calculate_target_rect(source_hwnd, cursor_pos):
-    """Compute target snap rectangle based on cursor position."""
+    """Compute target snap rectangle (absolute coords) with frame-borders included."""
     
     if source_hwnd not in grid_state:
         return None
-   
+
     monitors = get_monitors()
     cx, cy = cursor_pos
     
@@ -987,78 +983,85 @@ def calculate_target_rect(source_hwnd, cursor_pos):
         if mx <= cx < mx + mw and my <= cy < my + mh:
             target_mon_idx = i
             break
-    
+
     mon_x, mon_y, mon_w, mon_h = monitors[target_mon_idx]
     
     # Get windows currently on this monitor
     wins_on_mon = [h for h, (m, _, _) in grid_state.items() 
                    if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd]
+
     count_including_source = len(wins_on_mon) + 1
     current_layout, current_info = choose_layout(count_including_source)
-    
-    # Calculate target cell
-    target_col = target_row = 0
-    
+
+    # Default
+    x = y = 0
+    w = h = 0
+
     if current_layout == "master_stack":
-        master_width = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
-        master_right = mon_x + EDGE_PADDING + master_width + GAP//2
-        
+        master_w = (mon_w - 2*EDGE_PADDING - GAP) * 3 // 5
+        master_right = mon_x + EDGE_PADDING + master_w + GAP//2
+
         if cx < master_right:
-            target_col, target_row = 0, 0
-            # Master pane dimensions
-            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-                   master_width, mon_h - 2*EDGE_PADDING)
+            x = mon_x + EDGE_PADDING
+            y = mon_y + EDGE_PADDING
+            w = master_w
+            h = mon_h - 2*EDGE_PADDING
         else:
-            # Stack pane
-            sw = mon_w - 2*EDGE_PADDING - master_width - GAP
+            sw = mon_w - 2*EDGE_PADDING - master_w - GAP
             sh = (mon_h - 2*EDGE_PADDING - GAP) // 2
-            mid_y = mon_y + mon_h // 2
-            
-            if cy < mid_y:
-                # Top stack
-                return (mon_x + EDGE_PADDING + master_width + GAP, mon_y + EDGE_PADDING,
-                       sw, sh)
-            else:
-                # Bottom stack
-                return (mon_x + EDGE_PADDING + master_width + GAP, 
-                       mon_y + EDGE_PADDING + sh + GAP, sw, sh)
-    
+            mid = mon_y + mon_h // 2
+
+            x = mon_x + EDGE_PADDING + master_w + GAP
+            y = mon_y + EDGE_PADDING + (sh + GAP if cy >= mid else 0)
+            w = sw
+            h = sh
+
     elif current_layout == "side_by_side":
         cw = (mon_w - 2*EDGE_PADDING - GAP) // 2
-        if cx < mon_x + mon_w // 2:
-            # Left side
-            return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING, 
-                   cw, mon_h - 2*EDGE_PADDING)
-        else:
-            # Right side
-            return (mon_x + EDGE_PADDING + cw + GAP, mon_y + EDGE_PADDING,
-                   cw, mon_h - 2*EDGE_PADDING)
-    
+
+        x = mon_x + EDGE_PADDING + (0 if cx < mon_x + mon_w//2 else cw + GAP)
+        y = mon_y + EDGE_PADDING
+        w = cw
+        h = mon_h - 2*EDGE_PADDING
+
     elif current_layout == "full":
-        return (mon_x + EDGE_PADDING, mon_y + EDGE_PADDING,
-               mon_w - 2*EDGE_PADDING, mon_h - 2*EDGE_PADDING)
+        x = mon_x + EDGE_PADDING
+        y = mon_y + EDGE_PADDING
+        w = mon_w - 2*EDGE_PADDING
+        h = mon_h - 2*EDGE_PADDING
 
-    else:  # grid
+    else:  # Grid
         cols, rows = current_info if current_info else (2, 2)
-        max_c = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
-        max_r = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
-        cols = max(cols, max_c + 1)
-        rows = max(rows, max_r + 1)
-        
-        cell_w = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
-        cell_h = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
-        
-        rel_x = cx - mon_x - EDGE_PADDING
-        rel_y = cy - mon_y - EDGE_PADDING
-        target_col = min(max(0, rel_x // (cell_w + GAP)), cols - 1)
-        target_row = min(max(0, rel_y // (cell_h + GAP)), rows - 1)
-        
-        x = mon_x + EDGE_PADDING + target_col * (cell_w + GAP)
-        y = mon_y + EDGE_PADDING + target_row * (cell_h + GAP)
-        
-        return (x, y, cell_w, cell_h)
+        maxc = max((c for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        maxr = max((r for h,(m,c,r) in grid_state.items() if m == target_mon_idx), default=0)
+        cols = max(cols, maxc + 1)
+        rows = max(rows, maxr + 1)
 
-    return None
+        cw = (mon_w - 2*EDGE_PADDING - GAP*(cols-1)) // cols
+        ch = (mon_h - 2*EDGE_PADDING - GAP*(rows-1)) // rows
+
+        relx = cx - mon_x - EDGE_PADDING
+        rely = cy - mon_y - EDGE_PADDING
+        col = min(max(0, relx // (cw + GAP)), cols-1)
+        row = min(max(0, rely // (ch + GAP)), rows-1)
+
+        x = mon_x + EDGE_PADDING + col * (cw + GAP)
+        y = mon_y + EDGE_PADDING + row * (ch + GAP)
+        w = cw
+        h = ch
+
+    # ---- FRAME BORDER COMPENSATION (as tiling does) ----
+    try:
+        lb, tb, rb, bb = get_frame_borders(source_hwnd)
+    except:
+        lb = tb = rb = bb = 0
+
+    return (
+        int(x - lb),
+        int(y - tb),
+        int(w + lb + rb),
+        int(h + tb + bb)
+    )
 
 def apply_grid_state():
     """Reapply all saved grid positions physically (used after snap, swap, or workspace change)."""
@@ -1737,7 +1740,9 @@ def create_tray_menu():
         ),
         MenuItem('Move Workspace to Next Monitor (Ctrl+Alt+M)', lambda: threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()),
         Menu.SEPARATOR,
-        #MenuItem('Hotkeys Cheatsheet', show_hotkeys_tooltip),
+        MenuItem('Settings (Gap & Padding)', 
+         lambda: threading.Thread(target=show_settings_dialog, daemon=True).start()),
+        Menu.SEPARATOR,
         MenuItem('Hotkeys Cheatsheet', lambda: threading.Thread(target=show_hotkeys_tooltip, daemon=True).start()),
         MenuItem('Quit SmartGrid (Ctrl+Alt+Q)', on_quit_from_tray)
     )
@@ -1794,6 +1799,119 @@ def start_systray():
         create_tray_menu()
     )
     tray_icon.run()
+
+def show_settings_dialog():
+    """Show dialog to modify GAP and EDGE_PADDING with dropdown menus"""
+    global GAP, EDGE_PADDING, last_visible_count
+    
+    import tkinter as tk
+    from tkinter import ttk
+    
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes('-topmost', True)
+    
+    dialog = tk.Toplevel(root)
+    dialog.title("SmartGrid Settings")
+    dialog.geometry("350x250")
+    dialog.attributes('-topmost', True)
+    dialog.resizable(False, False)
+    
+    # Title
+    title = tk.Label(dialog, text="SmartGrid Settings", font=("Arial", 12, "bold"))
+    title.pack(pady=10)
+    
+    # GAP Section
+    gap_frame = tk.LabelFrame(dialog, text="Gap Between Windows", padx=10, pady=10)
+    gap_frame.pack(fill=tk.X, padx=15, pady=5)
+    
+    gap_options = ["2px", "4px", "6px", "8px", "10px", "12px", "16px", "20px"]
+    gap_values = [2, 4, 6, 8, 10, 12, 16, 20]
+    current_gap_idx = gap_values.index(GAP) if GAP in gap_values else 3
+    
+    gap_var = tk.StringVar(value=gap_options[current_gap_idx])
+    gap_dropdown = ttk.Combobox(gap_frame, textvariable=gap_var, values=gap_options, 
+                                 state="readonly", width=15)
+    gap_dropdown.pack(side=tk.LEFT, padx=5)
+    
+    gap_label = tk.Label(gap_frame, text=f"(current: {GAP}px)", font=("Arial", 9, "italic"))
+    gap_label.pack(side=tk.LEFT, padx=10)
+    
+    # EDGE_PADDING Section
+    padding_frame = tk.LabelFrame(dialog, text="Edge Padding (margin)", padx=10, pady=10)
+    padding_frame.pack(fill=tk.X, padx=15, pady=5)
+    
+    padding_options = ["0px", "4px", "8px", "12px", "16px", "20px", "30px", "40px", "50px", "80px", "100px"]
+    padding_values = [0, 4, 8, 12, 16, 20, 30, 40, 50, 80, 100]
+    current_padding_idx = padding_values.index(EDGE_PADDING) if EDGE_PADDING in padding_values else 2
+    
+    padding_var = tk.StringVar(value=padding_options[current_padding_idx])
+    padding_dropdown = ttk.Combobox(padding_frame, textvariable=padding_var, 
+                                     values=padding_options, state="readonly", width=15)
+    padding_dropdown.pack(side=tk.LEFT, padx=5)
+    
+    padding_label = tk.Label(padding_frame, text=f"(current: {EDGE_PADDING}px)", font=("Arial", 9, "italic"))
+    padding_label.pack(side=tk.LEFT, padx=10)
+    
+    # Buttons
+    button_frame = tk.Frame(dialog)
+    button_frame.pack(pady=15)
+    
+    def apply_and_close():
+        global GAP, EDGE_PADDING
+        
+        gap_str = gap_var.get().replace("px", "")
+        padding_str = padding_var.get().replace("px", "")
+        
+        # stop preview if active
+        hide_snap_preview()
+        time.sleep(0.15)
+        
+        # apply new settings
+        GAP = int(gap_str)
+        EDGE_PADDING = int(padding_str)
+        
+        log(f"[SETTINGS] GAP={GAP}px, EDGE_PADDING={EDGE_PADDING}px")
+
+        apply_new_settings()
+        
+        dialog.destroy()
+        root.destroy()
+        
+    def cancel_and_close():
+        dialog.destroy()
+        root.destroy()
+    
+    def reset_defaults():
+        nonlocal current_gap_idx, current_padding_idx
+        gap_var.set(gap_options[3])  # 8px
+        padding_var.set(padding_options[2])  # 8px
+    
+    tk.Button(button_frame, text="Apply", command=apply_and_close, width=12, bg="#4CAF50", fg="white").pack(side=tk.LEFT, padx=5)
+    tk.Button(button_frame, text="Reset", command=reset_defaults, width=12).pack(side=tk.LEFT, padx=5)
+    tk.Button(button_frame, text="Cancel", command=cancel_and_close, width=12).pack(side=tk.LEFT, padx=5)
+    
+    info = tk.Label(dialog, text="Changes apply immediately on next retile cycle", 
+                    font=("Arial", 8), fg="gray")
+    info.pack(pady=5)
+    
+    root.mainloop()
+
+def apply_new_settings():
+    global ignore_retile_until, last_visible_count, drag_drop_lock
+    
+    drag_drop_lock = True
+    time.sleep(0.1)
+
+    ignore_retile_until = 0
+    last_visible_count = 0
+    
+    smart_tile_with_restore()
+    apply_grid_state()
+
+    time.sleep(0.1)
+    drag_drop_lock = False
+
 
 # ==============================================================================
 # MAIN LOOP & THREADS

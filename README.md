@@ -79,14 +79,6 @@ SmartGrid gives you **3 independent workspaces per monitor** — like having mul
 3. Tile different windows on workspace 2
 4. Press `Ctrl+Alt+1` → back to your first context, **pixel-perfect**
 
-**Smart features:**
-- ✅ Restores **exact positions** (no layout recalculation)
-- ✅ Brings back **minimized windows** from taskbar
-- ✅ Shows **hidden windows** automatically
-- ✅ Skips **dead windows** (closed apps)
-- ✅ **Smooth transitions** (no flickering)
-- ✅ Works **independently** on each monitor
-
 **Example workflow:**
 ```
 Monitor 1, Workspace 1: [Browser, VSCode, Terminal]  ← Dev environment
