@@ -49,16 +49,14 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 ## Hotkeys
 
-| Shortcut         | Action                                                                     |
-|:-----------------|----------------------------------------------------------------------------|
-| `Ctrl + Alt + T` | Toggle tiling (on/off)                                                     |
-| `Ctrl + Alt + R` | Force re-tile all windows now                                              |
-| `Ctrl + Alt + S` | Enter Swap Mode (red border + arrows)                                      |
-| `Ctrl + Alt + M` | Move current workspace to next monitor                                     |
-| `Ctrl + Alt + 1` | Switch to workspace 1 (current monitor)                                    |
-| `Ctrl + Alt + 2` | Switch to workspace 2 (current monitor)                                    |
-| `Ctrl + Alt + 3` | Switch to workspace 3 (current monitor)                                    |
-| `Ctrl + Alt + Q` | Quit SmartGrid                                                             |
+| Shortcut             | Action                                                                      |
+|:---------------------|-----------------------------------------------------------------------------|
+| `Ctrl + Alt + T`     | Toggle tiling (on/off)                                                      |
+| `Ctrl + Alt + R`     | Force re-tile all windows now                                               |
+| `Ctrl + Alt + S`     | Enter Swap Mode (red border + arrows)                                       |
+| `Ctrl + Alt + M`     | Move current workspace to next monitor                                      |
+| `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
+| `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
 
 > **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
 
