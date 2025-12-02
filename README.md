@@ -71,7 +71,7 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 - Launch SmartGrid → nothing moves (you see the welcome message)
 - Press `Ctrl+Alt+T` → **BAM**. Instant perfect tiling + auto-retile activated
-- From now on: restore a window, minimize one, open Firefox → layout updates **automatically**
+- From now on: restore a window, minimize one, open whatever you want → layout updates **automatically**
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
 
