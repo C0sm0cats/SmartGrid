@@ -71,7 +71,11 @@ HOTKEY_SWAP_UP = 9008
 HOTKEY_SWAP_DOWN = 9009
 HOTKEY_SWAP_CONFIRM = 9010
 
+# Custom toggle swap key - systray
 CUSTOM_TOGGLE_SWAP = 0x9000
+
+# Float toggle key
+HOTKEY_FLOAT_TOGGLE = 9011
 
 # Win32 API
 user32 = ctypes.WinDLL('user32', use_last_error=True)   # Main Windows API
@@ -113,6 +117,12 @@ overlay_hwnd = None
 preview_rect = None  # (x, y, w, h) of preview rectangle
 tray_icon = None
 main_thread_id = win32api.GetCurrentThreadId()
+
+# Track the currently selected window in real-time
+user_selected_hwnd = None  # Updated continuously to reflect user's current focus
+
+# Float windows
+override_windows = set()  # Set of HWNDs that should be excluded from tiling
 
 # ==============================================================================
 # UTILITY FUNCTIONS
@@ -205,19 +215,19 @@ def is_useful_window(title, class_name=""):
 
     # === SPECIAL CASE: Microsoft Teams ===
     if "teams" in title_lower:
-        # Keep the main Teams window (class TeamsWebView)
-        if class_lower == "teamswebview":
+
+        # Only allow the real main Microsoft Teams window
+        allowed_classes = [
+            "teamswebview",
+            "teamsdesktopwindowclass",
+        ]
+
+        if class_lower in allowed_classes:
+            # This is the real main Teams window → allow tiling
             return True
 
-        # Exclude popups, notifications, calls, and meeting windows
-        bad_substrings = [
-            "notification", "notif", "toast", "popup",
-            "appel", "call", "calling", "incoming", "entrant",
-            "réunion", "meeting", "join", "rejoindre",
-            "|",   # Teams often uses "|" in popup window titles
-        ]
-        if any(bad in title_lower for bad in bad_substrings):
-            return False
+        # Everything else is a popup / meeting window / pre-join / call overlay
+        return False
 
     # === HARD EXCLUDE BY TITLE ===
     bad_titles = [
@@ -249,10 +259,15 @@ def is_useful_window(title, class_name=""):
         "shell_traywnd",                 # Taskbar
         "realtimedisplay",               # Some overlays
         # === Added to exclude Win+Tab / Alt+Tab task switcher ===
-        "multitaskingviewframe",           # Win+Tab
-        "taskswitcherwnd",                 # Alt+Tab
-        "xamlexplorerhostislandwindow",    # Alt+Tab / Win11 timeline
-        "#32770",                          # MessageBox dialog class
+        "multitaskingviewframe",         # Win+Tab
+        "taskswitcherwnd",               # Alt+Tab
+        "xamlexplorerhostislandwindow",  # Alt+Tab / Win11 timeline
+        "#32770",                        # MessageBox dialog class
+        "windows.ui.popupwindowclass",   # WinUI menus
+        "popuphostwindow",               # Menu dropdown host
+        # === Added to exclude notepad menu popups (WinUI 3) ===
+        "microsoft.ui.content.popupwindowsitebridge", # WinUI 3 menu popup
+        "notepadshellexperiencehost",
     ]
 
     if class_lower in bad_classes:
@@ -276,7 +291,7 @@ def get_visible_windows():
                 return True
             elif state != 'normal':
                 return True
-            
+        
             rect = wintypes.RECT()
             if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                 w = rect.right - rect.left
@@ -290,7 +305,12 @@ def get_visible_windows():
                     if overlay_hwnd and hwnd == overlay_hwnd:
                         return True
                     
-                    if is_useful_window(title, class_name):
+                    # override windows logic
+                    useful = is_useful_window(title, class_name)
+                    if hwnd in override_windows:
+                        useful = not useful
+
+                    if useful:
                         overlap = sum(
                             max(0, min(rect.right, mx + mw) - max(rect.left, mx)) *
                             max(0, min(rect.bottom, my + mh) - max(rect.top, my))
@@ -304,6 +324,48 @@ def get_visible_windows():
         ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum), 0
     )
     return windows
+
+# ==============================================================================
+# FLOATING WINDOW MANAGEMENT
+# ==============================================================================
+
+def toggle_floating_selected():
+    """Ctrl+Alt+F → (tile → float, float → tile)   
+    Uses user_selected_hwnd which is continuously updated by the monitor loop.
+    This ensures we toggle the window the USER last clicked.
+    """
+    global user_selected_hwnd
+    
+    # Use the continuously-tracked user selection
+    hwnd = user_selected_hwnd
+    
+    if not hwnd or not user32.IsWindow(hwnd) or not user32.IsWindowVisible(hwnd):
+        winsound.MessageBeep(0xFFFFFFFF)
+        log("[FLOAT] No valid window selected")
+        return
+
+    title = win32gui.GetWindowText(hwnd)
+    class_name = win32gui.GetClassName(hwnd)
+    default_useful = is_useful_window(title, class_name)
+
+    if hwnd in override_windows:
+        override_windows.remove(hwnd)
+        log(f"[OVERRIDE] {title[:60]} → rollback to ({'tile' if default_useful else 'float'})")
+        if default_useful:
+            smart_tile_with_restore()
+        winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
+    else:
+        override_windows.add(hwnd)
+        log(f"[OVERRIDE] {title[:60]} → override to ({'float' if default_useful else 'tile'})")
+        if default_useful:
+            if hwnd in grid_state:
+                grid_state.pop(hwnd, None)
+            set_window_border(hwnd, None)
+        elif not default_useful:
+            smart_tile_with_restore()
+        winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
+
+    update_tray_menu()
 
 # ==============================================================================
 # LAYOUT ENGINE
@@ -1656,11 +1718,12 @@ def register_hotkeys():
     user32.RegisterHotKey(None, HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1'))
     user32.RegisterHotKey(None, HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2'))
     user32.RegisterHotKey(None, HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3'))
+    user32.RegisterHotKey(None, HOTKEY_FLOAT_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('F')) 
 
 def unregister_hotkeys():
     """Unregister all main global hotkeys (cleanup on exit)"""
     for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
-               HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3):
+               HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3, HOTKEY_FLOAT_TOGGLE):
         try: user32.UnregisterHotKey(None, hk)
         except: pass
 
@@ -1724,13 +1787,6 @@ def create_tray_menu():
             lambda: (toggle_persistent(), update_tray_menu()),
             checked=lambda item: is_active
         ),
-        Menu.SEPARATOR,
-        MenuItem('Workspaces', Menu(
-            MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: ws_switch(0)),
-            MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)', lambda: ws_switch(1)),
-            MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)', lambda: ws_switch(2)),
-        )),
-        Menu.SEPARATOR,
         MenuItem('Force Re-tile All Windows (Ctrl+Alt+R)', 
          lambda: threading.Thread(target=force_immediate_retile, daemon=True).start()),
         MenuItem(
@@ -1739,10 +1795,18 @@ def create_tray_menu():
             checked=lambda item: swap_mode_lock
         ),
         MenuItem('Move Workspace to Next Monitor (Ctrl+Alt+M)', lambda: threading.Thread(target=move_current_workspace_to_next_monitor, daemon=True).start()),
+        MenuItem('Toggle Floating Selected Window (Ctrl+Alt+F)',
+            lambda: threading.Thread(target=toggle_floating_selected, daemon=True).start()
+        ),
+        Menu.SEPARATOR,
+        MenuItem('Workspaces', Menu(
+            MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: ws_switch(0)),
+            MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)', lambda: ws_switch(1)),
+            MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)', lambda: ws_switch(2)),
+        )),
         Menu.SEPARATOR,
         MenuItem('Settings (Gap & Padding)', 
          lambda: threading.Thread(target=show_settings_dialog, daemon=True).start()),
-        Menu.SEPARATOR,
         MenuItem('Hotkeys Cheatsheet', lambda: threading.Thread(target=show_hotkeys_tooltip, daemon=True).start()),
         MenuItem('Quit SmartGrid (Ctrl+Alt+Q)', on_quit_from_tray)
     )
@@ -1775,30 +1839,18 @@ def show_hotkeys_tooltip():
     ctypes.windll.user32.MessageBoxW(
         0,
         "---------- MAIN HOTKEYS\n\n"
-        "Ctrl+Alt+T  →  Toggle tiling on/off\n"
-        "Ctrl+Alt+R  →  Force re-tile all windows now\n"
-        "Ctrl+Alt+S  →  Enter Swap Mode (red border + arrows)\n"
-        "Ctrl+Alt+M  →  Move workspace to next monitor\n\n"
+        "Ctrl+Alt+T       →  Toggle tiling on/off\n"
+        "Ctrl+Alt+R       →  Force re-tile all windows now\n"
+        "Ctrl+Alt+S       →  Enter Swap Mode (red border + arrows)\n"
+        "Ctrl+Alt+M      →  Move workspace to next monitor\n"
+        "Ctrl+Alt+F       →  Toggle Floating Selected Window\n\n"
         "---------- WORKSPACES\n\n"
-        "Ctrl+Alt+1/2/3  →  Switch workspace\n\n"
-        "---------- DRAG & DROP\n\n"
-        "Drag title bar → Snap with preview (works across monitors)\n\n"
+        "Ctrl+Alt+1/2/3   →  Switch workspace\n\n"
         "---------- EXIT\n\n"
-        "Ctrl+Alt+Q  →  Quit",
+        "Ctrl+Alt+Q       →  Quit",
         "SmartGrid Hotkeys",
         0x40  # MB_ICONINFORMATION
     )
-
-def start_systray():
-    """Start the system tray icon"""
-    global tray_icon
-    tray_icon = Icon(
-        "SmartGrid",
-        create_icon_image(),
-        "SmartGrid - Tiling Window Manager",
-        create_tray_menu()
-    )
-    tray_icon.run()
 
 def show_settings_dialog():
     """Show dialog to modify GAP and EDGE_PADDING with dropdown menus"""
@@ -1922,9 +1974,23 @@ def monitor():
     global current_hwnd, grid_state, last_visible_count, last_active_hwnd
     global ignore_retile_until, swap_mode_lock, drag_drop_lock
     global move_monitor_lock, workspace_switching_lock
+    global user_selected_hwnd
 
     while True:
+
+        # === TRACK USER'S CURRENT WINDOW SELECTION ===
+        # This captures which window the user actually has in focus
+        # BEFORE any systray/menu steals focus
+        fg = user32.GetForegroundWindow()
+        if fg and user32.IsWindow(fg) and user32.IsWindowVisible(fg):
+            # Only update if it's a real application window (not systray/menu)
+            title = win32gui.GetWindowText(fg)
+            class_name = win32gui.GetClassName(fg)
+            if is_useful_window(title, class_name):
+                user_selected_hwnd = fg
+
         update_active_border()
+        
         if (swap_mode_lock or drag_drop_lock or move_monitor_lock or workspace_switching_lock):
             time.sleep(0.1)
             continue
@@ -1954,43 +2020,8 @@ def monitor():
 
         time.sleep(0.06)
 
-if __name__ == "__main__":
-    log("="*70)
-    log(" SMARTGRID — Advanced Windows Tiling Manager")
-    log("="*70)
-    log("Ctrl+Alt+T  → Toggle tiling on/off")
-    log("Ctrl+Alt+R  → Force re-tile all windows now")
-    log("Ctrl+Alt+S  → Enter Swap Mode (red border + arrows)")
-    log("Ctrl+Alt+M  → Move workspace to next monitor")
-    log("Ctrl+Alt+1/2/3 → Switch workspace")
-    log("Drag title bar → Snap with preview (works across monitors)")
-    log("Ctrl+Alt+Q  → Quit")
-    log("-"*70)
-
-    time.sleep(0.05)
-
-    # Initialize monitors and workspaces
-    monitors = get_monitors()
-    log(f"Detected {len(monitors)} monitor(s)")
-    
-    # Initialize workspace structure dynamically
-    workspaces, current_workspace = init_workspaces()
-    current_workspace = {i: 0 for i in range(len(monitors))}
-    log(f"Initialized {len(monitors)} × 3 workspaces")
-    
-    if len(monitors) > 1:
-        log("Ctrl+Alt+M -> cycle tiled windows across monitors")
-
-    # Background services ----------------------------------------------------
-    # → Watches for new/minimized/restored windows, auto-retiles, manages green border
-    threading.Thread(target=monitor, daemon=True).start()
-    # → Real-time drag detection: enables snap on drop (with swap/move)
-    threading.Thread(target=start_drag_snap_monitor, daemon=True).start()
-    # → System tray icon with context menu
-    threading.Thread(target=start_systray, daemon=True).start()
-    # ------------------------------------------------------------------------
-    register_hotkeys()
-
+def message_loop():
+    """Main message loop for hotkeys and window messages"""
     msg = wintypes.MSG()
     while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
         if msg.message == win32con.WM_HOTKEY:
@@ -2024,6 +2055,8 @@ if __name__ == "__main__":
                 ws_switch(1)
             elif msg.wParam == HOTKEY_WS3:
                 ws_switch(2)
+            elif msg.wParam == HOTKEY_FLOAT_TOGGLE:
+                toggle_floating_selected()
         elif msg.message == CUSTOM_TOGGLE_SWAP:
             if swap_mode_lock:
                 exit_swap_mode()
@@ -2033,12 +2066,63 @@ if __name__ == "__main__":
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
-    if current_hwnd:
-        set_window_border(current_hwnd, None)
+if __name__ == "__main__":
+    print("="*70)
+    print(" SMARTGRID — Advanced Windows Tiling Manager")
+    print("="*70)
+    print("Ctrl+Alt+T     → Toggle tiling on/off")
+    print("Ctrl+Alt+R     → Force re-tile all windows now")
+    print("Ctrl+Alt+S     → Enter Swap Mode (red border + arrows)")
+    print("Ctrl+Alt+M     → Move workspace to next monitor")
+    print("Ctrl+Alt+F     → Toggle Floating Selected Window")
+    print("Ctrl+Alt+1/2/3 → Switch workspace")
+    print("Ctrl+Alt+Q     → Quit")
+    print("-"*70)
 
-    # Stop systray icon
-    if tray_icon:
-        tray_icon.stop()
+    time.sleep(0.05)
 
-    unregister_hotkeys()
-    log("[EXIT] SmartGrid stopped.")
+    # Init
+    monitors = get_monitors()
+    log(f"Detected {len(monitors)} monitor(s)")
+    workspaces, current_workspace = init_workspaces()
+    current_workspace = {i: 0 for i in range(len(monitors))}
+    log(f"Initialized {len(monitors)} × 3 workspaces")
+
+    if len(monitors) > 1:
+        log("Ctrl+Alt+M -> cycle tiled windows across monitors")
+
+    # Background Threads
+    threading.Thread(target=monitor, daemon=True).start()
+    threading.Thread(target=start_drag_snap_monitor, daemon=True).start()
+
+    # === REGISTER HOTKEYS ===
+    register_hotkeys()
+    log("[MAIN] All hotkeys registered (including arrows)")
+
+    # === CREATE SYSTRAY ICON ===
+    tray_icon = Icon(
+        "SmartGrid",
+        create_icon_image(),
+        "SmartGrid - Tiling Window Manager",
+        menu=create_tray_menu()
+    )
+    update_tray_menu()
+
+    # === Give pystray a setup function that does nothing ===
+    def setup(icon):
+        icon.visible = True
+
+    # === Launch pystray in the main thread, BUT without blocking ===
+    tray_icon.run_detached(setup=setup)
+    log("[MAIN] Systray launched with run_detached")
+
+    # === OUR message_loop() takes over and receives ALL WM_HOTKEY ===
+    try:
+        message_loop()
+    finally:
+        if tray_icon:
+            tray_icon.stop()
+        unregister_hotkeys()
+        if current_hwnd:
+            set_window_border(current_hwnd, None)
+        log("[EXIT] SmartGrid stopped.")

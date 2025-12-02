@@ -14,36 +14,42 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 ## What It Actually Does Now
 
-- **True dynamic tiling** — open, close, minimize, restore → layout adapts **instantly**  
-  1 window → full screen  
-  2 → perfect side-by-side  
-  3 → master + stack  
+- **True dynamic tiling** — open, close, minimize, restore → layout adapts **instantly**
+  1 window → full screen
+  2 → perfect side-by-side
+  3 → master + stack
   4+ → intelligent grid (up to 5×3)
-- **Workspaces per monitor** — 3 independent workspaces on each screen  
-  → Switch instantly with `Ctrl+Alt+1/2/3`  
-  → Each workspace remembers its layout **perfectly** (position + grid coords)  
-  → Hidden windows restore automatically (even from taskbar)  
-  → Smooth transitions with **zero flickering**
-- **Drag & Drop Snap** — Grab any tiled window by the title bar → drop it anywhere → **it snaps perfectly**  
-  → Works **across monitors**  
-  → Automatically **swaps** if target cell is occupied  
+- **Green border** that **always** follows the active window
+- **Drag & Drop Snap** — Grab any tiled window by the title bar → drop it anywhere → **it snaps perfectly**
+  → Works **across monitors**
+  → Automatically **swaps** if target cell is occupied
   → **Zero hotkeys needed** — pure mouse bliss
 - **SWAP Mode** — `Ctrl+Alt+S` → red border → arrow keys → **direct swap** with adjacent windows
-  → Navigate with ← → ↑ ↓  
-  → The red window **follows your movements**  
+  → Navigate with ← → ↑ ↓
+  → The red window **follows your movements**
   → Press Enter or `Ctrl+Alt+S` to exit
-- **Green border** that **always** follows the active window
-- **Workspace-aware monitor cycling** — `Ctrl+Alt+M` → current workspace jumps to next monitor  
-  → Other workspaces stay intact  
+- **Workspace-aware monitor cycling** — `Ctrl+Alt+M` → current workspace jumps to next monitor
+  → Other workspaces stay intact
   → Merges smoothly if target workspace has windows
+- **Floating Windows** — `Ctrl+Alt+F` → toggle any window between tiled and floating
+  → Perfect for video players, chat windows, or temporary reference panels
+  → Floating windows won't participate in the grid layout
+  → Works from systray menu too — always targets your last-clicked window
+  → Press `Ctrl+Alt+F` again to snap it back into the tiling grid
+- **Workspaces per monitor** — 3 independent workspaces on each screen
+  → Switch instantly with `Ctrl+Alt+1/2/3`
+  → Each workspace remembers its layout **perfectly** (position + grid coords)
+  → Hidden windows restore automatically (even from taskbar)
+  → Smooth transitions with **zero flickering**
 - **System Tray Icon + Menu**
   → Quick access to :
-    → Toggle tiling ON/OFF  
-    → Switch workspaces (1/2/3)  
-    → Force re-tile all windows  
-    → Toggle Swap Mode ON/OFF  
-    → Move workspace to next monitor  
-    → Settings (Gap & Padding)  
+    → Toggle tiling ON/OFF
+    → Force re-tile all windows
+    → Toggle Swap Mode ON/OFF
+    → Move workspace to next monitor
+    → Toggle Floating selected window
+    → Switch workspaces (1/2/3)
+    → Settings (Gap & Padding)
     → Quick access to hotkeys cheatsheet and quit
 - Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 
@@ -55,6 +61,7 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 | `Ctrl + Alt + R`     | Force re-tile all windows now                                               |
 | `Ctrl + Alt + S`     | Enter Swap Mode (red border + arrows)                                       |
 | `Ctrl + Alt + M`     | Move current workspace to next monitor                                      |
+| `Ctrl + Alt + F`     | Toggle Floating Selected Window                                             |
 | `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
 | `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
 
@@ -113,7 +120,6 @@ This is the one that makes people go **"wait… how?!"**
 
 **What happens if target workspace has windows?**  
 → They **merge** and re-tile together (like i3/Sway behavior)
-
 
 ## Requirements
 
