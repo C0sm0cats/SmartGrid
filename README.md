@@ -14,42 +14,46 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 
 ## What It Actually Does Now
 
-- **True dynamic tiling** — open, close, minimize, restore → layout adapts **instantly**
-  1 window → full screen
-  2 → perfect side-by-side
-  3 → master + stack
-  4+ → intelligent grid (up to 5×3)
-- **Green border** that **always** follows the active window
-- **Drag & Drop Snap** — Grab any tiled window by the title bar → drop it anywhere → **it snaps perfectly**
-  → Works **across monitors**
-  → Automatically **swaps** if target cell is occupied
+- **True dynamic tiling** — open, close, minimize, restore → layout   adapts **instantly**  
+  1 window → full screen  
+  2 → perfect side-by-side  
+  3 → master + stack  
+  4+ → intelligent grid (up to 5×3)  
+- **Green border** that **always** follows the active window  
+- **Drag & Drop Snap** — Grab any tiled window by the title bar  
+  → drop it anywhere → **it snaps perfectly**  
+  → Works **across monitors**  
+  → Automatically **swaps** if target cell is occupied  
   → **Zero hotkeys needed** — pure mouse bliss
-- **SWAP Mode** — `Ctrl+Alt+S` → red border → arrow keys → **direct swap** with adjacent windows
-  → Navigate with ← → ↑ ↓
-  → The red window **follows your movements**
+- **SWAP Mode** — `Ctrl+Alt+S`  
+  → red border → arrow keys → **direct swap** with adjacent windows  
+  → Navigate with ← → ↑ ↓  
+  → The red window **follows your movements**  
   → Press Enter or `Ctrl+Alt+S` to exit
-- **Workspace-aware monitor cycling** — `Ctrl+Alt+M` → current workspace jumps to next monitor
-  → Other workspaces stay intact
+- **Workspace-aware monitor cycling** — `Ctrl+Alt+M`  
+  → current workspace jumps to next monitor  
+  → Other workspaces stay intact  
   → Merges smoothly if target workspace has windows
-- **Floating Windows** — `Ctrl+Alt+F` → toggle any window between tiled and floating
-  → Perfect for video players, chat windows, or temporary reference panels
-  → Floating windows won't participate in the grid layout
-  → Works from systray menu too — always targets your last-clicked window
+- **Floating Windows** — `Ctrl+Alt+F`  
+  → toggle any window between tiled and floating  
+  → Perfect for video players, chat windows, or temporary reference panels  
+  → Floating windows won't participate in the grid layout  
+  → Works from systray menu too — always targets your last-clicked window  
   → Press `Ctrl+Alt+F` again to snap it back into the tiling grid
-- **Workspaces per monitor** — 3 independent workspaces on each screen
-  → Switch instantly with `Ctrl+Alt+1/2/3`
-  → Each workspace remembers its layout **perfectly** (position + grid coords)
-  → Hidden windows restore automatically (even from taskbar)
+- **Workspaces per monitor** — 3 independent workspaces on each screen  
+  → Switch instantly with `Ctrl+Alt+1/2/3`  
+  → Each workspace remembers its layout **perfectly** (position + grid coords)  
+  → Hidden windows restore automatically (even from taskbar)  
   → Smooth transitions with **zero flickering**
 - **System Tray Icon + Menu**
-  → Quick access to :
-    → Toggle tiling ON/OFF
-    → Force re-tile all windows
-    → Toggle Swap Mode ON/OFF
-    → Move workspace to next monitor
-    → Toggle Floating selected window
-    → Switch workspaces (1/2/3)
-    → Settings (Gap & Padding)
+  → Quick access to :  
+    → Toggle tiling ON/OFF  
+    → Force re-tile all windows  
+    → Toggle Swap Mode ON/OFF  
+    → Move workspace to next monitor  
+    → Toggle Floating selected window  
+    → Switch workspaces (1/2/3)  
+    → Settings (Gap & Padding)  
     → Quick access to hotkeys cheatsheet and quit
 - Works with **everything**: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — **all obey**
 
