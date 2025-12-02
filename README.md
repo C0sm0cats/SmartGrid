@@ -24,12 +24,11 @@ No config. No bullshit. Just press one key and live in perfect harmony.
   → drop it anywhere → **it snaps perfectly**  
   → Works **across monitors**  
   → Automatically **swaps** if target cell is occupied  
-  → **Zero hotkeys needed** — pure mouse bliss
 - **SWAP Mode** — `Ctrl+Alt+S`  
   → red border → arrow keys → **direct swap** with adjacent windows  
   → Navigate with ← → ↑ ↓  
   → The red window **follows your movements**  
-  → Press Enter or `Ctrl+Alt+S` to exit
+  → Press Enter to confirm or `Ctrl+Alt+S` to exit
 - **Workspace-aware monitor cycling** — `Ctrl+Alt+M`  
   → current workspace jumps to next monitor  
   → Other workspaces stay intact  
@@ -45,8 +44,7 @@ No config. No bullshit. Just press one key and live in perfect harmony.
   → Each workspace remembers its layout **perfectly** (position + grid coords)  
   → Hidden windows restore automatically (even from taskbar)  
   → Smooth transitions with **zero flickering**
-- **System Tray Icon + Menu**
-  → Quick access to :  
+- **System Tray Icon + Menu** → Quick access to :  
     → Toggle tiling ON/OFF  
     → Force re-tile all windows  
     → Toggle Swap Mode ON/OFF  
@@ -68,8 +66,6 @@ No config. No bullshit. Just press one key and live in perfect harmony.
 | `Ctrl + Alt + F`     | Toggle Floating Selected Window                                             |
 | `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
 | `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
-
-> **Pro tip**: After the first `Ctrl+Alt+T`, you’ll almost never touch `R` again.
 
 ## Behavior
 
