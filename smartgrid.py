@@ -15,6 +15,7 @@ from ctypes import wintypes
 import win32gui
 import win32api
 import win32con
+import win32process
 from pystray import Icon, Menu, MenuItem
 from PIL import Image, ImageDraw
 
@@ -205,7 +206,35 @@ def set_window_border(hwnd, color):
     except:
         pass
 
-def is_useful_window(title, class_name=""):
+def get_process_name(hwnd):
+    """Retrieves the name of the process associated with the window handle (e.g., 'ms-teams.exe').
+    Returns an empty string if the handle is invalid or if an error occurs.
+    """
+    if not hwnd:
+        return ""
+    try:
+        _, process_id = win32process.GetWindowThreadProcessId(hwnd)
+        h_process = win32api.OpenProcess(0x0410, False, process_id)  # PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+        path = win32process.GetModuleFileNameEx(h_process, 0)
+        win32api.CloseHandle(h_process)
+        return os.path.basename(path).lower()
+    except:
+        return ""
+
+def get_window_size(hwnd):
+    """Retrieves the width and height of a window using its Windows handle.
+    Returns (0, 0) if the handle is invalid or if the window rectangle cannot be obtained.
+    """
+    if not hwnd or not user32.IsWindow(hwnd):
+        return 0, 0
+    rect = wintypes.RECT()
+    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        width = rect.right - rect.left
+        height = rect.bottom - rect.top
+        return width, height
+    return 0, 0
+
+def is_useful_window(title, class_name="", hwnd=None):
     """Filter out overlays, PIPs, taskbar, notifications, etc."""
     if not title:
         return False
@@ -213,21 +242,19 @@ def is_useful_window(title, class_name=""):
     title_lower = title.lower()
     class_lower = class_name.lower() if class_name else ""
 
-    # === SPECIAL CASE: Microsoft Teams ===
-    if "teams" in title_lower:
-
-        # Only allow the real main Microsoft Teams window
-        allowed_classes = [
-            "teamswebview",
-            "teamsdesktopwindowclass",
-        ]
-
-        if class_lower in allowed_classes:
-            # This is the real main Teams window → allow tiling
-            return True
-
-        # Everything else is a popup / meeting window / pre-join / call overlay
-        return False
+    # === SPECIAL CASE: Microsoft Teams
+    if hwnd:
+        process_name = get_process_name(hwnd)
+        if process_name == "ms-teams.exe":
+            w, h = get_window_size(hwnd)
+            # Exclude only very small toast notifications (typical ~372x272)
+            if w < 400 and h < 300:
+                log(f"[FILTER] Excluded small Teams toast: {title[:50]} | size {w}x{h}")
+                return False
+            
+            # Bonus for very short horizontal banners
+            if h < 200:
+                return False
 
     # === HARD EXCLUDE BY TITLE ===
     bad_titles = [
@@ -258,6 +285,7 @@ def is_useful_window(title, class_name=""):
         "progman",                       # Program Manager
         "shell_traywnd",                 # Taskbar
         "realtimedisplay",               # Some overlays
+        "credential dialog xaml host"    # Windows Security / zscaler
         # === Added to exclude Win+Tab / Alt+Tab task switcher ===
         "multitaskingviewframe",         # Win+Tab
         "taskswitcherwnd",               # Alt+Tab
@@ -267,7 +295,7 @@ def is_useful_window(title, class_name=""):
         "popuphostwindow",               # Menu dropdown host
         # === Added to exclude notepad menu popups (WinUI 3) ===
         "microsoft.ui.content.popupwindowsitebridge", # WinUI 3 menu popup
-        "notepadshellexperiencehost",
+        "notepadshellexperiencehost"
     ]
 
     if class_lower in bad_classes:
@@ -302,11 +330,14 @@ def get_visible_windows():
                     title = title_buf.value or ""
                     class_name = win32gui.GetClassName(hwnd)
 
+                    #proc = get_process_name(hwnd)
+                    #log(f"[ENUM] hwnd={hwnd} title='{title[:60]}' class='{class_name}' state='{state}' size={w}x{h} proc='{proc}'")
+
                     if overlay_hwnd and hwnd == overlay_hwnd:
                         return True
                     
                     # override windows logic
-                    useful = is_useful_window(title, class_name)
+                    useful = is_useful_window(title, class_name, hwnd=hwnd)
                     if hwnd in override_windows:
                         useful = not useful
 
@@ -382,6 +413,11 @@ def choose_layout(count):
     if count <= 12: return "grid", (4, 3)
     return "grid", (5, 3)
 
+def get_window_class(hwnd):
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
 def smart_tile_with_restore():
     """Smart tiling that respects saved grid positions"""
     global grid_state, ignore_retile_until
@@ -389,6 +425,9 @@ def smart_tile_with_restore():
     if time.time() < ignore_retile_until:
         return
     
+    # Debounce: prevent rapid successive calls (avoids log duplicates on toggle or fast events)
+    ignore_retile_until = time.time() + 0.3
+
     monitors = get_monitors()
 
     # Clean grid_state BEFORE enumerating visible windows
@@ -403,15 +442,10 @@ def smart_tile_with_restore():
         log("[TILE] No windows detected.")
         return
 
-    # Clean grid_state again BEFORE splitting windows by monitor
-    for hwnd in list(grid_state.keys()):
-        state = get_window_state(hwnd)
-        if not user32.IsWindow(hwnd) or state in ('minimized', 'maximized'):
-            grid_state.pop(hwnd, None)
-
     # Separate windows by monitor
     wins_by_monitor = {}
     for hwnd, title, rect in visible_windows:
+        win_class = get_window_class(hwnd)
         # Check if window has a saved position (was minimized/maximized)
         if hwnd in minimized_windows:
             mon_idx, col, row = minimized_windows[hwnd]
@@ -430,7 +464,7 @@ def smart_tile_with_restore():
             mon_idx = 0
             col, row = 0, 0
         
-        wins_by_monitor.setdefault(mon_idx, []).append((hwnd, title, rect, col, row))
+        wins_by_monitor.setdefault(mon_idx, []).append((hwnd, title, rect, col, row, win_class))
     
     # Process each monitor
     new_grid = {}
@@ -497,7 +531,7 @@ def smart_tile_with_restore():
         unassigned_windows = []
         
         # Phase 1: Assign windows that have saved positions
-        for hwnd, title, rect, saved_col, saved_row in windows:
+        for hwnd, title, rect, saved_col, saved_row, win_class in windows:
             target_coords = (saved_col, saved_row)
             
             # Check if saved position is valid in current layout
@@ -507,22 +541,22 @@ def smart_tile_with_restore():
                 force_tile_resizable(hwnd, x, y, w, h)
                 new_grid[hwnd] = (mon_idx, saved_col, saved_row)
                 assigned.add(target_coords)
-                log(f"   ✓ RESTORED to ({saved_col},{saved_row}): {title[:50]}")
+                log(f"   ✓ RESTORED to ({saved_col},{saved_row}): {title[:50]} [{win_class}]")
                 time.sleep(0.015)
             else:
                 # Saved position doesn't exist in current layout - reassign later
-                unassigned_windows.append((hwnd, title, rect))
+                unassigned_windows.append((hwnd, title, rect, 0, 0, win_class))
         
         # Phase 2: Assign remaining windows to available positions
         available_positions = [coord for coord in grid_coords if coord not in assigned]
         
-        for i, (hwnd, title, rect) in enumerate(unassigned_windows):
+        for i, (hwnd, title, rect, saved_col, saved_row, win_class) in enumerate(unassigned_windows):
             if i < len(available_positions):
                 col, row = available_positions[i]
                 x, y, w, h = pos_map[(col, row)]
                 force_tile_resizable(hwnd, x, y, w, h)
                 new_grid[hwnd] = (mon_idx, col, row)
-                log(f"   → NEW position ({col},{row}): {title[:50]}")
+                log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
                 time.sleep(0.015)
     
     grid_state = new_grid
@@ -620,9 +654,9 @@ def update_active_border():
     """
     global current_hwnd, last_active_hwnd
 
-    # SWAP MODE: Continuously reapply red border (Windows erases it)
+    # SWAP MODE: Continuously reapply red border
     if swap_mode_lock and selected_hwnd and user32.IsWindow(selected_hwnd):
-        set_window_border(selected_hwnd, 0x000000FF)  # Red - forced reapplication
+        set_window_border(selected_hwnd, 0x000000FF)  # Red
         return
 
     active = user32.GetForegroundWindow()
@@ -651,7 +685,7 @@ def update_active_border():
     # If foreground is NON-tiled (taskbar, systray, menu, icon, popup)
     # → MAINTAIN green border on last known tiled window
     if last_active_hwnd and user32.IsWindow(last_active_hwnd) and last_active_hwnd in grid_state:
-        # Continuously reapply border (Windows often removes it)
+        # Continuously reapply border
         set_window_border(last_active_hwnd, 0x0000FF00)
         current_hwnd = last_active_hwnd
 
@@ -1775,7 +1809,13 @@ def toggle_persistent():
     is_active = not is_active
     log(f"\n[SMARTGRID] Persistent mode: {'ON' if is_active else 'OFF'}")
     if is_active:
+        grid_state.clear()
         smart_tile_with_restore()
+    else:
+        for hwnd in list(grid_state.keys()):
+            if user32.IsWindow(hwnd):
+                set_window_border(hwnd, None)
+        grid_state.clear()
     # Refresh tray menu
     update_tray_menu()
 
@@ -1996,7 +2036,7 @@ def monitor():
             continue
 
         if is_active:
-            # Clean dead or minimized or maximizec windows
+            # Clean dead or minimized or maximizec windows from grid_state
             for hwnd in list(grid_state.keys()):
                 if not user32.IsWindow(hwnd):
                     grid_state.pop(hwnd, None)
@@ -2006,16 +2046,12 @@ def monitor():
             visible_windows = get_visible_windows()
             current_count = len(visible_windows)
 
-            # Add new windows
-            for hwnd, title, _ in visible_windows:
-                if hwnd not in grid_state:
-                    grid_state[hwnd] = (0, 0, 0)
-
             # Auto-retile with smart restore
             if time.time() >= ignore_retile_until and current_count > 0:
-                log(f"[AUTO-RETILE] {last_visible_count} → {current_count} windows")
-                smart_tile_with_restore()
-                last_visible_count = current_count
+                if current_count != last_visible_count:
+                    log(f"[AUTO-RETILE] {last_visible_count} → {current_count} windows")
+                    smart_tile_with_restore()
+                    last_visible_count = current_count
                 time.sleep(0.2)
 
         time.sleep(0.06)
@@ -2120,9 +2156,10 @@ if __name__ == "__main__":
     try:
         message_loop()
     finally:
+        unregister_hotkeys()
         if tray_icon:
             tray_icon.stop()
-        unregister_hotkeys()
         if current_hwnd:
             set_window_border(current_hwnd, None)
         log("[EXIT] SmartGrid stopped.")
+        os._exit(0)
