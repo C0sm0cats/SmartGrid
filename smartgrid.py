@@ -430,11 +430,26 @@ def smart_tile_with_restore():
 
     monitors = get_monitors()
 
-    # Clean grid_state BEFORE enumerating visible windows
+    # Clean grid_state BEFORE enumerating visible windows (dead + min/max + zombies)
     for hwnd in list(grid_state.keys()):
-        state = get_window_state(hwnd)
-        if not user32.IsWindow(hwnd) or state in ('minimized', 'maximized'):
+        if not user32.IsWindow(hwnd):
             grid_state.pop(hwnd, None)
+            continue
+        
+        state = get_window_state(hwnd)
+        if state in ('minimized', 'maximized'):
+            grid_state.pop(hwnd, None)
+            continue
+        
+        # Ghost / zombie window detection
+        title = win32gui.GetWindowText(hwnd)
+        rect = wintypes.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            w = rect.right - rect.left
+            h = rect.bottom - rect.top
+            if (not title or len(title.strip()) == 0) and (w < 50 or h < 50):
+                log(f"[CLEAN] Removed ghost window in retile: hwnd={hwnd}")
+                grid_state.pop(hwnd, None)
 
     visible_windows = get_visible_windows()
     
@@ -2036,12 +2051,33 @@ def monitor():
             continue
 
         if is_active:
-            # Clean dead or minimized or maximizec windows from grid_state
+            # Clean dead or minimized or maximizec, or zombie windows windows from grid_state
             for hwnd in list(grid_state.keys()):
                 if not user32.IsWindow(hwnd):
                     grid_state.pop(hwnd, None)
-                elif get_window_state(hwnd) in ("minimized", "maximized"):
+                    continue
+
+                state = get_window_state(hwnd)
+                if state in ("minimized", "maximized"):
                     grid_state.pop(hwnd, None)
+                    continue
+                
+                # === GHOST (ZOMBIE) WINDOW DETECTION ===
+                # If the window is "normal" but has no title AND is very small (often 0x0 or near),
+                # or if it no longer has visible content (empty class name or empty title depending on the app)
+                title = win32gui.GetWindowText(hwnd)
+                class_name = win32gui.GetClassName(hwnd)
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    # Criteria to consider a window as a ghost/zombie window
+                    if (not title or len(title.strip()) == 0) and (w < 50 or h < 50):
+                        log(f"[CLEAN] Removed ghost window: hwnd={hwnd} class='{class_name}' size={w}x{h}")
+                        grid_state.pop(hwnd, None)
+                        # Optional: force a DWM refresh
+                        set_window_border(hwnd, None)
+                        continue
 
             visible_windows = get_visible_windows()
             current_count = len(visible_windows)
