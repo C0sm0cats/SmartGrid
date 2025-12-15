@@ -425,31 +425,60 @@ def smart_tile_with_restore():
     if time.time() < ignore_retile_until:
         return
     
-    # Debounce: prevent rapid successive calls (avoids log duplicates on toggle or fast events)
     ignore_retile_until = time.time() + 0.3
 
     monitors = get_monitors()
 
-    # Clean grid_state BEFORE enumerating visible windows (dead + min/max + zombies)
+    # === STEP 1: AGGRESSIVE CLEANUP - Remove DEAD windows first ===
+    dead_windows = []
     for hwnd in list(grid_state.keys()):
+        # Check if window REALLY exists
         if not user32.IsWindow(hwnd):
+            dead_windows.append(hwnd)
             grid_state.pop(hwnd, None)
             continue
         
+        # Check if window is in min/max state (we don't tile those)
         state = get_window_state(hwnd)
         if state in ('minimized', 'maximized'):
             grid_state.pop(hwnd, None)
             continue
         
-        # Ghost / zombie window detection
+        # Check if window is actually visible
+        if not user32.IsWindowVisible(hwnd):
+            grid_state.pop(hwnd, None)
+            continue
+    
+    if dead_windows:
+        log(f"[CLEAN] Removed {len(dead_windows)} dead windows")
+
+    # === STEP 2: SOFT CLEANUP - Remove GHOST windows (zombie-like but technically exist) ===
+    ghost_windows = []
+    for hwnd in list(grid_state.keys()):
+        if not user32.IsWindow(hwnd):
+            # Already removed in step 1, skip
+            continue
+        
         title = win32gui.GetWindowText(hwnd)
         rect = wintypes.RECT()
-        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            if (not title or len(title.strip()) == 0) and (w < 50 or h < 50):
-                log(f"[CLEAN] Removed ghost window in retile: hwnd={hwnd}")
-                grid_state.pop(hwnd, None)
+        
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            # Can't get rect = something's wrong
+            grid_state.pop(hwnd, None)
+            ghost_windows.append(hwnd)
+            continue
+        
+        w = rect.right - rect.left
+        h = rect.bottom - rect.top
+        
+        # Ghost = no title AND very small (likely leftover process window)
+        if (not title or len(title.strip()) == 0) and (w < 50 or h < 50):
+            log(f"[CLEAN] Ghost window: hwnd={hwnd} size={w}x{h}")
+            grid_state.pop(hwnd, None)
+            ghost_windows.append(hwnd)
+    
+    if ghost_windows:
+        log(f"[CLEAN] Removed {len(ghost_windows)} ghost windows")
 
     visible_windows = get_visible_windows()
     
@@ -860,6 +889,9 @@ def find_window_in_direction(from_hwnd, direction):
     fcx = (fx1 + fx2) // 2
     fcy = (fy1 + fy2) // 2
 
+    from_width = fx2 - fx1
+    from_height = fy2 - fy1
+
     best_hwnd = None
     best_distance = float('inf')  # We want the CLOSEST one
 
@@ -884,14 +916,29 @@ def find_window_in_direction(from_hwnd, direction):
         if direction == "down"  and dy <= 30: continue
         if direction == "up"    and dy >= -30: continue
 
-        # --- OVERLAP MINIMUM (pour éviter les diagonales) ---
+        # --- DYNAMIC OVERLAP THRESHOLD (NEW) ---
+        # Calculate overlap in the perpendicular axis
         overlap_x = max(0, min(fx2, x2) - max(fx1, x1))
         overlap_y = max(0, min(fy2, y2) - max(fy1, y1))
 
+        # Instead of hard-coded 50px, use percentage of source window size
+        # This adapts to whether windows are huge or compressed
         if direction in ("left", "right"):
-            if overlap_y < 50: continue   # must be well aligned vertically
+            # For horizontal movement, check vertical alignment
+            # Require at least 20% of source height to overlap (was hard 50px)
+            min_overlap_y = max(20, int(from_height * 0.20))
+            
+            if overlap_y < min_overlap_y:
+                log(f"[SWAP] {hwnd} rejected: overlap_y={overlap_y} < min={min_overlap_y} (20% of {from_height})")
+                continue
         else:
-            if overlap_x < 50: continue   # must be well aligned horizontally
+            # For vertical movement, check horizontal alignment
+            # Require at least 20% of source width to overlap
+            min_overlap_x = max(20, int(from_width * 0.20))
+            
+            if overlap_x < min_overlap_x:
+                log(f"[SWAP] {hwnd} rejected: overlap_x={overlap_x} < min={min_overlap_x} (20% of {from_width})")
+                continue
 
         # --- EUCLIDEAN DISTANCE (the key: we take the CLOSEST one) ---
         distance = (dx * dx) + (dy * dy)
@@ -2034,11 +2081,8 @@ def monitor():
     while True:
 
         # === TRACK USER'S CURRENT WINDOW SELECTION ===
-        # This captures which window the user actually has in focus
-        # BEFORE any systray/menu steals focus
         fg = user32.GetForegroundWindow()
         if fg and user32.IsWindow(fg) and user32.IsWindowVisible(fg):
-            # Only update if it's a real application window (not systray/menu)
             title = win32gui.GetWindowText(fg)
             class_name = win32gui.GetClassName(fg)
             if is_useful_window(title, class_name):
@@ -2051,33 +2095,31 @@ def monitor():
             continue
 
         if is_active:
-            # Clean dead or minimized or maximizec, or zombie windows windows from grid_state
+            # === LIGHTWEIGHT CLEANUP - Only remove DEAD windows (not ghosts) ===
+            # Ghost detection is heavy, do it in smart_tile_with_restore() instead
+            dead_count = 0
             for hwnd in list(grid_state.keys()):
+                # Fast check: IsWindow() is cheap
                 if not user32.IsWindow(hwnd):
                     grid_state.pop(hwnd, None)
+                    dead_count += 1
                     continue
 
+                # Fast check: window state
                 state = get_window_state(hwnd)
                 if state in ("minimized", "maximized"):
                     grid_state.pop(hwnd, None)
+                    dead_count += 1
                     continue
                 
-                # === GHOST (ZOMBIE) WINDOW DETECTION ===
-                # If the window is "normal" but has no title AND is very small (often 0x0 or near),
-                # or if it no longer has visible content (empty class name or empty title depending on the app)
-                title = win32gui.GetWindowText(hwnd)
-                class_name = win32gui.GetClassName(hwnd)
-                rect = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    w = rect.right - rect.left
-                    h = rect.bottom - rect.top
-                    # Criteria to consider a window as a ghost/zombie window
-                    if (not title or len(title.strip()) == 0) and (w < 50 or h < 50):
-                        log(f"[CLEAN] Removed ghost window: hwnd={hwnd} class='{class_name}' size={w}x{h}")
-                        grid_state.pop(hwnd, None)
-                        # Optional: force a DWM refresh
-                        set_window_border(hwnd, None)
-                        continue
+                # Fast check: visible
+                if not user32.IsWindowVisible(hwnd):
+                    grid_state.pop(hwnd, None)
+                    dead_count += 1
+                    continue
+
+            if dead_count > 0:
+                log(f"[MONITOR] Cleaned {dead_count} dead windows")
 
             visible_windows = get_visible_windows()
             current_count = len(visible_windows)
@@ -2086,7 +2128,7 @@ def monitor():
             if time.time() >= ignore_retile_until and current_count > 0:
                 if current_count != last_visible_count:
                     log(f"[AUTO-RETILE] {last_visible_count} → {current_count} windows")
-                    smart_tile_with_restore()
+                    smart_tile_with_restore()  # ← Ghost detection happens HERE
                     last_visible_count = current_count
                 time.sleep(0.2)
 
