@@ -258,7 +258,7 @@ def is_useful_window(title, class_name="", hwnd=None):
 
     # === HARD EXCLUDE BY TITLE ===
     bad_titles = [
-        "zscaler","spotify", "discord", "steam", "call", "meeting", "join", "incoming call",
+        "zscaler", "spotify", "discord", "steam", "call", "meeting", "join", "incoming call",
         "obs", "streamlabs", "twitch studio", "nvidia overlay", "geforce experience",
         "shadowplay", "radeon software", "amd relive", "rainmeter", "wallpaper engine",
         "lively wallpaper", "msi afterburner", "rtss", "rivatuner", "hwinfo", "hwmonitor",
