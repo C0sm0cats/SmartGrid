@@ -285,6 +285,7 @@ def is_useful_window(title, class_name="", hwnd=None):
         "progman",                       # Program Manager
         "shell_traywnd",                 # Taskbar
         "realtimedisplay",               # Some overlays
+        "trectanglecapture",             # FastStone Capture
         "credential dialog xaml host"    # Windows Security / zscaler
         # === Added to exclude Win+Tab / Alt+Tab task switcher ===
         "multitaskingviewframe",         # Win+Tab
