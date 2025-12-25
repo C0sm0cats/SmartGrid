@@ -33,6 +33,22 @@ def log(*args, **kwargs):
 DEFAULT_GAP = 8
 DEFAULT_EDGE_PADDING = 8
 
+# Window size constraints
+MIN_WINDOW_WIDTH = 180
+MIN_WINDOW_HEIGHT = 180
+TEAMS_TOAST_MAX_WIDTH = 400
+TEAMS_TOAST_MAX_HEIGHT = 300
+
+# Timing constants
+ANIMATION_DURATION = 0.20
+ANIMATION_FPS = 60
+DRAG_MONITOR_FPS = 60  # Reduced from 200
+RETILE_DEBOUNCE = 0.5  # 500ms between auto-retiles
+CACHE_TTL = 5.0  # Cache validity duration
+TILE_TIMEOUT = 2.0  # Max time for tiling operation
+MAX_TILE_RETRIES = 10
+DRAG_THRESHOLD = 10
+
 # DWM attributes
 DWMWA_BORDER_COLOR = 34
 DWMWA_COLOR_NONE = 0xFFFFFFFF
@@ -77,10 +93,6 @@ CUSTOM_TOGGLE_SWAP = 0x9000
 # Win32 API
 user32 = ctypes.WinDLL('user32', use_last_error=True)
 dwmapi = ctypes.WinDLL('dwmapi')
-
-# Animation settings
-ANIMATION_DURATION = 0.20
-ANIMATION_FPS = 60
 
 # ==============================================================================
 # UTILITY FUNCTIONS (Global helpers - stateless)
@@ -208,7 +220,7 @@ def is_useful_window(title, class_name="", hwnd=None):
         process_name = get_process_name(hwnd)
         if process_name == "ms-teams.exe":
             w, h = get_window_size(hwnd)
-            if w < 400 and h < 300:
+            if w < TEAMS_TOAST_MAX_WIDTH and h < TEAMS_TOAST_MAX_HEIGHT:
                 log(f"[FILTER] Excluded small Teams toast: {title[:50]} | size {w}x{h}")
                 return False
             if h < 200:
@@ -296,20 +308,10 @@ def animate_window_move(hwnd, target_x, target_y, target_w, target_h):
         # Number of frames
         frames = int(ANIMATION_DURATION * ANIMATION_FPS)
         
-        # Interpolation with easing (easeOutCubic for smooth effect)
+        # Interpolation with easing
         for i in range(1, frames + 1):
             t = i / frames
-            # Smooth
-            # ease = 1 - pow(1 - t, 3)  # easeOutCubic
-            
-            # Very smooth (light bounce)
-            # ease = 1 - pow(1 - t, 4)  # easeOutQuart
-
-            # Linear (constant speed)
-            # ease = t
-
-            # Bounce effect
-            ease = 1 - (1 - t) * (1 - t) * (1 - 2 * t)
+            ease = 1 - (1 - t) * (1 - t) * (1 - 2 * t)  # Bounce effect
 
             x = start_x + (target_x - start_x) * ease
             y = start_y + (target_y - start_y) * ease
@@ -435,8 +437,24 @@ class WindowManager:
         self.last_active_hwnd = None
         self.user_selected_hwnd = None
         
+        # Cache for is_useful_window
+        self.useful_cache = {}  # hwnd → (timestamp, is_useful)
+        self.cache_ttl = CACHE_TTL
+        
         # Thread safety
         self.lock = threading.Lock()
+    
+    def is_window_useful_cached(self, hwnd, title, class_name):
+        """Cached version of is_useful_window to reduce overhead."""
+        now = time.time()
+        if hwnd in self.useful_cache:
+            timestamp, result = self.useful_cache[hwnd]
+            if now - timestamp < self.cache_ttl:
+                return result
+        
+        result = is_useful_window(title, class_name, hwnd)
+        self.useful_cache[hwnd] = (now, result)
+        return result
     
     def get_visible_windows(self, monitors, overlay_hwnd=None):
         """Enumerate visible, tileable windows."""
@@ -458,7 +476,7 @@ class WindowManager:
                 w = rect.right - rect.left
                 h = rect.bottom - rect.top
                 
-                if w <= 180 or h <= 180:
+                if w <= MIN_WINDOW_WIDTH or h <= MIN_WINDOW_HEIGHT:
                     return True
                 
                 title_buf = ctypes.create_unicode_buffer(256)
@@ -470,7 +488,7 @@ class WindowManager:
                     return True
                 
                 # Check override (float toggle)
-                useful = is_useful_window(title, class_name, hwnd=hwnd)
+                useful = self.is_window_useful_cached(hwnd, title, class_name)
                 if hwnd in self.override_windows:
                     useful = not useful
                 
@@ -498,7 +516,7 @@ class WindowManager:
         return windows
     
     def cleanup_dead_windows(self):
-        """Remove dead windows from grid_state (STEP 1: fast cleanup)."""
+        """Remove dead windows from grid_state and override_windows."""
         dead_windows = []
         
         with self.lock:
@@ -516,6 +534,19 @@ class WindowManager:
                 if not user32.IsWindowVisible(hwnd):
                     self.grid_state.pop(hwnd, None)
                     continue
+            
+            # Cleanup override_windows
+            dead_overrides = [
+                hwnd for hwnd in self.override_windows 
+                if not user32.IsWindow(hwnd)
+            ]
+            for hwnd in dead_overrides:
+                self.override_windows.remove(hwnd)
+            
+            # Cleanup cache
+            for hwnd in list(self.useful_cache.keys()):
+                if not user32.IsWindow(hwnd):
+                    del self.useful_cache[hwnd]
         
         if dead_windows:
             log(f"[CLEAN] Removed {len(dead_windows)} dead windows")
@@ -523,7 +554,7 @@ class WindowManager:
         return len(dead_windows)
     
     def cleanup_ghost_windows(self):
-        """Remove ghost windows (STEP 2: zombie-like windows)."""
+        """Remove ghost windows (zombie-like windows)."""
         ghost_windows = []
         
         with self.lock:
@@ -572,6 +603,8 @@ class WindowManager:
     
     def force_tile_resizable(self, hwnd, x, y, w, h, animate=True):
         """Move and resize window to exact coordinates, handling borders."""
+        start_time = time.time()
+        
         try:
             state = get_window_state(hwnd)
             if state in ('minimized', 'maximized'):
@@ -603,14 +636,18 @@ class WindowManager:
                                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING)
                     return
             
-            # Fallback : classic method without animation
+            # Fallback: classic method without animation
             lb, tb, rb, bb = get_frame_borders(hwnd)
             ax, ay = x - lb, y - tb
             aw, ah = w + lb + rb, h + tb + bb
             
             flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING
             
-            for _ in range(10):
+            for attempt in range(MAX_TILE_RETRIES):
+                if time.time() - start_time > TILE_TIMEOUT:
+                    log(f"[WARN] Tile timeout for hwnd={hwnd}")
+                    break
+                
                 user32.SetWindowPos(hwnd, 0, int(ax), int(ay), int(aw), int(ah), flags)
                 time.sleep(0.014)
                 
@@ -669,6 +706,7 @@ class SmartGrid:
         self.drag_drop_lock = False
         self.ignore_retile_until = 0.0
         self.last_visible_count = 0
+        self.last_retile_time = 0.0
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -680,6 +718,9 @@ class SmartGrid:
         self.overlay_hwnd = None
         self.preview_rect = None
         self.tray_icon = None
+        self._wnd_proc_ref = None  # Keep reference to prevent GC
+        self.overlay_brush = None  # Reusable GDI objects
+        self.overlay_pen = None
         
         # Threading
         self.lock = threading.Lock()
@@ -710,55 +751,85 @@ class SmartGrid:
         if time.time() < self.ignore_retile_until:
             return
         
+        # GLOBAL LOCK AT THE START
         with self.lock:
             self.ignore_retile_until = time.time() + 0.3
             
             # Cleanup
             self.window_mgr.cleanup_dead_windows()
             self.window_mgr.cleanup_ghost_windows()
+        
+        # Get visible windows (no lock needed)
+        visible_windows = self.window_mgr.get_visible_windows(
+            self.monitors_cache, self.overlay_hwnd
+        )
+        
+        if not visible_windows:
+            log("[TILE] No windows detected.")
+            return
+        
+        # Separate windows by monitor
+        wins_by_monitor = self._group_windows_by_monitor(visible_windows)
+        
+        # Process each monitor
+        new_grid = {}
+        for mon_idx, windows in wins_by_monitor.items():
+            if mon_idx >= len(self.monitors_cache):
+                continue
             
-            visible_windows = self.window_mgr.get_visible_windows(
-                self.monitors_cache, self.overlay_hwnd
-            )
-            
-            if not visible_windows:
-                log("[TILE] No windows detected.")
-                return
-            
-            # Separate windows by monitor
-            wins_by_monitor = self._group_windows_by_monitor(visible_windows)
-            
-            # Process each monitor
-            new_grid = {}
-            for mon_idx, windows in wins_by_monitor.items():
-                if mon_idx >= len(self.monitors_cache):
-                    continue
-                
-                self._tile_monitor(mon_idx, windows, new_grid)
-            
-            self.window_mgr.grid_state = new_grid
-            time.sleep(0.06)
+            self._tile_monitor(mon_idx, windows, new_grid)
+        
+        # Update grid_state with lock - ONLY ONCE
+        with self.lock:
+            self.window_mgr.grid_state.clear()  # ← CLEAR BEFORE UPDATE
+            self.window_mgr.grid_state.update(new_grid)
+        
+        time.sleep(0.06)
     
     def _group_windows_by_monitor(self, visible_windows):
         """Group windows by their assigned monitor, preserving saved positions."""
         wins_by_monitor = {}
         
+        # Atomic copy of necessary dictionaries
+        with self.lock:
+            minimized_snapshot = dict(self.window_mgr.minimized_windows)
+            maximized_snapshot = dict(self.window_mgr.maximized_windows)
+            grid_snapshot = dict(self.window_mgr.grid_state)
+        
         for hwnd, title, rect in visible_windows:
             win_class = get_window_class(hwnd)
             
-            # Check for saved position
-            if hwnd in self.window_mgr.minimized_windows:
-                mon_idx, col, row = self.window_mgr.minimized_windows[hwnd]
-                del self.window_mgr.minimized_windows[hwnd]
+            # DETERMINE THE PHYSICAL MONITOR FIRST
+            w_center_x = (rect.left + rect.right) // 2
+            w_center_y = (rect.top + rect.bottom) // 2
+            
+            physical_mon_idx = 0
+            for i, (mx, my, mw, mh) in enumerate(self.monitors_cache):
+                if mx <= w_center_x < mx + mw and my <= w_center_y < my + mh:
+                    physical_mon_idx = i
+                    break
+            
+            # Check for saved position (use snapshots)
+            if hwnd in minimized_snapshot:
+                mon_idx, col, row = minimized_snapshot[hwnd]
+                # Atomic removal
+                with self.lock:
+                    if hwnd in self.window_mgr.minimized_windows:
+                        del self.window_mgr.minimized_windows[hwnd]
                 log(f"[RESTORE] Restoring minimized window to ({col},{row}): {title[:40]}")
-            elif hwnd in self.window_mgr.maximized_windows:
-                mon_idx, col, row = self.window_mgr.maximized_windows[hwnd]
-                del self.window_mgr.maximized_windows[hwnd]
+            elif hwnd in maximized_snapshot:
+                mon_idx, col, row = maximized_snapshot[hwnd]
+                # Atomic removal
+                with self.lock:
+                    if hwnd in self.window_mgr.maximized_windows:
+                        del self.window_mgr.maximized_windows[hwnd]
                 log(f"[RESTORE] Restoring maximized window to ({col},{row}): {title[:40]}")
-            elif hwnd in self.window_mgr.grid_state:
-                mon_idx, col, row = self.window_mgr.grid_state[hwnd]
+            elif hwnd in grid_snapshot:
+                mon_idx, col, row = grid_snapshot[hwnd]
             else:
-                mon_idx, col, row = 0, 0, 0
+                # NEW WINDOW: use physical monitor
+                mon_idx = physical_mon_idx
+                col, row = 0, 0
             
             wins_by_monitor.setdefault(mon_idx, []).append(
                 (hwnd, title, rect, col, row, win_class)
@@ -788,7 +859,10 @@ class SmartGrid:
         for hwnd, title, rect, saved_col, saved_row, win_class in windows:
             target_coords = (saved_col, saved_row)
             
-            if target_coords in pos_map and target_coords not in assigned:
+            # CHECK IF COORDINATES ARE VALID
+            if (target_coords in pos_map and 
+                target_coords not in assigned and
+                saved_col < 10 and saved_row < 10):  # ← ADD VALIDATION
                 x, y, w, h = pos_map[target_coords]
                 self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
                 new_grid[hwnd] = (mon_idx, saved_col, saved_row)
@@ -796,6 +870,7 @@ class SmartGrid:
                 log(f"   ✓ RESTORED to ({saved_col},{saved_row}): {title[:50]} [{win_class}]")
                 time.sleep(0.015)
             else:
+                # Invalid or already occupied position
                 unassigned_windows.append((hwnd, title, rect, 0, 0, win_class))
         
         # Phase 2: Assign remaining windows
@@ -827,7 +902,9 @@ class SmartGrid:
             # Group by monitor
             wins_by_mon = {}
             for hwnd, (mon_idx, col, row) in self.window_mgr.grid_state.items():
-                wins_by_mon.setdefault(mon_idx, []).append((hwnd, col, row))
+                wins_by_mon.setdefault(mon_idx, []).append(
+                    (hwnd, col, row)
+                )
             
             # Process each monitor
             for mon_idx, windows in wins_by_mon.items():
@@ -885,8 +962,12 @@ class SmartGrid:
         
         active = user32.GetForegroundWindow()
         
+        # Get atomic copy of grid_state
+        with self.lock:
+            is_tiled = active in self.window_mgr.grid_state
+        
         # Active window is tiled → green border
-        if active in self.window_mgr.grid_state and user32.IsWindow(active):
+        if is_tiled and user32.IsWindow(active):
             self.window_mgr.last_active_hwnd = active
             
             if self.window_mgr.current_hwnd != active:
@@ -903,7 +984,11 @@ class SmartGrid:
         # Maintain border on last tiled window
         if self.window_mgr.last_active_hwnd:
             if user32.IsWindow(self.window_mgr.last_active_hwnd):
-                if self.window_mgr.last_active_hwnd in self.window_mgr.grid_state:
+                # Get atomic check
+                with self.lock:
+                    last_still_tiled = self.window_mgr.last_active_hwnd in self.window_mgr.grid_state
+                
+                if last_still_tiled:
                     set_window_border(self.window_mgr.last_active_hwnd, 0x0000FF00)
                     self.window_mgr.current_hwnd = self.window_mgr.last_active_hwnd
     
@@ -916,31 +1001,44 @@ class SmartGrid:
         self.swap_mode_lock = True
         time.sleep(0.25)
         
+        # Get atomic check
+        with self.lock:
+            grid_empty = len(self.window_mgr.grid_state) == 0
+        
         # Force quick update if grid_state is empty
-        if not self.window_mgr.grid_state:
+        if grid_empty:
             visible_windows = self.window_mgr.get_visible_windows(
                 self.monitors_cache, self.overlay_hwnd
             )
-            for hwnd, title, _ in visible_windows:
-                if hwnd not in self.window_mgr.grid_state:
-                    self.window_mgr.grid_state[hwnd] = (0, 0, 0)
+            
+            # Get atomic modification
+            with self.lock:
+                for hwnd, title, _ in visible_windows:
+                    if hwnd not in self.window_mgr.grid_state:
+                        self.window_mgr.grid_state[hwnd] = (0, 0, 0)
             
             log(f"[SWAP] grid_state rebuilt with {len(self.window_mgr.grid_state)} windows")
-            if not self.window_mgr.grid_state:
+            
+            # Get atomic re-check
+            with self.lock:
+                grid_still_empty = len(self.window_mgr.grid_state) == 0
+            
+            if grid_still_empty:
                 log("[SWAP] No tiled windows. Press Ctrl+Alt+T or Ctrl+Alt+R first")
                 self.swap_mode_lock = False
                 return
         
-        # Smart selection
+        # Get smart selection with lock
         candidate = None
-        if (self.window_mgr.last_active_hwnd and 
-            user32.IsWindow(self.window_mgr.last_active_hwnd) and 
-            self.window_mgr.last_active_hwnd in self.window_mgr.grid_state):
-            candidate = self.window_mgr.last_active_hwnd
-        elif user32.GetForegroundWindow() in self.window_mgr.grid_state:
-            candidate = user32.GetForegroundWindow()
-        else:
-            candidate = next(iter(self.window_mgr.grid_state.keys()), None)
+        with self.lock:
+            if (self.window_mgr.last_active_hwnd and 
+                user32.IsWindow(self.window_mgr.last_active_hwnd) and 
+                self.window_mgr.last_active_hwnd in self.window_mgr.grid_state):
+                candidate = self.window_mgr.last_active_hwnd
+            elif user32.GetForegroundWindow() in self.window_mgr.grid_state:
+                candidate = user32.GetForegroundWindow()
+            else:
+                candidate = next(iter(self.window_mgr.grid_state.keys()), None)
         
         if not candidate:
             log("[SWAP] No valid window to select")
@@ -989,10 +1087,20 @@ class SmartGrid:
     
     def _find_window_in_direction(self, from_hwnd, direction):
         """Find closest tiled window in specified direction."""
-        if from_hwnd not in self.window_mgr.grid_state:
-            return None
         
-        mon_idx = self.window_mgr.grid_state[from_hwnd][0]
+        # Get atomic copy of necessary data
+        with self.lock:
+            if from_hwnd not in self.window_mgr.grid_state:
+                return None
+            
+            mon_idx = self.window_mgr.grid_state[from_hwnd][0]
+            
+            # Copy the list of windows from the same monitor
+            windows_snapshot = [
+                (hwnd, mon, col, row) 
+                for hwnd, (mon, col, row) in self.window_mgr.grid_state.items()
+                if hwnd != from_hwnd and mon == mon_idx and user32.IsWindow(hwnd)
+            ]
         
         try:
             from_rect = wintypes.RECT()
@@ -1008,10 +1116,8 @@ class SmartGrid:
             best_hwnd = None
             best_distance = float('inf')
             
-            for hwnd, (m, _, _) in self.window_mgr.grid_state.items():
-                if hwnd == from_hwnd or m != mon_idx or not user32.IsWindow(hwnd):
-                    continue
-                
+            # Iterate over the snapshot (no race condition)
+            for hwnd, m, _, _ in windows_snapshot:
                 rect = wintypes.RECT()
                 if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     continue
@@ -1026,7 +1132,7 @@ class SmartGrid:
                 if direction == "down" and dy <= 30: continue
                 if direction == "up" and dy >= -30: continue
                 
-                # Dynamic overlap threshold (20% of source window)
+                # Dynamic overlap threshold
                 overlap_x = max(0, min(fx2, x2) - max(fx1, x1))
                 overlap_y = max(0, min(fy2, y2) - max(fy1, y1))
                 
@@ -1089,7 +1195,7 @@ class SmartGrid:
             title2 = win32gui.GetWindowText(hwnd2)[:40]
             log(f"[SWAP] '{title1}' ↔ '{title2}'")
             
-            # Swap in grid_state
+            # Swap in grid_state with lock
             with self.lock:
                 self.window_mgr.grid_state[hwnd1], self.window_mgr.grid_state[hwnd2] = \
                     self.window_mgr.grid_state[hwnd2], self.window_mgr.grid_state[hwnd1]
@@ -1121,9 +1227,15 @@ class SmartGrid:
         self.unregister_swap_hotkeys()
         self.window_mgr.current_hwnd = None
         
-        # Restore green border
+        # Restore green border with lock
         active = user32.GetForegroundWindow()
-        if active and user32.IsWindowVisible(active) and active in self.window_mgr.grid_state:
+        
+        with self.lock:
+            is_tiled = (active and 
+                    user32.IsWindowVisible(active) and 
+                    active in self.window_mgr.grid_state)
+        
+        if is_tiled:
             self.window_mgr.apply_border(active, 0x0000FF00)
             log(f"[SWAP] Green border restored")
         
@@ -1152,6 +1264,11 @@ class SmartGrid:
         
         @WNDPROCTYPE
         def wnd_proc(hwnd, msg, wparam, lparam):
+            brush = None
+            pen = None
+            old_brush = None
+            old_pen = None
+            
             try:
                 if msg == win32con.WM_PAINT:
                     class PAINTSTRUCT(ctypes.Structure):
@@ -1164,22 +1281,29 @@ class SmartGrid:
                     ps = PAINTSTRUCT()
                     hdc = user32.BeginPaint(hwnd, ctypes.byref(ps))
                     
-                    if self.preview_rect:
-                        _, _, w, h = self.preview_rect
-                        brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))
-                        pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))
-                        
-                        old_brush = win32gui.SelectObject(hdc, brush)
-                        old_pen = win32gui.SelectObject(hdc, pen)
-                        
-                        win32gui.Rectangle(hdc, 2, 2, w - 2, h - 2)
-                        
-                        win32gui.SelectObject(hdc, old_brush)
-                        win32gui.SelectObject(hdc, old_pen)
-                        win32gui.DeleteObject(brush)
-                        win32gui.DeleteObject(pen)
+                    try:
+                        if self.preview_rect:
+                            _, _, w, h = self.preview_rect
+                            
+                            # Use cached GDI objects if available
+                            if self.overlay_brush is None:
+                                self.overlay_brush = win32gui.CreateSolidBrush(win32api.RGB(100, 149, 237))
+                            if self.overlay_pen is None:
+                                self.overlay_pen = win32gui.CreatePen(win32con.PS_SOLID, 4, win32api.RGB(65, 105, 225))
+                            
+                            old_brush = win32gui.SelectObject(hdc, self.overlay_brush)
+                            old_pen = win32gui.SelectObject(hdc, self.overlay_pen)
+                            
+                            win32gui.Rectangle(hdc, 2, 2, w - 2, h - 2)
                     
-                    user32.EndPaint(hwnd, ctypes.byref(ps))
+                    finally:
+                        if old_brush:
+                            win32gui.SelectObject(hdc, old_brush)
+                        if old_pen:
+                            win32gui.SelectObject(hdc, old_pen)
+                        
+                        user32.EndPaint(hwnd, ctypes.byref(ps))
+                    
                     return 0
                 
                 elif msg == win32con.WM_DESTROY:
@@ -1189,11 +1313,25 @@ class SmartGrid:
             
             except Exception as e:
                 log(f"[ERROR] overlay wnd_proc: {e}")
+                # Cleanup on error
+                if old_brush:
+                    try:
+                        win32gui.SelectObject(hdc, old_brush)
+                    except:
+                        pass
+                if old_pen:
+                    try:
+                        win32gui.SelectObject(hdc, old_pen)
+                    except:
+                        pass
                 return 0
         
         try:
+            # Keep reference to prevent garbage collection
+            self._wnd_proc_ref = wnd_proc
+            
             wc = win32gui.WNDCLASS()
-            wc.lpfnWndProc = wnd_proc
+            wc.lpfnWndProc = self._wnd_proc_ref
             wc.lpszClassName = class_name
             wc.hCursor = win32gui.LoadCursor(0, win32con.IDC_ARROW)
             
@@ -1247,8 +1385,11 @@ class SmartGrid:
     
     def calculate_target_rect(self, source_hwnd, cursor_pos):
         """Calculate target snap rectangle for drag & drop."""
-        if source_hwnd not in self.window_mgr.grid_state:
-            return None
+        
+        # Atomic verification
+        with self.lock:
+            if source_hwnd not in self.window_mgr.grid_state:
+                return None
         
         try:
             cx, cy = cursor_pos
@@ -1263,11 +1404,18 @@ class SmartGrid:
             monitor_rect = self.monitors_cache[target_mon_idx]
             mon_x, mon_y, mon_w, mon_h = monitor_rect
             
-            # Get windows on target monitor
-            wins_on_mon = [
-                h for h, (m, _, _) in self.window_mgr.grid_state.items()
-                if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd
-            ]
+            # Atomic copy of window list
+            with self.lock:
+                wins_on_mon = [
+                    h for h, (m, _, _) in self.window_mgr.grid_state.items()
+                    if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd
+                ]
+                
+                # Also copy maxc and maxr to avoid a second iteration
+                maxc = max((c for h,(m,c,r) in self.window_mgr.grid_state.items() 
+                        if m == target_mon_idx), default=0)
+                maxr = max((r for h,(m,c,r) in self.window_mgr.grid_state.items() 
+                        if m == target_mon_idx), default=0)
             
             count = len(wins_on_mon) + 1
             layout, info = self.layout_engine.choose_layout(count)
@@ -1309,10 +1457,7 @@ class SmartGrid:
             
             else:  # grid
                 cols, rows = info if info else (2, 2)
-                maxc = max((c for h,(m,c,r) in self.window_mgr.grid_state.items() 
-                           if m == target_mon_idx), default=0)
-                maxr = max((r for h,(m,c,r) in self.window_mgr.grid_state.items() 
-                           if m == target_mon_idx), default=0)
+                # Use previously copied values
                 cols = max(cols, maxc + 1)
                 rows = max(rows, maxr + 1)
                 
@@ -1339,8 +1484,12 @@ class SmartGrid:
     
     def handle_snap_drop(self, source_hwnd, cursor_pos):
         """Handle window drop during drag."""
-        if source_hwnd not in self.window_mgr.grid_state:
-            return
+        
+        # Initial verification with lock
+        with self.lock:
+            if source_hwnd not in self.window_mgr.grid_state:
+                return
+            old_pos = self.window_mgr.grid_state[source_hwnd]
         
         try:
             cx, cy = cursor_pos
@@ -1355,10 +1504,17 @@ class SmartGrid:
             monitor_rect = self.monitors_cache[target_mon_idx]
             mon_x, mon_y, mon_w, mon_h = monitor_rect
             
-            wins_on_mon = [
-                h for h, (m, _, _) in self.window_mgr.grid_state.items()
-                if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd
-            ]
+            # Atomic copy
+            with self.lock:
+                wins_on_mon = [
+                    h for h, (m, _, _) in self.window_mgr.grid_state.items()
+                    if m == target_mon_idx and user32.IsWindow(h) and h != source_hwnd
+                ]
+                
+                max_c = max((c for h,(m,c,r) in self.window_mgr.grid_state.items() 
+                            if m == target_mon_idx), default=0)
+                max_r = max((r for h,(m,c,r) in self.window_mgr.grid_state.items() 
+                            if m == target_mon_idx), default=0)
             
             count = len(wins_on_mon) + 1
             layout, info = self.layout_engine.choose_layout(count)
@@ -1386,10 +1542,7 @@ class SmartGrid:
             
             else:  # grid
                 cols, rows = info if info else (2, 2)
-                max_c = max((c for h,(m,c,r) in self.window_mgr.grid_state.items() 
-                            if m == target_mon_idx), default=0)
-                max_r = max((r for h,(m,c,r) in self.window_mgr.grid_state.items() 
-                            if m == target_mon_idx), default=0)
+                # Use copied values
                 cols = max(cols, max_c + 1)
                 rows = max(rows, max_r + 1)
                 
@@ -1401,21 +1554,21 @@ class SmartGrid:
                 target_col = min(max(0, rel_x // (cell_w + self.gap)), cols - 1)
                 target_row = min(max(0, rel_y // (cell_h + self.gap)), rows - 1)
             
-            old_pos = self.window_mgr.grid_state[source_hwnd]
             new_pos = (target_mon_idx, target_col, target_row)
             
             if old_pos == new_pos:
                 self.apply_grid_state()
                 return
             
-            # Check if target cell is occupied
+            # Check if target cell is occupied (atomic)
             target_hwnd = None
-            for h, pos in self.window_mgr.grid_state.items():
-                if pos == new_pos and h != source_hwnd and user32.IsWindow(h):
-                    target_hwnd = h
-                    break
-            
             with self.lock:
+                for h, pos in self.window_mgr.grid_state.items():
+                    if pos == new_pos and h != source_hwnd and user32.IsWindow(h):
+                        target_hwnd = h
+                        break
+                
+                # Atomic modification
                 if target_hwnd:
                     log(f"[SNAP] SWAP with '{win32gui.GetWindowText(target_hwnd)[:40]}'")
                     self.window_mgr.grid_state[source_hwnd] = new_pos
@@ -1475,12 +1628,17 @@ class SmartGrid:
                             was_down = True
                             continue
                     
-                    if hwnd and hwnd in self.window_mgr.grid_state and user32.IsWindowVisible(hwnd):
-                        self.drag_drop_lock = True
-                        time.sleep(0.25)
-                        drag_hwnd = hwnd
-                        drag_start = pt
-                        preview_active = False
+                    # Atomic verification before starting drag
+                    if hwnd and user32.IsWindowVisible(hwnd):
+                        with self.lock:
+                            is_in_grid = hwnd in self.window_mgr.grid_state
+                        
+                        if is_in_grid:
+                            self.drag_drop_lock = True
+                            time.sleep(0.25)
+                            drag_hwnd = hwnd
+                            drag_start = pt
+                            preview_active = False
                 
                 # Drag in progress
                 elif down and drag_hwnd:
@@ -1512,7 +1670,7 @@ class SmartGrid:
                     if drag_start:
                         dx = abs(cursor_pos[0] - drag_start[0])
                         dy = abs(cursor_pos[1] - drag_start[1])
-                        moved = (dx > 10 or dy > 10)
+                        moved = (dx > DRAG_THRESHOLD or dy > DRAG_THRESHOLD)
                     
                     if moved:
                         self.handle_snap_drop(drag_hwnd, cursor_pos)
@@ -1523,9 +1681,10 @@ class SmartGrid:
                     drag_hwnd = None
                     drag_start = None
                     preview_active = False
+                    last_valid_rect = None
                 
                 was_down = down
-                time.sleep(0.005)
+                time.sleep(1.0 / DRAG_MONITOR_FPS)  # ~60 FPS
             
             except Exception as e:
                 log(f"[ERROR] drag_snap_monitor: {e}")
@@ -1548,8 +1707,14 @@ class SmartGrid:
         ws = self.current_workspace[monitor_idx]
         self.workspaces[monitor_idx][ws] = {}
         
+        # Atomic copy of grid_state
+        with self.lock:
+            grid_snapshot = dict(self.window_mgr.grid_state)
+            minimized_snapshot = dict(self.window_mgr.minimized_windows)
+            maximized_snapshot = dict(self.window_mgr.maximized_windows)
+        
         # Save normal windows
-        for hwnd, (mon, col, row) in self.window_mgr.grid_state.items():
+        for hwnd, (mon, col, row) in grid_snapshot.items():
             if mon != monitor_idx or not user32.IsWindow(hwnd):
                 continue
             
@@ -1573,7 +1738,7 @@ class SmartGrid:
                 log(f"[ERROR] save_workspace (normal): {e}")
         
         # Save minimized windows
-        for hwnd, (mon, col, row) in self.window_mgr.minimized_windows.items():
+        for hwnd, (mon, col, row) in minimized_snapshot.items():
             if mon == monitor_idx and user32.IsWindow(hwnd):
                 self.workspaces[monitor_idx][ws][hwnd] = {
                     'pos': (0, 0, 800, 600),
@@ -1582,7 +1747,7 @@ class SmartGrid:
                 }
         
         # Save maximized windows
-        for hwnd, (mon, col, row) in self.window_mgr.maximized_windows.items():
+        for hwnd, (mon, col, row) in maximized_snapshot.items():
             if mon == monitor_idx and user32.IsWindow(hwnd):
                 self.workspaces[monitor_idx][ws][hwnd] = {
                     'pos': (0, 0, 800, 600),
@@ -1664,11 +1829,12 @@ class SmartGrid:
             
             # Hide current windows
             hidden = 0
-            for hwnd, (mon_idx, col, row) in list(self.window_mgr.grid_state.items()):
-                if mon_idx == mon and user32.IsWindow(hwnd):
-                    user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
-                    del self.window_mgr.grid_state[hwnd]
-                    hidden += 1
+            with self.lock:
+                for hwnd, (mon_idx, col, row) in list(self.window_mgr.grid_state.items()):
+                    if mon_idx == mon and user32.IsWindow(hwnd):
+                        user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
+                        del self.window_mgr.grid_state[hwnd]
+                        hidden += 1
             
             log(f"[WS] Hidden {hidden} windows from workspace {self.current_workspace.get(mon, 0)+1}")
             
@@ -1766,7 +1932,7 @@ class SmartGrid:
                 log(f"   -> {title[:50]}")
                 time.sleep(0.015)
             
-            # Update grid_state
+            # Update grid_state with lock
             with self.lock:
                 for hwnd, _ in windows_to_move:
                     self.window_mgr.grid_state.pop(hwnd, None)
@@ -1817,8 +1983,9 @@ class SmartGrid:
                 self.window_mgr.override_windows.add(hwnd)
                 log(f"[OVERRIDE] {title[:60]} → override to ({'float' if default_useful else 'tile'})")
                 if default_useful:
-                    if hwnd in self.window_mgr.grid_state:
-                        self.window_mgr.grid_state.pop(hwnd, None)
+                    with self.lock:
+                        if hwnd in self.window_mgr.grid_state:
+                            self.window_mgr.grid_state.pop(hwnd, None)
                     set_window_border(hwnd, None)
                 elif not default_useful:
                     self.smart_tile_with_restore()
@@ -1835,8 +2002,8 @@ class SmartGrid:
     
     def show_settings_dialog(self):
         """Show settings dialog to modify GAP and EDGE_PADDING."""
-        # LOCK to prevent tiling during settings
-        settings_lock = True
+        old_ignore = self.ignore_retile_until
+        self.ignore_retile_until = float('inf')  # Block tiling
         
         try:
             import tkinter as tk
@@ -1851,9 +2018,6 @@ class SmartGrid:
             dialog.geometry("350x250")
             dialog.attributes('-topmost', True)
             dialog.resizable(False, False)
-            
-            # 🔒 Prevent tiling of this window
-            dialog.update()  # Force update to get the hwnd
             
             title = tk.Label(dialog, text="SmartGrid Settings", font=("Arial", 12, "bold"))
             title.pack(pady=10)
@@ -1899,14 +2063,14 @@ class SmartGrid:
                 gap_str = gap_var.get().replace("px", "")
                 padding_str = padding_var.get().replace("px", "")
                 
-                # Close BEFORE modifying the settings
+                # Close BEFORE modifying
                 dialog.destroy()
                 root.destroy()
                 
                 # Wait for Tkinter to fully close
                 time.sleep(0.3)
                 
-                # Now we can modify
+                # Now modify
                 self.gap = int(gap_str)
                 self.edge_padding = int(padding_str)
                 self.window_mgr.gap = self.gap
@@ -1914,7 +2078,7 @@ class SmartGrid:
                 
                 log(f"[SETTINGS] GAP={self.gap}px, EDGE_PADDING={self.edge_padding}px")
                 
-                # Apply the new settings
+                # Apply
                 self.apply_new_settings()
             
             def cancel_and_close():
@@ -1934,12 +2098,8 @@ class SmartGrid:
                             font=("Arial", 8), fg="gray")
             info.pack(pady=5)
             
-            # Prevent re-tiling while the dialog is open
-            old_ignore = self.ignore_retile_until
-            self.ignore_retile_until = time.time() + 999999  # Block tiling
-            
             def on_close():
-                self.ignore_retile_until = old_ignore  # Restore
+                self.ignore_retile_until = old_ignore
                 dialog.destroy()
                 root.destroy()
             
@@ -1947,12 +2107,12 @@ class SmartGrid:
             
             root.mainloop()
             
-            # Restore tiling
-            self.ignore_retile_until = old_ignore
-        
         except Exception as e:
             log(f"[ERROR] show_settings_dialog: {e}")
-            self.ignore_retile_until = 0  # Restore in case of an error
+        
+        finally:
+            # Always restore
+            self.ignore_retile_until = old_ignore
     
     def apply_new_settings(self):
         """Apply new GAP/EDGE_PADDING settings."""
@@ -1988,18 +2148,32 @@ class SmartGrid:
     
     def register_hotkeys(self):
         """Register global hotkeys."""
-        try:
-            user32.RegisterHotKey(None, HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T'))
-            user32.RegisterHotKey(None, HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R'))
-            user32.RegisterHotKey(None, HOTKEY_QUIT, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q'))
-            user32.RegisterHotKey(None, HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M'))
-            user32.RegisterHotKey(None, HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S'))
-            user32.RegisterHotKey(None, HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1'))
-            user32.RegisterHotKey(None, HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2'))
-            user32.RegisterHotKey(None, HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3'))
-            user32.RegisterHotKey(None, HOTKEY_FLOAT_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('F'))
-        except Exception as e:
-            log(f"[ERROR] register_hotkeys: {e}")
+        hotkeys = [
+            (HOTKEY_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('T')),
+            (HOTKEY_RETILE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('R')),
+            (HOTKEY_QUIT, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('Q')),
+            (HOTKEY_MOVE_MONITOR, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('M')),
+            (HOTKEY_SWAP_MODE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('S')),
+            (HOTKEY_WS1, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('1')),
+            (HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2')),
+            (HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3')),
+            (HOTKEY_FLOAT_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('F')),
+        ]
+        
+        failed = []
+        for hk_id, mod, key in hotkeys:
+            try:
+                if not user32.RegisterHotKey(None, hk_id, mod, key):
+                    failed.append(hk_id)
+                    log(f"[WARN] Failed to register hotkey {hk_id}")
+            except Exception as e:
+                failed.append(hk_id)
+                log(f"[ERROR] Hotkey {hk_id}: {e}")
+        
+        if failed:
+            log(f"[WARN] {len(failed)} hotkeys failed to register")
+        else:
+            log("[HOTKEYS] All hotkeys registered successfully")
     
     def unregister_hotkeys(self):
         """Unregister all hotkeys."""
@@ -2074,25 +2248,63 @@ class SmartGrid:
         log(f"\n[SMARTGRID] Persistent mode: {'ON' if self.is_active else 'OFF'}")
         
         if self.is_active:
-            self.window_mgr.grid_state.clear()
+            with self.lock:
+                self.window_mgr.grid_state.clear()
             self.smart_tile_with_restore()
         else:
-            for hwnd in list(self.window_mgr.grid_state.keys()):
-                if user32.IsWindow(hwnd):
-                    set_window_border(hwnd, None)
-            self.window_mgr.grid_state.clear()
+            with self.lock:
+                for hwnd in list(self.window_mgr.grid_state.keys()):
+                    if user32.IsWindow(hwnd):
+                        set_window_border(hwnd, None)
+                self.window_mgr.grid_state.clear()
         
         self.update_tray_menu()
     
-    def on_quit_from_tray(self, icon, item):
+    def on_quit_from_tray(self, icon=None, item=None):
         """Quit from systray."""
         log("[TRAY] Quit requested")
         
-        if self.tray_icon:
-            self.tray_icon.stop()
+        try:
+            # Stop the systray icon
+            if self.tray_icon:
+                self.tray_icon.stop()
+            
+            # Clean up resources
+            self.cleanup()
+            
+            # Cleanup overlay GDI objects
+            if self.overlay_brush:
+                try:
+                    win32gui.DeleteObject(self.overlay_brush)
+                except:
+                    pass
+            if self.overlay_pen:
+                try:
+                    win32gui.DeleteObject(self.overlay_pen)
+                except:
+                    pass
+            
+            # Destroy overlay window
+            if self.overlay_hwnd:
+                try:
+                    win32gui.DestroyWindow(self.overlay_hwnd)
+                except:
+                    pass
+            
+            # SEND WM_QUIT TO MAIN THREAD
+            user32.PostThreadMessageW(
+                self.main_thread_id, 
+                win32con.WM_QUIT, 
+                0, 
+                0
+            )
+            
+            log("[TRAY] WM_QUIT posted to main thread")
         
-        self.cleanup()
-        os._exit(0)
+        except Exception as e:
+            log(f"[ERROR] on_quit_from_tray: {e}")
+            # Forcer la sortie en dernier recours
+            os._exit(0)
     
     def cleanup(self):
         """Cleanup before exit."""
@@ -2112,9 +2324,21 @@ class SmartGrid:
     # ==========================================================================
     
     def monitor_loop(self):
-        """Background loop: auto-retile + border tracking."""
+        """Background loop: auto-retile + border tracking + monitor detection."""
+        last_monitor_count = len(self.monitors_cache)
+        
         while True:
             try:
+                # Monitor configuration change detection
+                current_monitors = get_monitors()
+                if len(current_monitors) != last_monitor_count:
+                    log(f"[MONITOR] Configuration changed: {last_monitor_count} → {len(current_monitors)}")
+                    self.monitors_cache = current_monitors
+                    self._init_workspaces()
+                    if self.is_active:
+                        self.smart_tile_with_restore()
+                    last_monitor_count = len(current_monitors)
+                
                 # Track user selection
                 fg = user32.GetForegroundWindow()
                 if fg and user32.IsWindow(fg) and user32.IsWindowVisible(fg):
@@ -2132,18 +2356,25 @@ class SmartGrid:
                 
                 if self.is_active:
                     # Lightweight cleanup
-                    dead_count = self.window_mgr.cleanup_dead_windows()
+                    self.window_mgr.cleanup_dead_windows()
                     
                     visible_windows = self.window_mgr.get_visible_windows(
                         self.monitors_cache, self.overlay_hwnd
                     )
                     current_count = len(visible_windows)
                     
-                    if time.time() >= self.ignore_retile_until and current_count > 0:
-                        if current_count != self.last_visible_count:
+                    # Debounced retiling
+                    now = time.time()
+                    if (now >= self.ignore_retile_until and 
+                        current_count > 0 and 
+                        current_count != self.last_visible_count):
+                        
+                        if now - self.last_retile_time >= RETILE_DEBOUNCE:
                             log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
                             self.smart_tile_with_restore()
                             self.last_visible_count = current_count
+                            self.last_retile_time = now
+                        
                         time.sleep(0.2)
                 
                 time.sleep(0.06)
@@ -2165,6 +2396,8 @@ class SmartGrid:
                     elif msg.wParam == HOTKEY_MOVE_MONITOR:
                         threading.Thread(target=self.move_current_workspace_to_next_monitor, daemon=True).start()
                     elif msg.wParam == HOTKEY_QUIT:
+                        log("[HOTKEY] Ctrl+Alt+Q pressed - Quitting...")
+                        self.on_quit_from_tray()  # Reuse the same function
                         break
                     elif msg.wParam == HOTKEY_SWAP_MODE:
                         if self.swap_mode_lock:
@@ -2190,17 +2423,28 @@ class SmartGrid:
                         self.ws_switch(2)
                     elif msg.wParam == HOTKEY_FLOAT_TOGGLE:
                         self.toggle_floating_selected()
+                
                 elif msg.message == CUSTOM_TOGGLE_SWAP:
                     if self.swap_mode_lock:
                         self.exit_swap_mode()
                     else:
                         self.enter_swap_mode()
                 
+                # HANDLE WM_QUIT EXPLICITLY
+                elif msg.message == win32con.WM_QUIT:
+                    log("[MAIN] WM_QUIT received - Exiting message loop")
+                    break
+                
                 user32.TranslateMessage(ctypes.byref(msg))
                 user32.DispatchMessageW(ctypes.byref(msg))
             
             except Exception as e:
                 log(f"[ERROR] message_loop: {e}")
+        
+        # CLEANUP AFTER LOOP EXIT
+        log("[MAIN] Message loop ended - Final cleanup")
+        self.cleanup()
+        log("[EXIT] SmartGrid stopped.")
     
     def start(self):
         """Start all background threads."""
@@ -2264,7 +2508,6 @@ if __name__ == "__main__":
     
     # Register hotkeys
     app.register_hotkeys()
-    log("[MAIN] All hotkeys registered")
     
     # Create systray icon
     app.tray_icon = Icon(
@@ -2284,7 +2527,12 @@ if __name__ == "__main__":
     # Main message loop
     try:
         app.message_loop()
+    except KeyboardInterrupt:
+        log("[EXIT] Keyboard interrupt")
+    except Exception as e:
+        log(f"[ERROR] main: {e}")
     finally:
         app.cleanup()
         log("[EXIT] SmartGrid stopped.")
-        os._exit(0)
+        time.sleep(0.2)  # Allow threads to finish
+        os._exit(0)  # Force stop all threads
