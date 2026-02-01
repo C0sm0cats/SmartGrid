@@ -134,10 +134,14 @@ def get_window_state(hwnd):
         
         if win32gui.IsIconic(hwnd):
             return 'minimized'
-        
-        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-        if style & WS_MAXIMIZE:
-            return 'maximized'
+
+        try:
+            if win32gui.IsZoomed(hwnd):
+                return 'maximized'
+        except Exception:
+            style = user32.GetWindowLongW(hwnd, GWL_STYLE)
+            if style & WS_MAXIMIZE:
+                return 'maximized'
         
         return 'normal'
     except Exception as e:
@@ -527,13 +531,26 @@ class WindowManager:
                     continue
                 
                 state = get_window_state(hwnd)
-                if state in ('minimized', 'maximized'):
+                if state == 'minimized':
+                    self.minimized_windows[hwnd] = self.grid_state[hwnd]
+                    self.grid_state.pop(hwnd, None)
+                    continue
+                if state == 'maximized':
+                    self.maximized_windows[hwnd] = self.grid_state[hwnd]
                     self.grid_state.pop(hwnd, None)
                     continue
                 
                 if not user32.IsWindowVisible(hwnd):
                     self.grid_state.pop(hwnd, None)
                     continue
+
+            # Cleanup minimized/maximized caches for dead windows
+            for hwnd in list(self.minimized_windows.keys()):
+                if not user32.IsWindow(hwnd):
+                    self.minimized_windows.pop(hwnd, None)
+            for hwnd in list(self.maximized_windows.keys()):
+                if not user32.IsWindow(hwnd):
+                    self.maximized_windows.pop(hwnd, None)
             
             # Cleanup override_windows
             dead_overrides = [
@@ -707,6 +724,10 @@ class SmartGrid:
         self.ignore_retile_until = 0.0
         self.last_visible_count = 0
         self.last_retile_time = 0.0
+        self.last_known_count = 0
+        self.layout_signature = {}
+        self.layout_capacity = {}
+        self._maximize_freeze_active = False
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -724,6 +745,8 @@ class SmartGrid:
         
         # Threading
         self.lock = threading.Lock()
+        self._tiling_lock = threading.RLock()
+        self._stop_event = threading.Event()
         self.main_thread_id = win32api.GetCurrentThreadId()
         
         # Initialize
@@ -748,43 +771,97 @@ class SmartGrid:
     
     def smart_tile_with_restore(self):
         """Smart tiling that respects saved grid positions."""
-        if time.time() < self.ignore_retile_until:
-            return
-        
-        # GLOBAL LOCK AT THE START
-        with self.lock:
-            self.ignore_retile_until = time.time() + 0.3
+        with self._tiling_lock:
+            if time.time() < self.ignore_retile_until:
+                return
             
-            # Cleanup
-            self.window_mgr.cleanup_dead_windows()
-            self.window_mgr.cleanup_ghost_windows()
-        
-        # Get visible windows (no lock needed)
-        visible_windows = self.window_mgr.get_visible_windows(
-            self.monitors_cache, self.overlay_hwnd
-        )
-        
-        if not visible_windows:
-            log("[TILE] No windows detected.")
-            return
-        
-        # Separate windows by monitor
-        wins_by_monitor = self._group_windows_by_monitor(visible_windows)
-        
-        # Process each monitor
-        new_grid = {}
-        for mon_idx, windows in wins_by_monitor.items():
-            if mon_idx >= len(self.monitors_cache):
-                continue
+            # GLOBAL LOCK AT THE START
+            with self.lock:
+                self.ignore_retile_until = time.time() + 0.3
+                
+                # Cleanup
+                self.window_mgr.cleanup_dead_windows()
+                self.window_mgr.cleanup_ghost_windows()
             
-            self._tile_monitor(mon_idx, windows, new_grid)
-        
-        # Update grid_state with lock - ONLY ONCE
-        with self.lock:
-            self.window_mgr.grid_state.clear()  # ← CLEAR BEFORE UPDATE
-            self.window_mgr.grid_state.update(new_grid)
-        
-        time.sleep(0.06)
+            # Get visible windows (no lock needed)
+            visible_windows = self.window_mgr.get_visible_windows(
+                self.monitors_cache, self.overlay_hwnd
+            )
+            
+            if not visible_windows:
+                log("[TILE] No windows detected.")
+                return
+            
+            # Separate windows by monitor
+            wins_by_monitor = self._group_windows_by_monitor(visible_windows)
+
+            # Snapshot maximized windows AFTER grouping, so restored windows are not
+            # mistakenly treated as reserved slots.
+            with self.lock:
+                maximized_snapshot = dict(self.window_mgr.maximized_windows)
+                grid_snapshot = dict(self.window_mgr.grid_state)
+
+            reserved_slots_by_monitor = {}
+            for _hwnd, (m_idx, col, row) in maximized_snapshot.items():
+                reserved_slots_by_monitor.setdefault(m_idx, set()).add((col, row))
+
+            # Process each monitor
+            new_grid = {}
+            for mon_idx, windows in wins_by_monitor.items():
+                if mon_idx >= len(self.monitors_cache):
+                    continue
+                visible_count = len(windows)
+                if visible_count <= 0:
+                    continue
+
+                # Hyprland-like behavior: when a window is maximized, keep its grid slot
+                # reserved so background retiles can't steal it.
+                reserved_slots = reserved_slots_by_monitor.get(mon_idx, set())
+                if reserved_slots:
+                    log(f"[TILE] Monitor {mon_idx+1}: reserved slots {sorted(reserved_slots)}")
+                    # Hard freeze: while a window is maximized on this monitor, do NOT move any
+                    # other tiled windows (Hyprland-like). Keep the previous grid_state for this
+                    # monitor, and skip tiling it entirely.
+                    kept = 0
+                    for hwnd, (m, c, r) in grid_snapshot.items():
+                        if m != mon_idx or not user32.IsWindow(hwnd):
+                            continue
+                        if get_window_state(hwnd) != 'normal':
+                            continue
+                        new_grid[hwnd] = (m, c, r)
+                        kept += 1
+                    log(f"[TILE] Monitor {mon_idx+1}: maximize freeze (kept {kept} windows)")
+                    continue
+
+                # While there are maximized windows on this monitor, avoid shrinking the
+                # layout based solely on visible windows (prevents slot reassignment).
+                effective_count = visible_count
+                if reserved_slots:
+                    effective_count = visible_count + len(reserved_slots)
+                    prev_capacity = self.layout_capacity.get(mon_idx, 0)
+                    if prev_capacity:
+                        effective_count = max(effective_count, prev_capacity)
+
+                layout, info = self.layout_engine.choose_layout(effective_count)
+                capacity = self._layout_capacity(layout, info)
+                self.layout_signature[mon_idx] = (layout, info)
+                self.layout_capacity[mon_idx] = capacity
+                self._tile_monitor(
+                    mon_idx,
+                    windows,
+                    new_grid,
+                    layout,
+                    info,
+                    capacity,
+                    reserved_slots=reserved_slots,
+                )
+            
+            # Update grid_state with lock - ONLY ONCE
+            with self.lock:
+                self.window_mgr.grid_state.clear()  # ← CLEAR BEFORE UPDATE
+                self.window_mgr.grid_state.update(new_grid)
+            
+            time.sleep(0.06)
     
     def _group_windows_by_monitor(self, visible_windows):
         """Group windows by their assigned monitor, preserving saved positions."""
@@ -837,23 +914,26 @@ class SmartGrid:
         
         return wins_by_monitor
     
-    def _tile_monitor(self, mon_idx, windows, new_grid):
+    def _tile_monitor(self, mon_idx, windows, new_grid, layout=None, info=None, capacity=None, reserved_slots=None):
         """Tile windows on a specific monitor."""
         monitor_rect = self.monitors_cache[mon_idx]
-        count = len(windows)
-        
-        layout, info = self.layout_engine.choose_layout(count)
-        log(f"\n[TILE] Monitor {mon_idx+1}: {count} windows -> {layout} layout")
+        visible_count = len(windows)
+        if layout is None or capacity is None:
+            layout, info = self.layout_engine.choose_layout(visible_count)
+            capacity = self._layout_capacity(layout, info)
+        reserved_slots = reserved_slots or set()
+        log(f"\n[TILE] Monitor {mon_idx+1}: {visible_count}/{capacity} windows -> {layout} layout")
         
         # Calculate positions
         positions, grid_coords = self.layout_engine.calculate_positions(
-            monitor_rect, count, self.gap, self.edge_padding, layout, info
+            monitor_rect, capacity, self.gap, self.edge_padding, layout, info
         )
         
         pos_map = dict(zip(grid_coords, positions))
         
         # Phase 1: Restore saved positions
-        assigned = set()
+        reserved_in_layout = {slot for slot in reserved_slots if slot in pos_map}
+        assigned = set(reserved_in_layout)
         unassigned_windows = []
         
         for hwnd, title, rect, saved_col, saved_row, win_class in windows:
@@ -884,40 +964,217 @@ class SmartGrid:
                 new_grid[hwnd] = (mon_idx, col, row)
                 log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
                 time.sleep(0.015)
+
+    def _sync_window_state_changes(self):
+        """Track min/max/restore state transitions for stable retile decisions."""
+        restored = []
+        minimized_moved = 0
+        maximized_moved = 0
+        with self.lock:
+            # Move minimized/maximized windows out of grid_state (keep their slot)
+            for hwnd, (mon, col, row) in list(self.window_mgr.grid_state.items()):
+                if not user32.IsWindow(hwnd):
+                    continue
+                state = get_window_state(hwnd)
+                if state == 'minimized':
+                    self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
+                    self.window_mgr.grid_state.pop(hwnd, None)
+                    minimized_moved += 1
+                elif state == 'maximized':
+                    self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
+                    self.window_mgr.grid_state.pop(hwnd, None)
+                    maximized_moved += 1
+
+            # Restore minimized windows that returned to normal
+            for hwnd, (mon, col, row) in list(self.window_mgr.minimized_windows.items()):
+                if not user32.IsWindow(hwnd):
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    continue
+                state = get_window_state(hwnd)
+                if state == 'normal' and user32.IsWindowVisible(hwnd):
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    self.window_mgr.grid_state[hwnd] = (mon, col, row)
+                    restored.append((hwnd, mon, col, row))
+                elif state == 'maximized':
+                    self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    maximized_moved += 1
+
+            # Restore maximized windows that returned to normal
+            for hwnd, (mon, col, row) in list(self.window_mgr.maximized_windows.items()):
+                if not user32.IsWindow(hwnd):
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+                    continue
+                state = get_window_state(hwnd)
+                if state == 'normal' and user32.IsWindowVisible(hwnd):
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+                    self.window_mgr.grid_state[hwnd] = (mon, col, row)
+                    restored.append((hwnd, mon, col, row))
+                elif state == 'minimized':
+                    self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+                    minimized_moved += 1
+
+        return restored, minimized_moved, maximized_moved
+
+    def _layout_capacity(self, layout, info):
+        if layout == "full":
+            return 1
+        if layout == "side_by_side":
+            return 2
+        if layout == "master_stack":
+            return 3
+        if layout == "grid":
+            cols, rows = info if info else (2, 2)
+            return cols * rows
+        return 1
+
+    def _count_visible_by_monitor(self, visible_windows):
+        counts = {}
+        for _, _, rect in visible_windows:
+            w_center_x = (rect.left + rect.right) // 2
+            w_center_y = (rect.top + rect.bottom) // 2
+            mon_idx = 0
+            for i, (mx, my, mw, mh) in enumerate(self.monitors_cache):
+                if mx <= w_center_x < mx + mw and my <= w_center_y < my + mh:
+                    mon_idx = i
+                    break
+            counts[mon_idx] = counts.get(mon_idx, 0) + 1
+        return counts
+
+    def _get_layout_count_for_monitor(self, mon_idx):
+        with self.lock:
+            base = self.layout_capacity.get(mon_idx, 0)
+        if base > 0:
+            return base
+        count = 0
+        with self.lock:
+            for hwnd, (m, _, _) in self.window_mgr.grid_state.items():
+                if m == mon_idx and user32.IsWindow(hwnd):
+                    count += 1
+        if count <= 0:
+            return 0
+        layout, info = self.layout_engine.choose_layout(count)
+        return self._layout_capacity(layout, info)
+
+    def _restore_windows_to_slots(self, restored):
+        """Place restored windows back into their saved slots."""
+        with self._tiling_lock:
+            with self.lock:
+                grid_snapshot = dict(self.window_mgr.grid_state)
+
+            need_full_retile = False
+            for hwnd, mon_idx, col, row in restored:
+                if mon_idx >= len(self.monitors_cache):
+                    continue
+                if not user32.IsWindow(hwnd):
+                    continue
+                count = self._get_layout_count_for_monitor(mon_idx)
+                if count <= 0:
+                    continue
+
+                layout, info = self.layout_engine.choose_layout(count)
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx], count, self.gap, self.edge_padding, layout, info
+                )
+                pos_map = dict(zip(grid_coords, positions))
+                target = (col, row)
+                if target not in pos_map:
+                    need_full_retile = True
+                    break
+
+                # If the monitor currently has more windows than the last known layout capacity
+                # (e.g. because another window appeared while this one was minimized), restoring
+                # "in place" cannot be guaranteed without overlaps -> do a single full retile.
+                mon_windows = [
+                    (h, c, r)
+                    for h, (m, c, r) in grid_snapshot.items()
+                    if m == mon_idx and user32.IsWindow(h)
+                ]
+                if len(mon_windows) > count:
+                    need_full_retile = True
+                    break
+
+                # If the saved slot is already occupied, resolve by moving the occupant(s) to
+                # free slot(s) instead of doing a full retile (prevents "swap" surprises).
+                conflicts = [
+                    other_hwnd
+                    for other_hwnd, other_col, other_row in mon_windows
+                    if other_hwnd != hwnd and other_col == col and other_row == row
+                ]
+                if conflicts:
+                    try:
+                        restored_title = win32gui.GetWindowText(hwnd)[:60]
+                    except Exception:
+                        restored_title = ""
+                    log(f"[RESTORE] Slot ({col},{row}) occupied for '{restored_title}' -> resolving")
+                    used_slots = {(c, r) for _, c, r in mon_windows}
+                    free_slots = [coord for coord in grid_coords if coord not in used_slots]
+                    if len(free_slots) < len(conflicts):
+                        log(f"[RESTORE] Not enough free slots ({len(free_slots)}) for {len(conflicts)} conflicts")
+                        need_full_retile = True
+                        break
+
+                    # Move each conflicting window to a free slot.
+                    for other_hwnd in conflicts:
+                        new_slot = free_slots.pop(0)
+                        try:
+                            other_title = win32gui.GetWindowText(other_hwnd)[:60]
+                        except Exception:
+                            other_title = ""
+                        log(f"[RESTORE] Moving '{other_title}' -> {new_slot}")
+                        with self.lock:
+                            self.window_mgr.grid_state[other_hwnd] = (mon_idx, new_slot[0], new_slot[1])
+                        grid_snapshot[other_hwnd] = (mon_idx, new_slot[0], new_slot[1])
+                        x2, y2, w2, h2 = pos_map[new_slot]
+                        self.window_mgr.force_tile_resizable(other_hwnd, x2, y2, w2, h2)
+                        time.sleep(0.01)
+
+                # Finally, put the restored window back in its saved slot.
+                x, y, w, h = pos_map[target]
+                self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+            if need_full_retile:
+                # Bypass the short "grace" window so the conflict is resolved immediately.
+                with self.lock:
+                    self.ignore_retile_until = 0.0
+                self.smart_tile_with_restore()
     
     def apply_grid_state(self):
         """Reapply all saved grid positions physically."""
-        with self.lock:
-            if not self.window_mgr.grid_state:
-                return
+        with self._tiling_lock:
+            with self.lock:
+                if not self.window_mgr.grid_state:
+                    return
+                
+                # Remove dead windows
+                for hwnd in list(self.window_mgr.grid_state.keys()):
+                    if not user32.IsWindow(hwnd):
+                        self.window_mgr.grid_state.pop(hwnd, None)
+                
+                if not self.window_mgr.grid_state:
+                    return
+                
+                grid_snapshot = dict(self.window_mgr.grid_state)
+                monitors_snapshot = list(self.monitors_cache)
+                gap = self.gap
+                edge_padding = self.edge_padding
             
-            # Remove dead windows
-            for hwnd in list(self.window_mgr.grid_state.keys()):
-                if not user32.IsWindow(hwnd):
-                    self.window_mgr.grid_state.pop(hwnd, None)
-            
-            if not self.window_mgr.grid_state:
-                return
-            
-            # Group by monitor
+            # Group by monitor (snapshot)
             wins_by_mon = {}
-            for hwnd, (mon_idx, col, row) in self.window_mgr.grid_state.items():
-                wins_by_mon.setdefault(mon_idx, []).append(
-                    (hwnd, col, row)
-                )
+            for hwnd, (mon_idx, col, row) in grid_snapshot.items():
+                if mon_idx >= len(monitors_snapshot) or not user32.IsWindow(hwnd):
+                    continue
+                wins_by_mon.setdefault(mon_idx, []).append((hwnd, col, row))
             
             # Process each monitor
             for mon_idx, windows in wins_by_mon.items():
-                if mon_idx >= len(self.monitors_cache):
-                    continue
-                
-                monitor_rect = self.monitors_cache[mon_idx]
+                monitor_rect = monitors_snapshot[mon_idx]
                 count = len(windows)
                 layout, info = self.layout_engine.choose_layout(count)
                 
                 # Calculate positions
                 positions, coord_list = self.layout_engine.calculate_positions(
-                    monitor_rect, count, self.gap, self.edge_padding, layout, info
+                    monitor_rect, count, gap, edge_padding, layout, info
                 )
                 
                 pos_dict = dict(zip(coord_list, positions))
@@ -940,6 +1197,7 @@ class SmartGrid:
         log("\n[FORCE RETILE] Ctrl+Alt+R → Immediate full re-tile")
         self.ignore_retile_until = 0
         self.last_visible_count = 0
+        self.last_known_count = 0
         
         try:
             winsound.PlaySound("SystemExclamation", winsound.SND_ALIAS | winsound.SND_ASYNC)
@@ -1004,18 +1262,38 @@ class SmartGrid:
         # Get atomic check
         with self.lock:
             grid_empty = len(self.window_mgr.grid_state) == 0
-        
+
         # Force quick update if grid_state is empty
         if grid_empty:
             visible_windows = self.window_mgr.get_visible_windows(
                 self.monitors_cache, self.overlay_hwnd
             )
             
+            assignments = []
+            per_monitor_idx = {}
+            for hwnd, title, rect in visible_windows:
+                # Determine the physical monitor
+                w_center_x = (rect.left + rect.right) // 2
+                w_center_y = (rect.top + rect.bottom) // 2
+                
+                mon_idx = 0
+                for i, (mx, my, mw, mh) in enumerate(self.monitors_cache):
+                    if mx <= w_center_x < mx + mw and my <= w_center_y < my + mh:
+                        mon_idx = i
+                        break
+                
+                idx = per_monitor_idx.get(mon_idx, 0)
+                per_monitor_idx[mon_idx] = idx + 1
+                
+                col = idx % 10
+                row = idx // 10
+                assignments.append((hwnd, (mon_idx, col, row)))
+            
             # Get atomic modification
             with self.lock:
-                for hwnd, title, _ in visible_windows:
+                for hwnd, pos in assignments:
                     if hwnd not in self.window_mgr.grid_state:
-                        self.window_mgr.grid_state[hwnd] = (0, 0, 0)
+                        self.window_mgr.grid_state[hwnd] = pos
             
             log(f"[SWAP] grid_state rebuilt with {len(self.window_mgr.grid_state)} windows")
             
@@ -1159,58 +1437,60 @@ class SmartGrid:
         except Exception as e:
             log(f"[ERROR] _find_window_in_direction: {e}")
             return None
-    
+
     def _swap_windows(self, hwnd1, hwnd2):
         """Swap two windows' grid positions and physically move them."""
-        if hwnd1 not in self.window_mgr.grid_state or hwnd2 not in self.window_mgr.grid_state:
-            return False
-        
-        try:
-            set_window_border(hwnd1, None)
-            set_window_border(hwnd2, None)
-            time.sleep(0.05)
-            
-            rect1 = wintypes.RECT()
-            rect2 = wintypes.RECT()
-            
-            if not user32.GetWindowRect(hwnd1, ctypes.byref(rect1)):
-                return False
-            if not user32.GetWindowRect(hwnd2, ctypes.byref(rect2)):
-                return False
-            
-            lb1, tb1, rb1, bb1 = get_frame_borders(hwnd1)
-            lb2, tb2, rb2, bb2 = get_frame_borders(hwnd2)
-            
-            x1 = rect1.left + lb1
-            y1 = rect1.top + tb1
-            w1 = rect1.right - rect1.left - lb1 - rb1
-            h1 = rect1.bottom - rect1.top - tb1 - bb1
-            
-            x2 = rect2.left + lb2
-            y2 = rect2.top + tb2
-            w2 = rect2.right - rect2.left - lb2 - rb2
-            h2 = rect2.bottom - rect2.top - tb2 - bb2
-            
-            title1 = win32gui.GetWindowText(hwnd1)[:40]
-            title2 = win32gui.GetWindowText(hwnd2)[:40]
-            log(f"[SWAP] '{title1}' ↔ '{title2}'")
-            
-            # Swap in grid_state with lock
+        with self._tiling_lock:
             with self.lock:
-                self.window_mgr.grid_state[hwnd1], self.window_mgr.grid_state[hwnd2] = \
-                    self.window_mgr.grid_state[hwnd2], self.window_mgr.grid_state[hwnd1]
+                if hwnd1 not in self.window_mgr.grid_state or hwnd2 not in self.window_mgr.grid_state:
+                    return False
             
-            # Physical swap
-            self.window_mgr.force_tile_resizable(hwnd1, x2, y2, w2, h2)
-            time.sleep(0.04)
-            self.window_mgr.force_tile_resizable(hwnd2, x1, y1, w1, h1)
-            time.sleep(0.04)
+            try:
+                set_window_border(hwnd1, None)
+                set_window_border(hwnd2, None)
+                time.sleep(0.05)
+                
+                rect1 = wintypes.RECT()
+                rect2 = wintypes.RECT()
+                
+                if not user32.GetWindowRect(hwnd1, ctypes.byref(rect1)):
+                    return False
+                if not user32.GetWindowRect(hwnd2, ctypes.byref(rect2)):
+                    return False
+                
+                lb1, tb1, rb1, bb1 = get_frame_borders(hwnd1)
+                lb2, tb2, rb2, bb2 = get_frame_borders(hwnd2)
+                
+                x1 = rect1.left + lb1
+                y1 = rect1.top + tb1
+                w1 = rect1.right - rect1.left - lb1 - rb1
+                h1 = rect1.bottom - rect1.top - tb1 - bb1
+                
+                x2 = rect2.left + lb2
+                y2 = rect2.top + tb2
+                w2 = rect2.right - rect2.left - lb2 - rb2
+                h2 = rect2.bottom - rect2.top - tb2 - bb2
+                
+                title1 = win32gui.GetWindowText(hwnd1)[:40]
+                title2 = win32gui.GetWindowText(hwnd2)[:40]
+                log(f"[SWAP] '{title1}' ↔ '{title2}'")
+                
+                # Swap in grid_state with lock
+                with self.lock:
+                    self.window_mgr.grid_state[hwnd1], self.window_mgr.grid_state[hwnd2] = \
+                        self.window_mgr.grid_state[hwnd2], self.window_mgr.grid_state[hwnd1]
+                
+                # Physical swap
+                self.window_mgr.force_tile_resizable(hwnd1, x2, y2, w2, h2)
+                time.sleep(0.04)
+                self.window_mgr.force_tile_resizable(hwnd2, x1, y1, w1, h1)
+                time.sleep(0.04)
+                
+                return True
             
-            return True
-        
-        except Exception as e:
-            log(f"[ERROR] _swap_windows: {e}")
-            return False
+            except Exception as e:
+                log(f"[ERROR] _swap_windows: {e}")
+                return False
     
     def exit_swap_mode(self):
         """Exit swap mode and restore normal borders."""
@@ -1261,13 +1541,14 @@ class SmartGrid:
         WNDPROCTYPE = ctypes.WINFUNCTYPE(
             wintypes.LPARAM, wintypes.HWND, ctypes.c_uint, wintypes.WPARAM, wintypes.LPARAM
         )
-        
+
         @WNDPROCTYPE
         def wnd_proc(hwnd, msg, wparam, lparam):
             brush = None
             pen = None
             old_brush = None
             old_pen = None
+            hdc = None
             
             try:
                 if msg == win32con.WM_PAINT:
@@ -1306,7 +1587,7 @@ class SmartGrid:
                     
                     return 0
                 
-                elif msg == win32con.WM_DESTROY:
+                if msg == win32con.WM_DESTROY:
                     return 0
                 
                 return DefWindowProc(hwnd, msg, wparam, lparam)
@@ -1314,15 +1595,15 @@ class SmartGrid:
             except Exception as e:
                 log(f"[ERROR] overlay wnd_proc: {e}")
                 # Cleanup on error
-                if old_brush:
+                if hdc and old_brush:
                     try:
                         win32gui.SelectObject(hdc, old_brush)
-                    except:
+                    except Exception:
                         pass
-                if old_pen:
+                if hdc and old_pen:
                     try:
                         win32gui.SelectObject(hdc, old_pen)
-                    except:
+                    except Exception:
                         pass
                 return 0
         
@@ -1585,12 +1866,18 @@ class SmartGrid:
     def start_drag_snap_monitor(self):
         """Background thread: drag detection with live preview."""
         was_down = False
+        candidate_hwnd = None
+        candidate_start = None
         drag_hwnd = None
         drag_start = None
         preview_active = False
         last_valid_rect = None
+
+        WM_NCHITTEST = 0x0084
+        HTCLIENT = 1
+        HTCAPTION = 2
         
-        while True:
+        while not self._stop_event.is_set():
             try:
                 down = win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000
                 
@@ -1610,7 +1897,7 @@ class SmartGrid:
                             hwnd = top
                     except Exception:
                         try:
-                            while True:
+                            for _ in range(16):
                                 parent = win32gui.GetParent(hwnd)
                                 if not parent:
                                     break
@@ -1622,23 +1909,42 @@ class SmartGrid:
                         hwnd = user32.GetForegroundWindow()
                     
                     # Check maximized
-                    if hwnd:
-                        style = user32.GetWindowLongW(hwnd, GWL_STYLE)
-                        if style & WS_MAXIMIZE:
-                            was_down = True
-                            continue
+                    if hwnd and get_window_state(hwnd) == 'maximized':
+                        was_down = True
+                        continue
                     
-                    # Atomic verification before starting drag
+                    candidate_hwnd = None
+                    candidate_start = None
+
+                    # Only consider drag from title bar (prevents false drags when clicking
+                    # buttons like maximize/minimize/close, and avoids "retile" jitter).
                     if hwnd and user32.IsWindowVisible(hwnd):
-                        with self.lock:
-                            is_in_grid = hwnd in self.window_mgr.grid_state
-                        
-                        if is_in_grid:
-                            self.drag_drop_lock = True
-                            time.sleep(0.25)
-                            drag_hwnd = hwnd
-                            drag_start = pt
-                            preview_active = False
+                        try:
+                            lparam = win32api.MAKELONG(pt[0] & 0xFFFF, pt[1] & 0xFFFF)
+                            hit = win32gui.SendMessage(hwnd, WM_NCHITTEST, 0, lparam)
+                        except Exception:
+                            hit = None
+
+                        if hit in (HTCAPTION, HTCLIENT):
+                            with self.lock:
+                                is_in_grid = hwnd in self.window_mgr.grid_state
+                            if is_in_grid:
+                                candidate_hwnd = hwnd
+                                candidate_start = pt
+
+                # Candidate drag: wait for movement threshold before engaging
+                elif down and candidate_hwnd and not drag_hwnd:
+                    cursor_pos = win32api.GetCursorPos()
+                    dx = abs(cursor_pos[0] - candidate_start[0]) if candidate_start else 0
+                    dy = abs(cursor_pos[1] - candidate_start[1]) if candidate_start else 0
+
+                    if dx > DRAG_THRESHOLD or dy > DRAG_THRESHOLD:
+                        drag_hwnd = candidate_hwnd
+                        drag_start = candidate_start
+                        candidate_hwnd = None
+                        candidate_start = None
+                        preview_active = True
+                        self.drag_drop_lock = True
                 
                 # Drag in progress
                 elif down and drag_hwnd:
@@ -1647,9 +1953,6 @@ class SmartGrid:
                     if drag_start:
                         dx = abs(cursor_pos[0] - drag_start[0])
                         dy = abs(cursor_pos[1] - drag_start[1])
-                        
-                        if (dx > 1 or dy > 1) and not preview_active:
-                            preview_active = True
                         
                         if preview_active:
                             target_rect = self.calculate_target_rect(drag_hwnd, cursor_pos)
@@ -1662,26 +1965,23 @@ class SmartGrid:
                                 self.hide_snap_preview()
                 
                 # Mouse up
-                elif not down and was_down and drag_hwnd:
-                    self.hide_snap_preview()
-                    cursor_pos = win32api.GetCursorPos()
-                    moved = False
-                    
-                    if drag_start:
-                        dx = abs(cursor_pos[0] - drag_start[0])
-                        dy = abs(cursor_pos[1] - drag_start[1])
-                        moved = (dx > DRAG_THRESHOLD or dy > DRAG_THRESHOLD)
-                    
-                    if moved:
-                        self.handle_snap_drop(drag_hwnd, cursor_pos)
-                    else:
-                        self.apply_grid_state()
-                    
-                    self.drag_drop_lock = False
-                    drag_hwnd = None
-                    drag_start = None
-                    preview_active = False
-                    last_valid_rect = None
+                elif not down and was_down:
+                    if drag_hwnd:
+                        self.hide_snap_preview()
+                        cursor_pos = win32api.GetCursorPos()
+                        # If the user used Windows "Aero Snap" to maximize during the drag,
+                        # do NOT treat it as a grid move (it would move other windows).
+                        if get_window_state(drag_hwnd) != 'maximized':
+                            self.handle_snap_drop(drag_hwnd, cursor_pos)
+                        else:
+                            log("[DRAG] Drop ignored (window maximized)")
+                        self.drag_drop_lock = False
+                        drag_hwnd = None
+                        drag_start = None
+                        preview_active = False
+                        last_valid_rect = None
+                    candidate_hwnd = None
+                    candidate_start = None
                 
                 was_down = down
                 time.sleep(1.0 / DRAG_MONITOR_FPS)  # ~60 FPS
@@ -1693,6 +1993,8 @@ class SmartGrid:
                 drag_hwnd = None
                 drag_start = None
                 preview_active = False
+                candidate_hwnd = None
+                candidate_start = None
                 time.sleep(0.1)
     
     # ==========================================================================
@@ -1771,6 +2073,10 @@ class SmartGrid:
         log(f"[WS] Loading workspace {ws_idx+1}...")
         self.ignore_retile_until = time.time() + 2.0
         
+        grid_updates = {}
+        minimized_updates = {}
+        maximized_updates = {}
+        
         for hwnd, data in layout.items():
             if not user32.IsWindow(hwnd):
                 continue
@@ -1782,10 +2088,10 @@ class SmartGrid:
                 
                 if saved_state == 'minimized':
                     user32.ShowWindowAsync(hwnd, win32con.SW_MINIMIZE)
-                    self.window_mgr.minimized_windows[hwnd] = (monitor_idx, col, row)
+                    minimized_updates[hwnd] = (monitor_idx, col, row)
                 elif saved_state == 'maximized':
                     user32.ShowWindowAsync(hwnd, win32con.SW_MAXIMIZE)
-                    self.window_mgr.maximized_windows[hwnd] = (monitor_idx, col, row)
+                    maximized_updates[hwnd] = (monitor_idx, col, row)
                 else:
                     if win32gui.IsIconic(hwnd):
                         user32.ShowWindowAsync(hwnd, SW_RESTORE)
@@ -1793,12 +2099,28 @@ class SmartGrid:
                     if not user32.IsWindowVisible(hwnd):
                         user32.ShowWindowAsync(hwnd, SW_SHOWNORMAL)
                         time.sleep(0.08)
-                    self.window_mgr.grid_state[hwnd] = (monitor_idx, col, row)
+                    grid_updates[hwnd] = (monitor_idx, col, row)
                 
                 time.sleep(0.015)
             
             except Exception as e:
                 log(f"[ERROR] load_workspace: {e}")
+        
+        with self.lock:
+            for hwnd, pos in minimized_updates.items():
+                self.window_mgr.minimized_windows[hwnd] = pos
+                self.window_mgr.grid_state.pop(hwnd, None)
+                self.window_mgr.maximized_windows.pop(hwnd, None)
+            
+            for hwnd, pos in maximized_updates.items():
+                self.window_mgr.maximized_windows[hwnd] = pos
+                self.window_mgr.grid_state.pop(hwnd, None)
+                self.window_mgr.minimized_windows.pop(hwnd, None)
+            
+            for hwnd, pos in grid_updates.items():
+                self.window_mgr.grid_state[hwnd] = pos
+                self.window_mgr.minimized_windows.pop(hwnd, None)
+                self.window_mgr.maximized_windows.pop(hwnd, None)
         
         time.sleep(0.15)
         self.smart_tile_with_restore()
@@ -1850,6 +2172,10 @@ class SmartGrid:
                 self.monitors_cache, self.overlay_hwnd
             )
             self.last_visible_count = len(visible_windows)
+            with self.lock:
+                self.last_known_count = (len(self.window_mgr.grid_state) +
+                                         len(self.window_mgr.minimized_windows) +
+                                         len(self.window_mgr.maximized_windows))
             
             time.sleep(0.2)
             self.is_active = was_active
@@ -1886,8 +2212,11 @@ class SmartGrid:
             monitor_rect = self.monitors_cache[new_mon]
             mon_x, mon_y, mon_w, mon_h = monitor_rect
             
+            with self.lock:
+                grid_snapshot = list(self.window_mgr.grid_state.items())
+            
             windows_to_move = [
-                (hwnd, pos) for hwnd, pos in self.window_mgr.grid_state.items()
+                (hwnd, pos) for hwnd, pos in grid_snapshot
                 if pos[0] == old_mon and user32.IsWindow(hwnd)
             ]
             
@@ -1907,36 +2236,37 @@ class SmartGrid:
             new_grid = {}
             log(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
             
-            for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
-                x, y, w, h = positions[i]
-                self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
-                
-                # Assign grid position
-                if layout == "full":
-                    new_grid[hwnd] = (new_mon, 0, 0)
-                elif layout == "side_by_side":
-                    new_col = 0 if i == 0 else 1
-                    new_grid[hwnd] = (new_mon, new_col, 0)
-                elif layout == "master_stack":
-                    if i == 0:
+            with self._tiling_lock:
+                for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
+                    x, y, w, h = positions[i]
+                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                    
+                    # Assign grid position
+                    if layout == "full":
                         new_grid[hwnd] = (new_mon, 0, 0)
-                    elif i == 1:
-                        new_grid[hwnd] = (new_mon, 1, 0)
-                    elif i == 2:
-                        new_grid[hwnd] = (new_mon, 1, 1)
-                else:  # grid
-                    cols, rows = info
-                    new_grid[hwnd] = (new_mon, i % cols, i // cols)
+                    elif layout == "side_by_side":
+                        new_col = 0 if i == 0 else 1
+                        new_grid[hwnd] = (new_mon, new_col, 0)
+                    elif layout == "master_stack":
+                        if i == 0:
+                            new_grid[hwnd] = (new_mon, 0, 0)
+                        elif i == 1:
+                            new_grid[hwnd] = (new_mon, 1, 0)
+                        elif i == 2:
+                            new_grid[hwnd] = (new_mon, 1, 1)
+                    else:  # grid
+                        cols, rows = info
+                        new_grid[hwnd] = (new_mon, i % cols, i // cols)
+                    
+                    title = win32gui.GetWindowText(hwnd)
+                    log(f"   -> {title[:50]}")
+                    time.sleep(0.015)
                 
-                title = win32gui.GetWindowText(hwnd)
-                log(f"   -> {title[:50]}")
-                time.sleep(0.015)
-            
-            # Update grid_state with lock
-            with self.lock:
-                for hwnd, _ in windows_to_move:
-                    self.window_mgr.grid_state.pop(hwnd, None)
-                self.window_mgr.grid_state.update(new_grid)
+                # Update grid_state with lock
+                with self.lock:
+                    for hwnd, _ in windows_to_move:
+                        self.window_mgr.grid_state.pop(hwnd, None)
+                    self.window_mgr.grid_state.update(new_grid)
             
             time.sleep(0.15)
             
@@ -2250,6 +2580,8 @@ class SmartGrid:
         if self.is_active:
             with self.lock:
                 self.window_mgr.grid_state.clear()
+                self.last_visible_count = 0
+                self.last_known_count = 0
             self.smart_tile_with_restore()
         else:
             with self.lock:
@@ -2309,6 +2641,7 @@ class SmartGrid:
     def cleanup(self):
         """Cleanup before exit."""
         try:
+            self._stop_event.set()
             if self.window_mgr.current_hwnd:
                 set_window_border(self.window_mgr.current_hwnd, None)
             
@@ -2327,7 +2660,7 @@ class SmartGrid:
         """Background loop: auto-retile + border tracking + monitor detection."""
         last_monitor_count = len(self.monitors_cache)
         
-        while True:
+        while not self._stop_event.is_set():
             try:
                 # Monitor configuration change detection
                 current_monitors = get_monitors()
@@ -2355,27 +2688,98 @@ class SmartGrid:
                     continue
                 
                 if self.is_active:
-                    # Lightweight cleanup
+                    restored, minimized_moved, _maximized_moved = self._sync_window_state_changes()
+                    if restored:
+                        self._restore_windows_to_slots(restored)
+
+                    # Lightweight cleanup (safe during maximize freeze)
                     self.window_mgr.cleanup_dead_windows()
-                    
+
+                    # Hard rule: while ANY window is maximized, do not auto-retile/reflow.
+                    # This prevents "background retiles" from moving other windows (Hyprland-like).
+                    with self.lock:
+                        has_maximized = any(
+                            user32.IsWindow(hwnd) for hwnd in self.window_mgr.maximized_windows.keys()
+                        )
+                    if has_maximized and not self._maximize_freeze_active:
+                        log("[FREEZE] Maximize detected -> auto-retile paused")
+                    elif not has_maximized and self._maximize_freeze_active:
+                        log("[FREEZE] Maximize cleared -> auto-retile resumed")
+                    self._maximize_freeze_active = has_maximized
+                    if has_maximized:
+                        # Keep the counters in sync to avoid a retile storm when unmaximizing.
+                        visible_windows = self.window_mgr.get_visible_windows(
+                            self.monitors_cache, self.overlay_hwnd
+                        )
+                        current_count = len(visible_windows)
+                        with self.lock:
+                            known_hwnds = (set(self.window_mgr.grid_state.keys()) |
+                                           set(self.window_mgr.minimized_windows.keys()) |
+                                           set(self.window_mgr.maximized_windows.keys()))
+                        self.last_visible_count = current_count
+                        self.last_known_count = len(known_hwnds)
+                        time.sleep(0.06)
+                        continue
+
+                    if minimized_moved:
+                        # Minimizing a tiled window reduces the effective count; do a single
+                        # reflow so the remaining windows fill the layout.
+                        self.smart_tile_with_restore()
+
                     visible_windows = self.window_mgr.get_visible_windows(
                         self.monitors_cache, self.overlay_hwnd
                     )
                     current_count = len(visible_windows)
+                    visible_hwnds = {hwnd for hwnd, _, _ in visible_windows}
+                    counts_by_monitor = self._count_visible_by_monitor(visible_windows)
+
+                    layout_change = False
+                    for mon_idx, visible_count in counts_by_monitor.items():
+                        if visible_count <= 0:
+                            continue
+                        # Use the last known layout capacity to avoid "retile storms" when
+                        # windows are temporarily minimized/maximized (visible_count changes,
+                        # but the intended grid layout should remain stable).
+                        prev_sig = self.layout_signature.get(mon_idx)
+                        if prev_sig is None:
+                            continue
+                        expected_count = self._get_layout_count_for_monitor(mon_idx)
+                        if expected_count <= 0:
+                            expected_count = visible_count
+                        layout, info = self.layout_engine.choose_layout(expected_count)
+                        sig = (layout, info)
+                        if prev_sig != sig:
+                            layout_change = True
+                            break
+
+                    with self.lock:
+                        known_hwnds = (set(self.window_mgr.grid_state.keys()) |
+                                       set(self.window_mgr.minimized_windows.keys()) |
+                                       set(self.window_mgr.maximized_windows.keys()))
+                    known_count = len(known_hwnds)
+                    new_windows = [h for h in visible_hwnds if h not in known_hwnds]
                     
                     # Debounced retiling
                     now = time.time()
-                    if (now >= self.ignore_retile_until and 
-                        current_count > 0 and 
-                        current_count != self.last_visible_count):
-                        
-                        if now - self.last_retile_time >= RETILE_DEBOUNCE:
+                    if now >= self.ignore_retile_until and current_count > 0:
+                        should_retile = False
+                        if new_windows:
+                            should_retile = True
+                        elif known_count < self.last_known_count:
+                            should_retile = True
+                        elif layout_change:
+                            should_retile = True
+
+                        if should_retile and now - self.last_retile_time >= RETILE_DEBOUNCE:
                             log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
                             self.smart_tile_with_restore()
                             self.last_visible_count = current_count
+                            self.last_known_count = known_count
                             self.last_retile_time = now
-                        
-                        time.sleep(0.2)
+                            time.sleep(0.2)
+                        elif not should_retile:
+                            self.last_visible_count = current_count
+                            self.last_known_count = known_count
                 
                 time.sleep(0.06)
             
