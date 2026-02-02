@@ -8,6 +8,10 @@
 
 SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **workspaces per monitor** — with a system tray UI and global hotkeys.
 
+## Demo
+
+![SmartGrid demo](demo.gif)
+
 ## Features
 
 - **Dynamic layouts** (1 → full, 2 → split, 3 → master/stack, 4+ → grid up to 5×3)
