@@ -5,63 +5,20 @@
 [![License](https://img.shields.io/github/license/C0sm0cats/SmartGrid)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/C0sm0cats/SmartGrid)
 
-## Powerful Pure-Python Dynamic Tiling Window Manager for Windows
+> Dynamic tiling window manager for Windows — **pure Python** (Win32 + DWM)
 
-**SmartGrid** is not just a tiler.
-It’s a **real, living, breathing dynamic tiling window manager** for Windows — written in pure Python.
+SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **workspaces per monitor** — with a system tray UI and global hotkeys.
 
-No config. Just press one key and live in perfect harmony.
+## Features
 
-## What It Actually Does Now
-
-True dynamic tiling — open, close, minimize, restore → layout adapts instantly  
-1 window → full screen  
-2 → perfect side-by-side  
-3 → master + stack  
-4+ → intelligent grid (up to 5×3)
-
-- **Green border** that always follows the active window
-
-- **Drag & Drop Snap** — Grab any tiled window by the title bar  
-  → drop it anywhere → it snaps perfectly  
-  → Works across monitors  
-  → Automatically swaps if target cell is occupied
-
-- **SWAP Mode** — Ctrl+Alt+S  
-  → Red border → arrow keys → direct swap with adjacent windows  
-  → Navigate with ← → ↑ ↓  
-  → The red window follows your movements  
-  → Press Enter to confirm or Ctrl+Alt+S to exit
-
-- **Workspace-aware monitor cycling** — Ctrl+Alt+M  
-  → current workspace jumps to next monitor  
-  → Other workspaces stay intact  
-  → Merges smoothly if target workspace has windows
-
-- **Floating Windows** — Ctrl+Alt+F  
-  → Toggle any window between tiled and floating  
-  → Perfect for video players, chat windows, or temporary reference panels  
-  → Floating windows won't participate in the grid layout  
-  → Works from systray menu too — always targets your last-clicked window  
-  → Press Ctrl+Alt+F again to snap it back into the tiling grid
-
-- **Workspaces per monitor** — 3 independent workspaces on each screen  
-  → Switch instantly with Ctrl+Alt+1/2/3  
-  → Each workspace remembers its layout perfectly (position + grid coords)  
-  → Hidden windows restore automatically (even from taskbar)  
-  → Smooth transitions with zero flickering
-
-- **System Tray Icon + Menu** → Quick access to :  
-  → Toggle tiling ON/OFF  
-  → Force re-tile all windows  
-  → Toggle Swap Mode ON/OFF  
-  → Move workspace to next monitor  
-  → Toggle Floating selected window  
-  → Switch workspaces (1/2/3)  
-  → Settings (Gap & Padding)  
-  → Quick access to hotkeys cheatsheet and quit
-
-- Works with everything: Electron, UWP, WPF, acrylic, custom-drawn, stubborn apps — all obey
+- **Dynamic layouts** (1 → full, 2 → split, 3 → master/stack, 4+ → grid up to 5×3)
+- **Maximize-safe tiling:** maximizing a tiled window won’t reshuffle other windows; restore returns to the original slot
+- **Drag & drop snap:** drag a tiled window by the title bar, preview appears, drop to snap (supports cross-monitor)
+- **Swap Mode:** red border + arrow keys to swap with adjacent windows
+- **Floating windows toggle:** keep specific windows out of the grid (video/chat/reference)
+- **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
+- **System tray menu:** toggle tiling, retile, swap mode, move workspace, settings (gap/padding), hotkeys, quit
+- **Active border:** green border follows the active tiled window
 
 ## Hotkeys
 
@@ -75,15 +32,38 @@ True dynamic tiling — open, close, minimize, restore → layout adapts instant
 | `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
 | `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
 
-## Behavior
+## Install & Run
+
+### Option A — Download the latest release
+
+https://github.com/C0sm0cats/SmartGrid/releases/latest
+
+### Option B — Run from source
+
+Requirements:
+- Windows 10 / 11 (64-bit)
+- Python 3.9+
+- Dependencies: `pywin32`, `pystray`, `pillow` (PIL)
+
+```bash
+git clone https://github.com/C0sm0cats/SmartGrid.git
+cd SmartGrid
+python -m pip install --upgrade pip
+python -m pip install pywin32 pystray pillow
+python smartgrid.py
+```
+
+Press `Ctrl + Alt + T` to enable tiling.
+
+## Usage
 
 - Launch SmartGrid → nothing moves (you see the welcome message)
-- Press `Ctrl+Alt+T` → **BAM**. Instant perfect tiling + auto-retile activated
+- Press `Ctrl+Alt+T` → instant tiling + auto-retile activated
 - From now on: restore a window, minimize one, open whatever you want → layout updates **automatically**
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
 
-## Workspace System
+## Workspaces (per monitor)
 
 SmartGrid gives you **3 independent workspaces per monitor** — like having multiple virtual desktops, but better.
 
@@ -102,12 +82,10 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 → Switch contexts instantly without cluttering your taskbar!
 ```
 
-## Drag & Drop Snap Feature
-
-This is the one that makes people go **"wait… how?!"**
+## Drag & Drop Snap
 
 1. You have 6 windows tiled
-2. You grab **one** by the title bar 
+2. You grab **one** by the title bar
 3. **A blue preview rectangle appears** showing exactly where it will snap
 4. You **drop**
 → **BAM**. It snaps perfectly to the previewed position.
@@ -129,24 +107,19 @@ This is the one that makes people go **"wait… how?!"**
 **What happens if target workspace has windows?**  
 → They **merge** and re-tile together (like i3/Sway behavior)
 
-## Requirements
+## Notes / Troubleshooting
 
-- Windows 10 / 11 (64-bit)
-- Python 3.9+
-- `pywin32` and `pystray` Python package
+- **Maximize behavior:** while a window is maximized, SmartGrid intentionally avoids background reshuffles so other windows don’t move.
+- **Hotkeys don’t work:** another tool may be using the same shortcuts (PowerToys/FancyZones, DisplayFusion, etc.).
+- **Some windows don’t tile:** SmartGrid filters overlays/toasts/taskbar/etc. You can tune the rules in `is_useful_window()` in `smartgrid.py`.
+- **Border colors:** DWM border coloring works best on Windows 11; on some Windows 10 builds it may be ignored.
 
-## Install & Run
+## Contributing
 
-```bash
-git clone https://github.com/yourusername/smartgrid.git
-cd smartgrid
-python -m pip install pywin32 pystray
-python smartgrid.py
-```
-
-Press `Ctrl + Alt + T` → enjoy instant, perfect tiling.
-
-> If you have ideas to improve SmartGrid, your code and feedback are always welcome!
+Ideas, issues and PRs are welcome. For bug reports, please include:
+- Windows version (10/11 + build)
+- Monitor setup (count + resolution + scaling)
+- App names involved (and whether they were maximized/minimized/restored)
 
 ## Why This Script Exists
 
