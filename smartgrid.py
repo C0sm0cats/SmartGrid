@@ -735,7 +735,8 @@ class SmartGrid:
         self.layout_signature = {}
         self.layout_capacity = {}
         self._maximize_freeze_active = False
-        self.compact_on_minimize = False
+        self.compact_on_minimize = True
+        self.compact_on_close = True
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -1239,6 +1240,10 @@ class SmartGrid:
                         self.window_mgr.grid_state[hwnd] = (mon_idx, target_coord[0], target_coord[1])
                     slot_to_hwnd[target_coord] = hwnd
                     bisect.insort(filled_indices, target_idx)
+
+    def _compact_grid_after_close(self):
+        """Compact grid after a window closes (hybrid layout change)."""
+        self._compact_grid_after_minimize()
     
     def apply_grid_state(self):
         """Reapply all saved grid positions physically."""
@@ -2668,6 +2673,11 @@ class SmartGrid:
                 lambda: self.toggle_compact_on_minimize(),
                 checked=lambda item: self.compact_on_minimize
             ),
+            MenuItem(
+                f"Compact on Close: {'ON' if self.compact_on_close else 'OFF'}",
+                lambda: self.toggle_compact_on_close(),
+                checked=lambda item: self.compact_on_close
+            ),
             Menu.SEPARATOR,
             MenuItem('Workspaces', Menu(
                 MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: self.ws_switch(0)),
@@ -2711,6 +2721,26 @@ class SmartGrid:
         """Toggle compact-on-minimize behavior."""
         self.compact_on_minimize = not self.compact_on_minimize
         log(f"[SMARTGRID] Compact on minimize: {'ON' if self.compact_on_minimize else 'OFF'}")
+        # Prevent systray menu windows from triggering an immediate auto-retile.
+        now = time.time()
+        self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
+        visible_windows = self.window_mgr.get_visible_windows(
+            self.monitors_cache, self.overlay_hwnd
+        )
+        current_count = len(visible_windows)
+        with self.lock:
+            known_hwnds = (set(self.window_mgr.grid_state.keys()) |
+                           set(self.window_mgr.minimized_windows.keys()) |
+                           set(self.window_mgr.maximized_windows.keys()))
+        self.last_visible_count = current_count
+        self.last_known_count = len(known_hwnds)
+        self.last_retile_time = now
+        self.update_tray_menu()
+
+    def toggle_compact_on_close(self):
+        """Toggle compact-on-close behavior."""
+        self.compact_on_close = not self.compact_on_close
+        log(f"[SMARTGRID] Compact on close: {'ON' if self.compact_on_close else 'OFF'}")
         # Prevent systray menu windows from triggering an immediate auto-retile.
         now = time.time()
         self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
@@ -2896,6 +2926,7 @@ class SmartGrid:
                                        set(self.window_mgr.maximized_windows.keys()))
                     known_count = len(known_hwnds)
                     new_windows = [h for h in visible_hwnds if h not in known_hwnds]
+                    closed_windows = known_count < self.last_known_count
                     
                     # Debounced retiling
                     now = time.time()
@@ -2909,8 +2940,12 @@ class SmartGrid:
                             should_retile = True
 
                         if should_retile and now - self.last_retile_time >= RETILE_DEBOUNCE:
-                            log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
-                            self.smart_tile_with_restore()
+                            if self.compact_on_close and closed_windows and not new_windows:
+                                log(f"[AUTO-RETILE] close compaction {self.last_visible_count} → {current_count} windows")
+                                self._compact_grid_after_close()
+                            else:
+                                log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
+                                self.smart_tile_with_restore()
                             self.last_visible_count = current_count
                             self.last_known_count = known_count
                             self.last_retile_time = now
@@ -3010,7 +3045,8 @@ def show_hotkeys_tooltip():
             "Ctrl+Alt+M      →  Move workspace to next monitor\n"
             "Ctrl+Alt+F       →  Toggle Floating Selected Window\n\n"
             "---------- OPTIONS\n\n"
-            "Compact on Minimize → Fills empty slot\n\n"
+            "Compact on Minimize → Fills empty slot\n"
+            "Compact on Close   → Fills empty slot\n\n"
             "---------- WORKSPACES\n\n"
             "Ctrl+Alt+1/2/3   →  Switch workspace\n\n"
             "---------- EXIT\n\n"
