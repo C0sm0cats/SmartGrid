@@ -2688,6 +2688,8 @@ class SmartGrid:
                     if user32.IsWindow(hwnd):
                         set_window_border(hwnd, None)
                 self.window_mgr.grid_state.clear()
+        
+        self.update_tray_menu()
 
     def toggle_compact_on_minimize(self):
         """Toggle compact-on-minimize behavior."""
