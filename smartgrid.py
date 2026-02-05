@@ -316,7 +316,7 @@ def animate_window_move(hwnd, target_x, target_y, target_w, target_h):
         # Interpolation with easing
         for i in range(1, frames + 1):
             t = i / frames
-            ease = 1 - (1 - t) * (1 - t) * (1 - 2 * t)  # Bounce effect
+            ease = t * t * (3 - 2 * t)  # Smoothstep (no overshoot)
 
             x = start_x + (target_x - start_x) * ease
             y = start_y + (target_y - start_y) * ease
@@ -1169,6 +1169,22 @@ class SmartGrid:
                 grid_snapshot = dict(self.window_mgr.grid_state)
                 layout_signature = dict(self.layout_signature)
                 layout_capacity = dict(self.layout_capacity)
+
+            # Hybrid behavior: if the window count implies a different layout, retile fully.
+            counts_by_monitor = {}
+            for hwnd, (mon_idx, _, _) in grid_snapshot.items():
+                if user32.IsWindow(hwnd):
+                    counts_by_monitor[mon_idx] = counts_by_monitor.get(mon_idx, 0) + 1
+            for mon_idx, count in counts_by_monitor.items():
+                if count <= 0:
+                    continue
+                desired_layout, desired_info = self.layout_engine.choose_layout(count)
+                current_sig = layout_signature.get(mon_idx)
+                if current_sig is None or current_sig != (desired_layout, desired_info):
+                    with self.lock:
+                        self.ignore_retile_until = 0.0
+                    self.smart_tile_with_restore()
+                    return
 
             for mon_idx, (layout, info) in layout_signature.items():
                 capacity = layout_capacity.get(mon_idx, 0)
