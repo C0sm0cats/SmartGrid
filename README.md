@@ -4,11 +4,7 @@
 [![License](https://img.shields.io/github/license/C0sm0cats/SmartGrid)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/C0sm0cats/SmartGrid)
 
-> Dynamic tiling window manager for Windows — **pure Python** (Win32 + DWM)
-
 SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **workspaces per monitor** — with a system tray UI and global hotkeys.
-
-## Demo
 
 ![SmartGrid demo](demo.gif)
 
@@ -20,7 +16,8 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **works
 - **Swap Mode:** red border + arrow keys to swap with adjacent windows
 - **Floating windows toggle:** keep specific windows out of the grid (video/chat/reference)
 - **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
-- **System tray menu:** toggle tiling, retile, swap mode, move workspace, settings (gap/padding), hotkeys, quit
+- **Compact on minimize/close:** optional hybrid compaction (fills empty slots, retile only when layout must change)
+- **System tray menu:** toggle tiling, retile, swap mode, move workspace, compact options, settings (gap/padding), hotkeys, quit
 - **Active border:** green border follows the active tiled window
 
 ## Hotkeys
@@ -65,6 +62,7 @@ Press `Ctrl + Alt + T` to enable tiling.
 - From now on: restore a window, minimize one, open whatever you want → layout updates **automatically**
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
+- Use the tray menu to toggle **Compact on Minimize/Close** if you want layouts to stay gap‑free.
 
 ## Workspaces (per monitor)
 
@@ -113,6 +111,7 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 ## Notes / Troubleshooting
 
 - **Maximize behavior:** while a window is maximized, SmartGrid intentionally avoids background reshuffles so other windows don’t move.
+- **Compact behavior:** when enabled, closing or minimizing a tiled window fills the empty slot without a full retile unless the layout must change.
 - **Hotkeys don’t work:** another tool may be using the same shortcuts (PowerToys/FancyZones, DisplayFusion, etc.).
 - **Some windows don’t tile:** SmartGrid filters overlays/toasts/taskbar/etc. You can tune the rules in `is_useful_window()` in `smartgrid.py`.
 - **Border colors:** DWM border coloring works best on Windows 11; on some Windows 10 builds it may be ignored.
