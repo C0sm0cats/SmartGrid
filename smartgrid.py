@@ -11,6 +11,7 @@ import ctypes
 import time
 import threading
 import winsound
+import bisect
 from ctypes import wintypes
 import win32gui
 import win32api
@@ -734,6 +735,7 @@ class SmartGrid:
         self.layout_signature = {}
         self.layout_capacity = {}
         self._maximize_freeze_active = False
+        self.compact_on_minimize = False
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -1159,6 +1161,68 @@ class SmartGrid:
                 with self.lock:
                     self.ignore_retile_until = 0.0
                 self.smart_tile_with_restore()
+
+    def _compact_grid_after_minimize(self):
+        """Fill earliest empty slots by moving windows from the end of the layout."""
+        with self._tiling_lock:
+            with self.lock:
+                grid_snapshot = dict(self.window_mgr.grid_state)
+                layout_signature = dict(self.layout_signature)
+                layout_capacity = dict(self.layout_capacity)
+
+            for mon_idx, (layout, info) in layout_signature.items():
+                capacity = layout_capacity.get(mon_idx, 0)
+                if capacity <= 0 or mon_idx >= len(self.monitors_cache):
+                    continue
+
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx],
+                    capacity,
+                    self.gap,
+                    self.edge_padding,
+                    layout,
+                    info,
+                )
+                pos_map = dict(zip(grid_coords, positions))
+                order_index = {coord: i for i, coord in enumerate(grid_coords)}
+
+                slot_to_hwnd = {}
+                for hwnd, (m, col, row) in grid_snapshot.items():
+                    coord = (col, row)
+                    if m != mon_idx or coord not in pos_map:
+                        continue
+                    if not user32.IsWindow(hwnd):
+                        continue
+                    slot_to_hwnd[coord] = hwnd
+
+                if not slot_to_hwnd:
+                    continue
+
+                empty_indices = [
+                    order_index[coord]
+                    for coord in grid_coords
+                    if coord not in slot_to_hwnd
+                ]
+                if not empty_indices:
+                    continue
+
+                empty_indices.sort()
+                filled_indices = sorted(order_index[coord] for coord in slot_to_hwnd.keys())
+
+                while empty_indices and filled_indices and filled_indices[-1] > empty_indices[0]:
+                    donor_idx = filled_indices.pop(-1)
+                    target_idx = empty_indices.pop(0)
+
+                    donor_coord = grid_coords[donor_idx]
+                    target_coord = grid_coords[target_idx]
+                    hwnd = slot_to_hwnd.pop(donor_coord)
+
+                    x, y, w, h = pos_map[target_coord]
+                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                    with self.lock:
+                        self.window_mgr.grid_state[hwnd] = (mon_idx, target_coord[0], target_coord[1])
+                    slot_to_hwnd[target_coord] = hwnd
+                    bisect.insort(filled_indices, target_idx)
     
     def apply_grid_state(self):
         """Reapply all saved grid positions physically."""
@@ -2583,6 +2647,12 @@ class SmartGrid:
             MenuItem('Toggle Floating Selected Window (Ctrl+Alt+F)',
                      lambda: threading.Thread(target=self.toggle_floating_selected, daemon=True).start()),
             Menu.SEPARATOR,
+            MenuItem(
+                f"Compact on Minimize: {'ON' if self.compact_on_minimize else 'OFF'}",
+                lambda: self.toggle_compact_on_minimize(),
+                checked=lambda item: self.compact_on_minimize
+            ),
+            Menu.SEPARATOR,
             MenuItem('Workspaces', Menu(
                 MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: self.ws_switch(0)),
                 MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)', lambda: self.ws_switch(1)),
@@ -2618,7 +2688,25 @@ class SmartGrid:
                     if user32.IsWindow(hwnd):
                         set_window_border(hwnd, None)
                 self.window_mgr.grid_state.clear()
-        
+
+    def toggle_compact_on_minimize(self):
+        """Toggle compact-on-minimize behavior."""
+        self.compact_on_minimize = not self.compact_on_minimize
+        log(f"[SMARTGRID] Compact on minimize: {'ON' if self.compact_on_minimize else 'OFF'}")
+        # Prevent systray menu windows from triggering an immediate auto-retile.
+        now = time.time()
+        self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
+        visible_windows = self.window_mgr.get_visible_windows(
+            self.monitors_cache, self.overlay_hwnd
+        )
+        current_count = len(visible_windows)
+        with self.lock:
+            known_hwnds = (set(self.window_mgr.grid_state.keys()) |
+                           set(self.window_mgr.minimized_windows.keys()) |
+                           set(self.window_mgr.maximized_windows.keys()))
+        self.last_visible_count = current_count
+        self.last_known_count = len(known_hwnds)
+        self.last_retile_time = now
         self.update_tray_menu()
     
     def on_quit_from_tray(self, icon=None, item=None):
@@ -2753,7 +2841,10 @@ class SmartGrid:
                     if minimized_moved:
                         # Minimizing a tiled window reduces the effective count; do a single
                         # reflow so the remaining windows fill the layout.
-                        self.smart_tile_with_restore()
+                        if self.compact_on_minimize:
+                            self._compact_grid_after_minimize()
+                        else:
+                            self.smart_tile_with_restore()
 
                     visible_windows = self.window_mgr.get_visible_windows(
                         self.monitors_cache, self.overlay_hwnd
@@ -2900,6 +2991,8 @@ def show_hotkeys_tooltip():
             "Ctrl+Alt+S       →  Enter Swap Mode (red border + arrows)\n"
             "Ctrl+Alt+M      →  Move workspace to next monitor\n"
             "Ctrl+Alt+F       →  Toggle Floating Selected Window\n\n"
+            "---------- OPTIONS\n\n"
+            "Compact on Minimize → Fills empty slot\n\n"
             "---------- WORKSPACES\n\n"
             "Ctrl+Alt+1/2/3   →  Switch workspace\n\n"
             "---------- EXIT\n\n"
