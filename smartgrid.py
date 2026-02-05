@@ -434,6 +434,7 @@ class WindowManager:
         self.minimized_windows = {}
         self.maximized_windows = {}
         self.override_windows = set()  # Floating windows
+        self.float_restore_slots = {}  # hwnd → (monitor_idx, col, row)
         
         # Active/selected windows
         self.current_hwnd = None  # Green border
@@ -559,6 +560,11 @@ class WindowManager:
             ]
             for hwnd in dead_overrides:
                 self.override_windows.remove(hwnd)
+            
+            # Cleanup float_restore_slots
+            for hwnd in list(self.float_restore_slots.keys()):
+                if not user32.IsWindow(hwnd):
+                    self.float_restore_slots.pop(hwnd, None)
             
             # Cleanup cache
             for hwnd in list(self.useful_cache.keys()):
@@ -951,19 +957,34 @@ class SmartGrid:
                 time.sleep(0.015)
             else:
                 # Invalid or already occupied position
-                unassigned_windows.append((hwnd, title, rect, 0, 0, win_class))
+                desired = target_coords if (target_coords in pos_map and saved_col < 10 and saved_row < 10) else None
+                unassigned_windows.append((hwnd, title, rect, desired, win_class))
         
         # Phase 2: Assign remaining windows
         available_positions = [coord for coord in grid_coords if coord not in assigned]
+        coord_order = {coord: i for i, coord in enumerate(grid_coords)}
         
-        for i, (hwnd, title, rect, _, _, win_class) in enumerate(unassigned_windows):
-            if i < len(available_positions):
-                col, row = available_positions[i]
-                x, y, w, h = pos_map[(col, row)]
-                self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
-                new_grid[hwnd] = (mon_idx, col, row)
-                log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
-                time.sleep(0.015)
+        for hwnd, title, rect, desired, win_class in unassigned_windows:
+            if not available_positions:
+                break
+            
+            if desired and desired in pos_map:
+                col, row = min(
+                    available_positions,
+                    key=lambda coord: (
+                        abs(coord[0] - desired[0]) + abs(coord[1] - desired[1]),
+                        coord_order[coord],
+                    ),
+                )
+            else:
+                col, row = available_positions[0]
+            
+            available_positions.remove((col, row))
+            x, y, w, h = pos_map[(col, row)]
+            self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+            new_grid[hwnd] = (mon_idx, col, row)
+            log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
+            time.sleep(0.015)
 
     def _sync_window_state_changes(self):
         """Track min/max/restore state transitions for stable retile decisions."""
@@ -2307,6 +2328,13 @@ class SmartGrid:
                 self.window_mgr.override_windows.remove(hwnd)
                 log(f"[OVERRIDE] {title[:60]} → rollback to ({'tile' if default_useful else 'float'})")
                 if default_useful:
+                    restore_slot = self.window_mgr.float_restore_slots.get(hwnd)
+                    if restore_slot:
+                        mon_idx, col, row = restore_slot
+                        if 0 <= mon_idx < len(self.monitors_cache):
+                            with self.lock:
+                                if hwnd not in self.window_mgr.grid_state:
+                                    self.window_mgr.grid_state[hwnd] = (mon_idx, col, row)
                     self.smart_tile_with_restore()
                 winsound.PlaySound("SystemAsterisk", winsound.SND_ALIAS | winsound.SND_ASYNC)
             else:
@@ -2315,6 +2343,7 @@ class SmartGrid:
                 if default_useful:
                     with self.lock:
                         if hwnd in self.window_mgr.grid_state:
+                            self.window_mgr.float_restore_slots[hwnd] = self.window_mgr.grid_state[hwnd]
                             self.window_mgr.grid_state.pop(hwnd, None)
                     set_window_border(hwnd, None)
                 elif not default_useful:
