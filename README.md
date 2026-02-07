@@ -4,7 +4,7 @@
 [![License](https://img.shields.io/github/license/C0sm0cats/SmartGrid)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/C0sm0cats/SmartGrid)
 
-SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **workspaces per monitor** — with a system tray UI and global hotkeys.
+SmartGrid gives you instant tiling, drag & drop snapping, swap mode, a **Layout Manager**, and **workspaces per monitor** — with a system tray UI and global hotkeys.
 
 ![SmartGrid demo](demo.gif)
 
@@ -16,7 +16,8 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **works
 - **Swap Mode:** red border + arrow keys to swap with adjacent windows
 - **Floating windows toggle:** keep specific windows out of the grid (video/chat/reference)
 - **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
-- **Compact on minimize/close:** optional hybrid compaction (fills empty slots, retile only when layout must change)
+- **Layout Manager (`Ctrl+Alt+P`):** choose a target layout and assign windows/apps to slots visually
+- **Auto-Compact on minimize/close:** hybrid compaction (fills empty slots, retile only when layout must change)
 - **System tray menu:** toggle tiling, retile, swap mode, move workspace, compact options, settings (gap/padding), hotkeys, quit
 - **Active border:** green border follows the active tiled window
 
@@ -29,6 +30,7 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, and **works
 | `Ctrl + Alt + S`     | Enter Swap Mode (red border + arrows)                                       |
 | `Ctrl + Alt + M`     | Move current workspace to next monitor                                      |
 | `Ctrl + Alt + F`     | Toggle Floating Selected Window                                             |
+| `Ctrl + Alt + P`     | Open Layout Manager (manual layout assignment)                              |
 | `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
 | `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
 
@@ -60,9 +62,23 @@ Press `Ctrl + Alt + T` to enable tiling.
 - Launch SmartGrid → nothing moves (you see the welcome message)
 - Press `Ctrl+Alt+T` → instant tiling + auto-retile activated
 - From now on: restore a window, minimize one, open whatever you want → layout updates **automatically**
+- Press `Ctrl+Alt+P` any time to open **Layout Manager** and manually rebuild a layout by slot
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
-- Use the tray menu to toggle **Compact on Minimize/Close** if you want layouts to stay gap‑free.
+- Use the tray menu to toggle **Auto-Compact on Minimize/Close** if you want layouts to stay gap-free.
+
+## Layout Manager
+
+Use `Ctrl+Alt+P` (or tray menu) to open the visual layout picker.
+
+- Choose a layout preset (Full, Side-by-side, Master/Stack, Grid variants)
+- Assign visible windows/apps to target slots
+- Apply the layout instantly on the active monitor
+- Workspace-aware tabs let you target WS1/WS2/WS3
+
+Notes:
+- The manager works with currently visible/runnable windows on the active context.
+- It is optimized for fast manual reorganization, not persistent snapshot restore.
 
 ## Workspaces (per monitor)
 
@@ -112,7 +128,8 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 
 - **Maximize behavior:** while a window is maximized, SmartGrid intentionally avoids background reshuffles so other windows don’t move.
 - **Compact behavior:** when enabled, closing or minimizing a tiled window fills the empty slot without a full retile unless the layout must change.
-- **Hotkeys don’t work:** another tool may be using the same shortcuts (PowerToys/FancyZones, DisplayFusion, etc.).
+- **Layout Manager behavior:** slot assignment is based on windows visible in the current context (monitor/workspace).
+- **Hotkeys don’t work:** another application may already be using the same global shortcut.
 - **Some windows don’t tile:** SmartGrid filters overlays/toasts/taskbar/etc. You can tune the rules in `is_useful_window()` in `smartgrid.py`.
 - **Border colors:** DWM border coloring works best on Windows 11; on some Windows 10 builds it may be ignored.
 

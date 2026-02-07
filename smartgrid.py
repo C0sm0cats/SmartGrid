@@ -6,7 +6,6 @@ Author: C0sm0cats (2025)
 """
 
 import os
-import sys
 import ctypes
 import time
 import threading
@@ -87,9 +86,12 @@ HOTKEY_SWAP_UP = 9008
 HOTKEY_SWAP_DOWN = 9009
 HOTKEY_SWAP_CONFIRM = 9010
 HOTKEY_FLOAT_TOGGLE = 9011
+HOTKEY_LAYOUT_PICKER = 9012
 
 # Custom messages
 CUSTOM_TOGGLE_SWAP = 0x9000
+CUSTOM_OPEN_LAYOUT_PICKER = 0x9001
+CUSTOM_OPEN_SETTINGS = 0x9002
 
 # Win32 API
 user32 = ctypes.WinDLL('user32', use_last_error=True)
@@ -244,7 +246,7 @@ def is_useful_window(title, class_name="", hwnd=None):
         "notification", "toast", "popup", "tooltip", "splash", "alert", "flyout",
         "volume control", "brightness", "program manager", "start", "cortana", "search",
         "realtek audio console", "operationstatuswindow", "shell_secondarytraywnd",
-        "smartgrid settings", "tk"
+        "smartgrid settings", "smartgrid layout manager", "tk"
     ]
 
     if any(bad in title_lower for bad in bad_titles):
@@ -446,6 +448,7 @@ class WindowManager:
         # Cache for is_useful_window
         self.useful_cache = {}  # hwnd → (timestamp, is_useful)
         self.cache_ttl = CACHE_TTL
+        self.last_cleanup_minimized_moved = 0
         
         # Thread safety
         self.lock = threading.Lock()
@@ -524,6 +527,8 @@ class WindowManager:
     def cleanup_dead_windows(self):
         """Remove dead windows from grid_state and override_windows."""
         dead_windows = []
+        minimized_moved = 0
+        maximized_moved = 0
         
         with self.lock:
             for hwnd in list(self.grid_state.keys()):
@@ -536,10 +541,12 @@ class WindowManager:
                 if state == 'minimized':
                     self.minimized_windows[hwnd] = self.grid_state[hwnd]
                     self.grid_state.pop(hwnd, None)
+                    minimized_moved += 1
                     continue
                 if state == 'maximized':
                     self.maximized_windows[hwnd] = self.grid_state[hwnd]
                     self.grid_state.pop(hwnd, None)
+                    maximized_moved += 1
                     continue
                 
                 if not user32.IsWindowVisible(hwnd):
@@ -571,6 +578,7 @@ class WindowManager:
             for hwnd in list(self.useful_cache.keys()):
                 if not user32.IsWindow(hwnd):
                     del self.useful_cache[hwnd]
+            self.last_cleanup_minimized_moved = minimized_moved
         
         if dead_windows:
             log(f"[CLEAN] Removed {len(dead_windows)} dead windows")
@@ -723,7 +731,7 @@ class SmartGrid:
         self.edge_padding = DEFAULT_EDGE_PADDING
         
         # Runtime flags
-        self.is_active = False
+        self.is_active = True
         self.swap_mode_lock = False
         self.move_monitor_lock = False
         self.workspace_switching_lock = False
@@ -737,6 +745,7 @@ class SmartGrid:
         self._maximize_freeze_active = False
         self.compact_on_minimize = True
         self.compact_on_close = True
+        self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -751,6 +760,9 @@ class SmartGrid:
         self._wnd_proc_ref = None  # Keep reference to prevent GC
         self.overlay_brush = None  # Reusable GDI objects
         self.overlay_pen = None
+        self._layout_picker_lock = threading.Lock()
+        self._layout_picker_open = False
+        self._layout_picker_hwnd = None
         
         # Threading
         self.lock = threading.Lock()
@@ -773,6 +785,267 @@ class SmartGrid:
             self.workspaces[i] = [{}, {}, {}]
             self.current_workspace[i] = 0
         log(f"Initialized {len(self.monitors_cache)} × 3 workspaces")
+
+    def _reconcile_workspaces_after_monitor_change(self, new_monitors):
+        """Preserve workspace state by monitor index when display count changes."""
+        new_count = len(new_monitors)
+        new_workspaces = {}
+        new_current_workspace = {}
+
+        with self.lock:
+            old_workspaces = dict(self.workspaces)
+            old_current_workspace = dict(self.current_workspace)
+            old_layout_signature = dict(self.layout_signature)
+            old_layout_capacity = dict(self.layout_capacity)
+
+            for i in range(new_count):
+                ws_maps = old_workspaces.get(i)
+                if isinstance(ws_maps, list) and len(ws_maps) == 3:
+                    rebuilt = []
+                    for ws_map in ws_maps:
+                        rebuilt.append(dict(ws_map) if isinstance(ws_map, dict) else {})
+                    new_workspaces[i] = rebuilt
+                else:
+                    new_workspaces[i] = [{}, {}, {}]
+
+                ws_idx = old_current_workspace.get(i, 0)
+                new_current_workspace[i] = ws_idx if ws_idx in (0, 1, 2) else 0
+
+            self.monitors_cache = list(new_monitors)
+            self.workspaces = new_workspaces
+            self.current_workspace = new_current_workspace
+
+            if self.current_monitor_index >= new_count:
+                self.current_monitor_index = max(0, new_count - 1)
+
+            self.layout_signature = {
+                mon: sig for mon, sig in old_layout_signature.items()
+                if mon < new_count
+            }
+            self.layout_capacity = {
+                mon: cap for mon, cap in old_layout_capacity.items()
+                if mon < new_count
+            }
+
+    # ==========================================================================
+    # LAYOUT HELPERS (Manual layout picker)
+    # ==========================================================================
+
+    def _layout_label(self, layout, info):
+        if layout == "full":
+            return "Full"
+        if layout == "side_by_side":
+            return "Side-by-side"
+        if layout == "master_stack":
+            return "Master Stack"
+        if layout == "grid":
+            cols, rows = info if info else (2, 2)
+            return f"Grid {cols}x{rows}"
+        return layout
+
+    def _get_layout_presets(self):
+        return [
+            ("Full", ("full", None)),
+            ("Side-by-side", ("side_by_side", None)),
+            ("Master Stack", ("master_stack", None)),
+            ("Grid 2x2", ("grid", (2, 2))),
+            ("Grid 3x2", ("grid", (3, 2))),
+            ("Grid 3x3", ("grid", (3, 3))),
+            ("Grid 4x3", ("grid", (4, 3))),
+            ("Grid 5x3", ("grid", (5, 3))),
+        ]
+
+    def _get_monitor_index_for_rect(self, rect):
+        w_center_x = (rect.left + rect.right) // 2
+        w_center_y = (rect.top + rect.bottom) // 2
+        mon_idx = 0
+        for i, (mx, my, mw, mh) in enumerate(self.monitors_cache):
+            if mx <= w_center_x < mx + mw and my <= w_center_y < my + mh:
+                mon_idx = i
+                break
+        return mon_idx
+
+    def _build_window_descriptor(self, hwnd):
+        try:
+            title = win32gui.GetWindowText(hwnd)
+        except Exception:
+            title = ""
+        process = get_process_name(hwnd)
+        return {"title": title, "process": process}
+
+    def _get_window_choices_for_monitor(self, mon_idx):
+        """Return list of (hwnd, descriptor) for windows on a monitor (visible + minimized/maximized)."""
+        choices = []
+        seen = set()
+        active_ws = self.current_workspace.get(mon_idx, 0)
+        visible = self.window_mgr.get_visible_windows(self.monitors_cache, self.overlay_hwnd)
+        for hwnd, _title, rect in visible:
+            if self._get_monitor_index_for_rect(rect) != mon_idx:
+                continue
+            choices.append((hwnd, self._build_window_descriptor(hwnd)))
+            seen.add(hwnd)
+
+        with self.lock:
+            minimized_snapshot = dict(self.window_mgr.minimized_windows)
+            maximized_snapshot = dict(self.window_mgr.maximized_windows)
+            grid_snapshot = dict(self.window_mgr.grid_state)
+            state_ws_snapshot = dict(self.window_state_ws)
+
+        for hwnd, (m, _c, _r) in minimized_snapshot.items():
+            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
+                continue
+            origin_ws = state_ws_snapshot.get(hwnd)
+            if origin_ws is not None and origin_ws != active_ws:
+                continue
+            if origin_ws is None:
+                owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
+                if owner_ws is not None and owner_ws != active_ws:
+                    continue
+            choices.append((hwnd, self._build_window_descriptor(hwnd)))
+            seen.add(hwnd)
+
+        for hwnd, (m, _c, _r) in maximized_snapshot.items():
+            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
+                continue
+            origin_ws = state_ws_snapshot.get(hwnd)
+            if origin_ws is not None and origin_ws != active_ws:
+                continue
+            if origin_ws is None:
+                owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
+                if owner_ws is not None and owner_ws != active_ws:
+                    continue
+            choices.append((hwnd, self._build_window_descriptor(hwnd)))
+            seen.add(hwnd)
+
+        # Ensure all currently tiled windows are included, even if filtered by title/class.
+        for hwnd, (m, _c, _r) in grid_snapshot.items():
+            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
+                continue
+            choices.append((hwnd, self._build_window_descriptor(hwnd)))
+            seen.add(hwnd)
+
+        if not choices:
+            def enum(hwnd, _):
+                try:
+                    if not user32.IsWindowVisible(hwnd):
+                        return True
+                    state = get_window_state(hwnd)
+                    if state not in ("normal", "maximized"):
+                        return True
+                    rect = wintypes.RECT()
+                    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        return True
+                    w = rect.right - rect.left
+                    h = rect.bottom - rect.top
+                    if w <= MIN_WINDOW_WIDTH or h <= MIN_WINDOW_HEIGHT:
+                        return True
+                    if self._get_monitor_index_for_rect(rect) != mon_idx:
+                        return True
+                    title_buf = ctypes.create_unicode_buffer(256)
+                    user32.GetWindowTextW(hwnd, title_buf, 256)
+                    title = title_buf.value or ""
+                    class_name = win32gui.GetClassName(hwnd)
+                    if not is_useful_window(title, class_name, hwnd):
+                        return True
+                    if hwnd in seen:
+                        return True
+                    choices.append((hwnd, self._build_window_descriptor(hwnd)))
+                    seen.add(hwnd)
+                except Exception:
+                    pass
+                return True
+
+            try:
+                user32.EnumWindows(
+                    ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum), 0
+                )
+            except Exception:
+                pass
+
+        return choices
+
+    def _apply_manual_layout(self, mon_idx, layout, info, assignments):
+        """Apply manual layout with explicit slot assignments."""
+        capacity = self._layout_capacity(layout, info)
+        if not assignments or len(assignments) > capacity:
+            return False
+
+        selected_hwnds = set(assignments.values())
+
+        monitor_rect = self.monitors_cache[mon_idx]
+        positions, grid_coords = self.layout_engine.calculate_positions(
+            monitor_rect, capacity, self.gap, self.edge_padding, layout, info
+        )
+        pos_map = dict(zip(grid_coords, positions))
+
+        # Ensure selected windows are visible before tiling.
+        for hwnd in selected_hwnds:
+            state = get_window_state(hwnd)
+            if state in ("minimized", "maximized"):
+                try:
+                    user32.ShowWindowAsync(hwnd, SW_RESTORE)
+                except Exception:
+                    pass
+            elif state == "hidden":
+                try:
+                    user32.ShowWindowAsync(hwnd, SW_SHOWNORMAL)
+                except Exception:
+                    pass
+
+        visible = self.window_mgr.get_visible_windows(self.monitors_cache, self.overlay_hwnd)
+        visible_on_mon = []
+        for hwnd, _title, rect in visible:
+            if self._get_monitor_index_for_rect(rect) == mon_idx:
+                visible_on_mon.append(hwnd)
+
+        with self._tiling_lock:
+            with self.lock:
+                active_ws = self.current_workspace.get(mon_idx, 0)
+                for hwnd in selected_hwnds:
+                    self.window_mgr.override_windows.discard(hwnd)
+                # Hide non-selected visible windows on this monitor, but do not persist
+                # manager-specific exclusions in override_windows.
+                for hwnd in visible_on_mon:
+                    if hwnd not in selected_hwnds:
+                        pos = self.window_mgr.grid_state.get(hwnd)
+                        if pos:
+                            self.window_mgr.minimized_windows[hwnd] = pos
+                        self.window_mgr.maximized_windows.pop(hwnd, None)
+                        self.window_state_ws[hwnd] = active_ws
+                        try:
+                            user32.ShowWindowAsync(hwnd, win32con.SW_MINIMIZE)
+                        except Exception:
+                            pass
+                    else:
+                        self.window_mgr.override_windows.discard(hwnd)
+                        self.window_state_ws.pop(hwnd, None)
+                        self.window_mgr.minimized_windows.pop(hwnd, None)
+
+                # Remove any non-selected windows from grid_state on this monitor.
+                for hwnd, (m, c, r) in list(self.window_mgr.grid_state.items()):
+                    if m == mon_idx and hwnd not in selected_hwnds:
+                        self.window_mgr.grid_state.pop(hwnd, None)
+                        if hwnd not in self.window_mgr.minimized_windows:
+                            self.window_mgr.minimized_windows[hwnd] = (m, c, r)
+                        self.window_state_ws[hwnd] = active_ws
+
+                # Apply assigned slots.
+                for (col, row), hwnd in assignments.items():
+                    self.window_mgr.grid_state[hwnd] = (mon_idx, col, row)
+                    self.window_state_ws.pop(hwnd, None)
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+
+            for (col, row), hwnd in assignments.items():
+                if (col, row) in pos_map:
+                    x, y, w, h = pos_map[(col, row)]
+                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                    time.sleep(0.01)
+
+        self.layout_signature[mon_idx] = (layout, info)
+        self.layout_capacity[mon_idx] = capacity
+        self.ignore_retile_until = time.time() + 0.3
+        return True
     
     # ==========================================================================
     # TILING LOGIC
@@ -790,6 +1063,7 @@ class SmartGrid:
                 
                 # Cleanup
                 self.window_mgr.cleanup_dead_windows()
+                self._backfill_window_state_ws_locked()
                 self.window_mgr.cleanup_ghost_windows()
             
             # Get visible windows (no lock needed)
@@ -881,6 +1155,7 @@ class SmartGrid:
             minimized_snapshot = dict(self.window_mgr.minimized_windows)
             maximized_snapshot = dict(self.window_mgr.maximized_windows)
             grid_snapshot = dict(self.window_mgr.grid_state)
+            state_ws_snapshot = dict(self.window_state_ws)
         
         for hwnd, title, rect in visible_windows:
             win_class = get_window_class(hwnd)
@@ -897,19 +1172,31 @@ class SmartGrid:
             
             # Check for saved position (use snapshots)
             if hwnd in minimized_snapshot:
-                mon_idx, col, row = minimized_snapshot[hwnd]
-                # Atomic removal
+                mon_idx = physical_mon_idx
+                col, row = 0, 0
+                active_ws = self.current_workspace.get(mon_idx, 0)
+                origin_ws = state_ws_snapshot.get(hwnd)
+                slot = self._get_workspace_slot(mon_idx, active_ws, hwnd)
+                can_restore = slot is not None and (origin_ws is None or origin_ws == active_ws)
+                if can_restore:
+                    col, row = slot
+                    log(f"[RESTORE] Restoring minimized window to ({col},{row}): {title[:40]}")
                 with self.lock:
-                    if hwnd in self.window_mgr.minimized_windows:
-                        del self.window_mgr.minimized_windows[hwnd]
-                log(f"[RESTORE] Restoring minimized window to ({col},{row}): {title[:40]}")
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    self.window_state_ws.pop(hwnd, None)
             elif hwnd in maximized_snapshot:
-                mon_idx, col, row = maximized_snapshot[hwnd]
-                # Atomic removal
+                mon_idx = physical_mon_idx
+                col, row = 0, 0
+                active_ws = self.current_workspace.get(mon_idx, 0)
+                origin_ws = state_ws_snapshot.get(hwnd)
+                slot = self._get_workspace_slot(mon_idx, active_ws, hwnd)
+                can_restore = slot is not None and (origin_ws is None or origin_ws == active_ws)
+                if can_restore:
+                    col, row = slot
+                    log(f"[RESTORE] Restoring maximized window to ({col},{row}): {title[:40]}")
                 with self.lock:
-                    if hwnd in self.window_mgr.maximized_windows:
-                        del self.window_mgr.maximized_windows[hwnd]
-                log(f"[RESTORE] Restoring maximized window to ({col},{row}): {title[:40]}")
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+                    self.window_state_ws.pop(hwnd, None)
             elif hwnd in grid_snapshot:
                 mon_idx, col, row = grid_snapshot[hwnd]
             else:
@@ -995,6 +1282,11 @@ class SmartGrid:
         minimized_moved = 0
         maximized_moved = 0
         with self.lock:
+            # Cleanup stale state markers.
+            for hwnd in list(self.window_state_ws.keys()):
+                if not user32.IsWindow(hwnd):
+                    self.window_state_ws.pop(hwnd, None)
+
             # Move minimized/maximized windows out of grid_state (keep their slot)
             for hwnd, (mon, col, row) in list(self.window_mgr.grid_state.items()):
                 if not user32.IsWindow(hwnd):
@@ -1002,10 +1294,12 @@ class SmartGrid:
                 state = get_window_state(hwnd)
                 if state == 'minimized':
                     self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
+                    self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.grid_state.pop(hwnd, None)
                     minimized_moved += 1
                 elif state == 'maximized':
                     self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
+                    self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.grid_state.pop(hwnd, None)
                     maximized_moved += 1
 
@@ -1016,11 +1310,29 @@ class SmartGrid:
                     continue
                 state = get_window_state(hwnd)
                 if state == 'normal' and user32.IsWindowVisible(hwnd):
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        mon = self._get_monitor_index_for_rect(rect)
+                    active_ws = self.current_workspace.get(mon, 0)
+                    origin_ws = self.window_state_ws.get(hwnd)
+                    slot = self._get_workspace_slot(mon, active_ws, hwnd)
+                    if origin_ws is not None and origin_ws != active_ws and slot is None:
+                        self.window_mgr.minimized_windows.pop(hwnd, None)
+                        self.window_state_ws.pop(hwnd, None)
+                        continue
+                    if slot is None:
+                        # No slot for this window in active workspace: treat it as new there.
+                        self.window_mgr.minimized_windows.pop(hwnd, None)
+                        self.window_state_ws.pop(hwnd, None)
+                        continue
+                    col, row = slot
                     self.window_mgr.minimized_windows.pop(hwnd, None)
+                    self.window_state_ws.pop(hwnd, None)
                     self.window_mgr.grid_state[hwnd] = (mon, col, row)
                     restored.append((hwnd, mon, col, row))
                 elif state == 'maximized':
                     self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
+                    self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     maximized_moved += 1
 
@@ -1031,11 +1343,29 @@ class SmartGrid:
                     continue
                 state = get_window_state(hwnd)
                 if state == 'normal' and user32.IsWindowVisible(hwnd):
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        mon = self._get_monitor_index_for_rect(rect)
+                    active_ws = self.current_workspace.get(mon, 0)
+                    origin_ws = self.window_state_ws.get(hwnd)
+                    slot = self._get_workspace_slot(mon, active_ws, hwnd)
+                    if origin_ws is not None and origin_ws != active_ws and slot is None:
+                        self.window_mgr.maximized_windows.pop(hwnd, None)
+                        self.window_state_ws.pop(hwnd, None)
+                        continue
+                    if slot is None:
+                        # No slot for this window in active workspace: treat it as new there.
+                        self.window_mgr.maximized_windows.pop(hwnd, None)
+                        self.window_state_ws.pop(hwnd, None)
+                        continue
+                    col, row = slot
                     self.window_mgr.maximized_windows.pop(hwnd, None)
+                    self.window_state_ws.pop(hwnd, None)
                     self.window_mgr.grid_state[hwnd] = (mon, col, row)
                     restored.append((hwnd, mon, col, row))
                 elif state == 'minimized':
                     self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
+                    self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.maximized_windows.pop(hwnd, None)
                     minimized_moved += 1
 
@@ -1067,10 +1397,6 @@ class SmartGrid:
         return counts
 
     def _get_layout_count_for_monitor(self, mon_idx):
-        with self.lock:
-            base = self.layout_capacity.get(mon_idx, 0)
-        if base > 0:
-            return base
         count = 0
         with self.lock:
             for hwnd, (m, _, _) in self.window_mgr.grid_state.items():
@@ -1080,6 +1406,50 @@ class SmartGrid:
             return 0
         layout, info = self.layout_engine.choose_layout(count)
         return self._layout_capacity(layout, info)
+
+    def _find_workspace_owner(self, mon_idx, hwnd, prefer_ws=None):
+        """Return workspace index that references hwnd on monitor mon_idx, else None."""
+        ws_list = self.workspaces.get(mon_idx, [])
+        if prefer_ws is not None and 0 <= prefer_ws < len(ws_list):
+            if hwnd in ws_list[prefer_ws]:
+                return prefer_ws
+        for ws_idx, ws_map in enumerate(ws_list):
+            if hwnd in ws_map:
+                return ws_idx
+        return None
+
+    def _get_workspace_slot(self, mon_idx, ws_idx, hwnd):
+        """Return (col,row) from saved workspace map if present and valid."""
+        ws_list = self.workspaces.get(mon_idx, [])
+        if ws_idx is None or ws_idx < 0 or ws_idx >= len(ws_list):
+            return None
+        data = ws_list[ws_idx].get(hwnd)
+        if not isinstance(data, dict):
+            return None
+        grid = data.get("grid")
+        if isinstance(grid, (list, tuple)) and len(grid) == 2:
+            try:
+                return int(grid[0]), int(grid[1])
+            except Exception:
+                return None
+        return None
+
+    def _backfill_window_state_ws_locked(self):
+        """Fill missing workspace markers for windows cached in min/max maps."""
+        for hwnd, (mon, _, _) in self.window_mgr.minimized_windows.items():
+            if hwnd not in self.window_state_ws:
+                active_ws = self.current_workspace.get(mon, 0)
+                owner_ws = self._find_workspace_owner(mon, hwnd, prefer_ws=active_ws)
+                self.window_state_ws[hwnd] = owner_ws if owner_ws is not None else active_ws
+        for hwnd, (mon, _, _) in self.window_mgr.maximized_windows.items():
+            if hwnd not in self.window_state_ws:
+                active_ws = self.current_workspace.get(mon, 0)
+                owner_ws = self._find_workspace_owner(mon, hwnd, prefer_ws=active_ws)
+                self.window_state_ws[hwnd] = owner_ws if owner_ws is not None else active_ws
+
+    def _backfill_window_state_ws(self):
+        with self.lock:
+            self._backfill_window_state_ws_locked()
 
     def _restore_windows_to_slots(self, restored):
         """Place restored windows back into their saved slots."""
@@ -1980,7 +2350,6 @@ class SmartGrid:
         last_valid_rect = None
 
         WM_NCHITTEST = 0x0084
-        HTCLIENT = 1
         HTCAPTION = 2
         
         while not self._stop_event.is_set():
@@ -2031,7 +2400,7 @@ class SmartGrid:
                         except Exception:
                             hit = None
 
-                        if hit in (HTCAPTION, HTCLIENT):
+                        if hit == HTCAPTION:
                             with self.lock:
                                 is_in_grid = hwnd in self.window_mgr.grid_state
                             if is_in_grid:
@@ -2120,6 +2489,7 @@ class SmartGrid:
             grid_snapshot = dict(self.window_mgr.grid_state)
             minimized_snapshot = dict(self.window_mgr.minimized_windows)
             maximized_snapshot = dict(self.window_mgr.maximized_windows)
+            state_ws_snapshot = dict(self.window_state_ws)
         
         # Save normal windows
         for hwnd, (mon, col, row) in grid_snapshot.items():
@@ -2147,21 +2517,41 @@ class SmartGrid:
         
         # Save minimized windows
         for hwnd, (mon, col, row) in minimized_snapshot.items():
-            if mon == monitor_idx and user32.IsWindow(hwnd):
-                self.workspaces[monitor_idx][ws][hwnd] = {
-                    'pos': (0, 0, 800, 600),
-                    'grid': (col, row),
-                    'state': 'minimized'
-                }
+            if mon != monitor_idx or not user32.IsWindow(hwnd):
+                continue
+            origin_ws = state_ws_snapshot.get(hwnd)
+            if origin_ws is not None and origin_ws != ws:
+                continue
+            if origin_ws is None:
+                owner_ws = self._find_workspace_owner(monitor_idx, hwnd, prefer_ws=ws)
+                if owner_ws is not None and owner_ws != ws:
+                    continue
+            if hwnd in self.workspaces[monitor_idx][ws]:
+                continue
+            self.workspaces[monitor_idx][ws][hwnd] = {
+                'pos': (0, 0, 800, 600),
+                'grid': (col, row),
+                'state': 'minimized'
+            }
         
         # Save maximized windows
         for hwnd, (mon, col, row) in maximized_snapshot.items():
-            if mon == monitor_idx and user32.IsWindow(hwnd):
-                self.workspaces[monitor_idx][ws][hwnd] = {
-                    'pos': (0, 0, 800, 600),
-                    'grid': (col, row),
-                    'state': 'maximized'
-                }
+            if mon != monitor_idx or not user32.IsWindow(hwnd):
+                continue
+            origin_ws = state_ws_snapshot.get(hwnd)
+            if origin_ws is not None and origin_ws != ws:
+                continue
+            if origin_ws is None:
+                owner_ws = self._find_workspace_owner(monitor_idx, hwnd, prefer_ws=ws)
+                if owner_ws is not None and owner_ws != ws:
+                    continue
+            if hwnd in self.workspaces[monitor_idx][ws]:
+                continue
+            self.workspaces[monitor_idx][ws][hwnd] = {
+                'pos': (0, 0, 800, 600),
+                'grid': (col, row),
+                'state': 'maximized'
+            }
         
         log(f"[WS] ✓ Workspace {ws+1} saved ({len(self.workspaces[monitor_idx][ws])} windows)")
     
@@ -2177,7 +2567,8 @@ class SmartGrid:
             return
         
         log(f"[WS] Loading workspace {ws_idx+1}...")
-        self.ignore_retile_until = time.time() + 2.0
+        # Short guard while toggling window visibility during workspace load.
+        self.ignore_retile_until = time.time() + 0.35
         
         grid_updates = {}
         minimized_updates = {}
@@ -2188,7 +2579,6 @@ class SmartGrid:
                 continue
             
             try:
-                x, y, w, h = data['pos']
                 col, row = data['grid']
                 saved_state = data.get('state', 'normal')
                 
@@ -2215,28 +2605,35 @@ class SmartGrid:
         with self.lock:
             for hwnd, pos in minimized_updates.items():
                 self.window_mgr.minimized_windows[hwnd] = pos
+                self.window_state_ws[hwnd] = ws_idx
                 self.window_mgr.grid_state.pop(hwnd, None)
                 self.window_mgr.maximized_windows.pop(hwnd, None)
             
             for hwnd, pos in maximized_updates.items():
                 self.window_mgr.maximized_windows[hwnd] = pos
+                self.window_state_ws[hwnd] = ws_idx
                 self.window_mgr.grid_state.pop(hwnd, None)
                 self.window_mgr.minimized_windows.pop(hwnd, None)
             
             for hwnd, pos in grid_updates.items():
                 self.window_mgr.grid_state[hwnd] = pos
+                self.window_state_ws.pop(hwnd, None)
                 self.window_mgr.minimized_windows.pop(hwnd, None)
                 self.window_mgr.maximized_windows.pop(hwnd, None)
         
         time.sleep(0.15)
+        # Force one immediate retile for the target workspace now that grid_state is ready.
+        self.ignore_retile_until = 0.0
         self.smart_tile_with_restore()
         log(f"[WS] ✓ Workspace {ws_idx+1} restored")
-        self.ignore_retile_until = time.time() + 2.0
+        # Keep a small debounce window only.
+        self.ignore_retile_until = time.time() + 0.35
     
     def ws_switch(self, ws_idx):
         """Switch to specified workspace."""
         self.workspace_switching_lock = True
         time.sleep(0.25)
+        was_active = self.is_active
         
         try:
             mon = self.current_monitor_index
@@ -2249,25 +2646,34 @@ class SmartGrid:
                 log(f"[WS] Already on workspace {ws_idx+1}")
                 return
             
-            was_active = self.is_active
             self.is_active = False
+            # Flush pending min/max transitions before persisting workspace map.
+            self._sync_window_state_changes()
             
             # Save current
             self.save_workspace(mon)
             
-            # Hide current windows
+            # Hide and clear all runtime states from current workspace on this monitor.
             hidden = 0
             with self.lock:
-                for hwnd, (mon_idx, col, row) in list(self.window_mgr.grid_state.items()):
-                    if mon_idx == mon and user32.IsWindow(hwnd):
+                source_ws = self.current_workspace.get(mon, 0)
+                source_map = dict(self.workspaces.get(mon, [{}, {}, {}])[source_ws])
+                for hwnd in list(source_map.keys()):
+                    if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
                         user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
-                        del self.window_mgr.grid_state[hwnd]
                         hidden += 1
+                    self.window_mgr.grid_state.pop(hwnd, None)
+                    self.window_mgr.minimized_windows.pop(hwnd, None)
+                    self.window_mgr.maximized_windows.pop(hwnd, None)
+                    self.window_state_ws.pop(hwnd, None)
             
             log(f"[WS] Hidden {hidden} windows from workspace {self.current_workspace.get(mon, 0)+1}")
             
             # Switch
             self.current_workspace[mon] = ws_idx
+            # Workspace changed: drop monitor-local layout caches to avoid stale restore math.
+            self.layout_signature.pop(mon, None)
+            self.layout_capacity.pop(mon, None)
             
             # Load new
             time.sleep(0.1)
@@ -2284,7 +2690,6 @@ class SmartGrid:
                                          len(self.window_mgr.maximized_windows))
             
             time.sleep(0.2)
-            self.is_active = was_active
             
             log(f"[WS] ✓ Switched to workspace {ws_idx+1}")
         
@@ -2292,6 +2697,7 @@ class SmartGrid:
             log(f"[ERROR] ws_switch: {e}")
         
         finally:
+            self.is_active = was_active
             self.workspace_switching_lock = False
     
     def move_current_workspace_to_next_monitor(self):
@@ -2300,89 +2706,158 @@ class SmartGrid:
         time.sleep(0.25)
         
         try:
-            if not self.window_mgr.grid_state:
-                log("[MOVE] Nothing to move")
-                return
-            
             if len(self.monitors_cache) <= 1:
                 log("[MOVE] Only one monitor")
+                try:
+                    ctypes.windll.user32.MessageBoxW(
+                        0,
+                        "Move Workspace to Next Monitor is unavailable:\nonly one monitor is detected.",
+                        "SmartGrid",
+                        0x40 | 0x00010000 | 0x00040000
+                    )
+                except Exception:
+                    pass
                 return
             
             old_mon = self.current_monitor_index
             old_ws = self.current_workspace.get(old_mon, 0)
+            new_mon = (old_mon + 1) % len(self.monitors_cache)
+
+            # Flush pending transitions and snapshot current workspace first.
+            self._sync_window_state_changes()
             self.save_workspace(old_mon)
-            
-            new_mon = (self.current_monitor_index + 1) % len(self.monitors_cache)
-            self.current_monitor_index = new_mon
-            
-            monitor_rect = self.monitors_cache[new_mon]
-            mon_x, mon_y, mon_w, mon_h = monitor_rect
-            
+
             with self.lock:
-                grid_snapshot = list(self.window_mgr.grid_state.items())
-            
-            windows_to_move = [
-                (hwnd, pos) for hwnd, pos in grid_snapshot
-                if pos[0] == old_mon and user32.IsWindow(hwnd)
-            ]
-            
-            if not windows_to_move:
-                log(f"[MOVE] No windows to move from monitor {old_mon+1}")
+                source_ws_map = dict(self.workspaces.get(old_mon, [{}])[old_ws])
+
+            moved_hwnds = [hwnd for hwnd in source_ws_map.keys() if user32.IsWindow(hwnd)]
+            if not moved_hwnds:
+                log(f"[MOVE] No windows to move from monitor {old_mon+1} workspace {old_ws+1}")
                 return
-            
-            count = len(windows_to_move)
-            layout, info = self.layout_engine.choose_layout(count)
-            
-            time.sleep(0.05)
-            
-            positions, grid_coords = self.layout_engine.calculate_positions(
-                monitor_rect, count, self.gap, self.edge_padding, layout, info
-            )
-            
-            new_grid = {}
+
+            # Separate normal/minimized/maximized so the move includes all workspace states.
+            normal_hwnds = []
+            minimized_hwnds = []
+            maximized_hwnds = []
+            for hwnd in moved_hwnds:
+                state = get_window_state(hwnd)
+                if state == "minimized":
+                    minimized_hwnds.append(hwnd)
+                elif state == "maximized":
+                    maximized_hwnds.append(hwnd)
+                else:
+                    normal_hwnds.append(hwnd)
+
+            monitor_rect = self.monitors_cache[new_mon]
+            new_grid = {}  # hwnd -> (new_mon, col, row) for normal windows moved now.
             log(f"\n[MOVE] Moving workspace {old_ws+1} from monitor {old_mon+1} → {new_mon+1}")
-            
+
             with self._tiling_lock:
-                for i, (hwnd, (old_idx, col, row)) in enumerate(windows_to_move):
-                    x, y, w, h = positions[i]
-                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
-                    
-                    # Assign grid position
-                    if layout == "full":
-                        new_grid[hwnd] = (new_mon, 0, 0)
-                    elif layout == "side_by_side":
-                        new_col = 0 if i == 0 else 1
-                        new_grid[hwnd] = (new_mon, new_col, 0)
-                    elif layout == "master_stack":
-                        if i == 0:
-                            new_grid[hwnd] = (new_mon, 0, 0)
-                        elif i == 1:
-                            new_grid[hwnd] = (new_mon, 1, 0)
-                        elif i == 2:
-                            new_grid[hwnd] = (new_mon, 1, 1)
-                    else:  # grid
-                        cols, rows = info
-                        new_grid[hwnd] = (new_mon, i % cols, i // cols)
-                    
-                    title = win32gui.GetWindowText(hwnd)
-                    log(f"   -> {title[:50]}")
-                    time.sleep(0.015)
-                
-                # Update grid_state with lock
+                if normal_hwnds:
+                    count = len(normal_hwnds)
+                    layout, info = self.layout_engine.choose_layout(count)
+                    positions, grid_coords = self.layout_engine.calculate_positions(
+                        monitor_rect, count, self.gap, self.edge_padding, layout, info
+                    )
+                    for i, hwnd in enumerate(normal_hwnds):
+                        x, y, w, h = positions[i]
+                        self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                        col, row = grid_coords[i]
+                        new_grid[hwnd] = (new_mon, col, row)
+                        title = win32gui.GetWindowText(hwnd)
+                        log(f"   -> {title[:50]}")
+                        time.sleep(0.015)
+
+                # Transactional state update.
                 with self.lock:
-                    for hwnd, _ in windows_to_move:
+                    # Remove moved windows from runtime caches on old monitor.
+                    for hwnd in moved_hwnds:
                         self.window_mgr.grid_state.pop(hwnd, None)
+                        self.window_mgr.minimized_windows.pop(hwnd, None)
+                        self.window_mgr.maximized_windows.pop(hwnd, None)
+
+                    # Reinsert moved normal windows on new monitor.
                     self.window_mgr.grid_state.update(new_grid)
-            
+
+                    # Keep moved minimized/maximized windows tracked on destination monitor.
+                    for hwnd in minimized_hwnds:
+                        data = source_ws_map.get(hwnd, {})
+                        grid = data.get("grid", (0, 0)) if isinstance(data, dict) else (0, 0)
+                        col, row = (grid[0], grid[1]) if isinstance(grid, (list, tuple)) and len(grid) == 2 else (0, 0)
+                        self.window_mgr.minimized_windows[hwnd] = (new_mon, int(col), int(row))
+                        self.window_state_ws[hwnd] = old_ws
+                    for hwnd in maximized_hwnds:
+                        data = source_ws_map.get(hwnd, {})
+                        grid = data.get("grid", (0, 0)) if isinstance(data, dict) else (0, 0)
+                        col, row = (grid[0], grid[1]) if isinstance(grid, (list, tuple)) and len(grid) == 2 else (0, 0)
+                        self.window_mgr.maximized_windows[hwnd] = (new_mon, int(col), int(row))
+                        self.window_state_ws[hwnd] = old_ws
+                    for hwnd in normal_hwnds:
+                        self.window_state_ws.pop(hwnd, None)
+
+                    # Move workspace snapshot: source -> destination (same ws index), without global save pollution.
+                    moved_payload = {}
+                    for hwnd in moved_hwnds:
+                        data = source_ws_map.get(hwnd)
+                        if not isinstance(data, dict):
+                            continue
+                        cloned = dict(data)
+                        if hwnd in new_grid:
+                            _m, c, r = new_grid[hwnd]
+                            cloned["grid"] = (c, r)
+                            cloned["state"] = "normal"
+                        moved_payload[hwnd] = cloned
+
+                    # Remove moved hwnds from any other workspace map to avoid duplicates.
+                    for ws_idx, ws_map in enumerate(self.workspaces.get(old_mon, [])):
+                        if ws_idx == old_ws or not isinstance(ws_map, dict):
+                            continue
+                        for hwnd in moved_hwnds:
+                            ws_map.pop(hwnd, None)
+                    for ws_idx, ws_map in enumerate(self.workspaces.get(new_mon, [])):
+                        if not isinstance(ws_map, dict):
+                            continue
+                        for hwnd in moved_hwnds:
+                            ws_map.pop(hwnd, None)
+
+                    self.workspaces[old_mon][old_ws] = {}
+                    self.workspaces[new_mon][old_ws] = moved_payload
+
+                    # Invalidate stale monitor layout caches after move.
+                    self.layout_signature.pop(old_mon, None)
+                    self.layout_capacity.pop(old_mon, None)
+                    self.layout_signature.pop(new_mon, None)
+                    self.layout_capacity.pop(new_mon, None)
+
+                    # Update active workspace on destination monitor, then switch current monitor.
+                    self.current_workspace[new_mon] = old_ws
+                    self.current_monitor_index = new_mon
+
             time.sleep(0.15)
-            
+
+            # Reflow destination monitor once after transaction.
+            self.ignore_retile_until = 0.0
+            self.smart_tile_with_restore()
+
             active = user32.GetForegroundWindow()
             if active and user32.IsWindowVisible(active):
                 self.window_mgr.apply_border(active, 0x0000FF00)
-            
-            self.current_workspace[new_mon] = old_ws
-            self.save_workspace(new_mon)
-            
+
+            # Refresh counters/debounce to avoid immediate storm.
+            visible_windows = self.window_mgr.get_visible_windows(
+                self.monitors_cache, self.overlay_hwnd
+            )
+            self.last_visible_count = len(visible_windows)
+            with self.lock:
+                self.last_known_count = (
+                    len(self.window_mgr.grid_state)
+                    + len(self.window_mgr.minimized_windows)
+                    + len(self.window_mgr.maximized_windows)
+                )
+            now = time.time()
+            self.last_retile_time = now
+            self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
+
             log(f"[MOVE] ✓ Workspace {old_ws+1} now on monitor {new_mon+1}")
         
         except Exception as e:
@@ -2443,6 +2918,19 @@ class SmartGrid:
     # ==========================================================================
     # SETTINGS
     # ==========================================================================
+
+    def _center_tk_window(self, window, width, height):
+        """Center a Tk/Toplevel window on screen with fixed size."""
+        try:
+            window.update_idletasks()
+            screen_w = window.winfo_screenwidth()
+            screen_h = window.winfo_screenheight()
+            x = max(0, (screen_w - width) // 2)
+            y = max(0, (screen_h - height) // 2)
+            window.geometry(f"{width}x{height}+{x}+{y}")
+        except Exception:
+            # Non-fatal: fallback to caller's existing geometry.
+            pass
     
     def show_settings_dialog(self):
         """Show settings dialog to modify GAP and EDGE_PADDING."""
@@ -2459,9 +2947,9 @@ class SmartGrid:
             
             dialog = tk.Toplevel(root)
             dialog.title("SmartGrid Settings")
-            dialog.geometry("350x250")
             dialog.attributes('-topmost', True)
             dialog.resizable(False, False)
+            self._center_tk_window(dialog, 350, 250)
             
             title = tk.Label(dialog, text="SmartGrid Settings", font=("Arial", 12, "bold"))
             title.pack(pady=10)
@@ -2565,6 +3053,7 @@ class SmartGrid:
         
         # Clean up dead windows
         self.window_mgr.cleanup_dead_windows()
+        self._backfill_window_state_ws()
         self.window_mgr.cleanup_ghost_windows()
         
         # Temporarily block drag & drop
@@ -2602,6 +3091,7 @@ class SmartGrid:
             (HOTKEY_WS2, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('2')),
             (HOTKEY_WS3, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('3')),
             (HOTKEY_FLOAT_TOGGLE, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('F')),
+            (HOTKEY_LAYOUT_PICKER, win32con.MOD_CONTROL | win32con.MOD_ALT, ord('P')),
         ]
         
         failed = []
@@ -2616,13 +3106,26 @@ class SmartGrid:
         
         if failed:
             log(f"[WARN] {len(failed)} hotkeys failed to register")
+            if HOTKEY_LAYOUT_PICKER in failed:
+                try:
+                    ctypes.windll.user32.MessageBoxW(
+                        0,
+                        "Ctrl+Alt+P hotkey failed to register.\n"
+                        "It may already be used by another program.\n\n"
+                        "You can still open the Layout Picker from the systray menu.",
+                        "SmartGrid Hotkey",
+                        0x30
+                    )
+                except Exception:
+                    pass
         else:
             log("[HOTKEYS] All hotkeys registered successfully")
     
     def unregister_hotkeys(self):
         """Unregister all hotkeys."""
         for hk in (HOTKEY_TOGGLE, HOTKEY_RETILE, HOTKEY_QUIT, HOTKEY_MOVE_MONITOR,
-                   HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3, HOTKEY_FLOAT_TOGGLE):
+                   HOTKEY_SWAP_MODE, HOTKEY_WS1, HOTKEY_WS2, HOTKEY_WS3,
+                   HOTKEY_FLOAT_TOGGLE, HOTKEY_LAYOUT_PICKER):
             try:
                 user32.UnregisterHotKey(None, hk)
             except Exception:
@@ -2667,26 +3170,31 @@ class SmartGrid:
                      lambda: threading.Thread(target=self.move_current_workspace_to_next_monitor, daemon=True).start()),
             MenuItem('Toggle Floating Selected Window (Ctrl+Alt+F)',
                      lambda: threading.Thread(target=self.toggle_floating_selected, daemon=True).start()),
+            MenuItem('Layout Manager (Ctrl+Alt+P)',
+                     lambda: user32.PostThreadMessageW(self.main_thread_id, CUSTOM_OPEN_LAYOUT_PICKER, 0, 0)),
             Menu.SEPARATOR,
             MenuItem(
-                f"Compact on Minimize: {'ON' if self.compact_on_minimize else 'OFF'}",
+                f"Auto-Compact on Minimize: {'ON' if self.compact_on_minimize else 'OFF'}",
                 lambda: self.toggle_compact_on_minimize(),
                 checked=lambda item: self.compact_on_minimize
             ),
             MenuItem(
-                f"Compact on Close: {'ON' if self.compact_on_close else 'OFF'}",
+                f"Auto-Compact on Close: {'ON' if self.compact_on_close else 'OFF'}",
                 lambda: self.toggle_compact_on_close(),
                 checked=lambda item: self.compact_on_close
             ),
             Menu.SEPARATOR,
             MenuItem('Workspaces', Menu(
-                MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)', lambda: self.ws_switch(0)),
-                MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)', lambda: self.ws_switch(1)),
-                MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)', lambda: self.ws_switch(2)),
+                MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)',
+                         lambda: threading.Thread(target=self.ws_switch, args=(0,), daemon=True).start()),
+                MenuItem('Switch to Workspace 2 (Ctrl+Alt+2)',
+                         lambda: threading.Thread(target=self.ws_switch, args=(1,), daemon=True).start()),
+                MenuItem('Switch to Workspace 3 (Ctrl+Alt+3)',
+                         lambda: threading.Thread(target=self.ws_switch, args=(2,), daemon=True).start()),
             )),
             Menu.SEPARATOR,
             MenuItem('Settings (Gap & Padding)',
-                     lambda: threading.Thread(target=self.show_settings_dialog, daemon=True).start()),
+                     lambda: user32.PostThreadMessageW(self.main_thread_id, CUSTOM_OPEN_SETTINGS, 0, 0)),
             MenuItem('Hotkeys Cheatsheet', lambda: threading.Thread(target=show_hotkeys_tooltip, daemon=True).start()),
             MenuItem('Quit SmartGrid (Ctrl+Alt+Q)', self.on_quit_from_tray)
         )
@@ -2710,17 +3218,28 @@ class SmartGrid:
             self.smart_tile_with_restore()
         else:
             with self.lock:
-                for hwnd in list(self.window_mgr.grid_state.keys()):
+                # Purge all runtime tiling state so next ON starts clean.
+                known_hwnds = (
+                    set(self.window_mgr.grid_state.keys())
+                    | set(self.window_mgr.minimized_windows.keys())
+                    | set(self.window_mgr.maximized_windows.keys())
+                )
+                for hwnd in known_hwnds:
                     if user32.IsWindow(hwnd):
                         set_window_border(hwnd, None)
                 self.window_mgr.grid_state.clear()
+                self.window_mgr.minimized_windows.clear()
+                self.window_mgr.maximized_windows.clear()
+                self.window_state_ws.clear()
+                self.last_visible_count = 0
+                self.last_known_count = 0
         
         self.update_tray_menu()
 
     def toggle_compact_on_minimize(self):
         """Toggle compact-on-minimize behavior."""
         self.compact_on_minimize = not self.compact_on_minimize
-        log(f"[SMARTGRID] Compact on minimize: {'ON' if self.compact_on_minimize else 'OFF'}")
+        log(f"[SMARTGRID] Auto-compact on minimize: {'ON' if self.compact_on_minimize else 'OFF'}")
         # Prevent systray menu windows from triggering an immediate auto-retile.
         now = time.time()
         self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
@@ -2740,7 +3259,7 @@ class SmartGrid:
     def toggle_compact_on_close(self):
         """Toggle compact-on-close behavior."""
         self.compact_on_close = not self.compact_on_close
-        log(f"[SMARTGRID] Compact on close: {'ON' if self.compact_on_close else 'OFF'}")
+        log(f"[SMARTGRID] Auto-compact on close: {'ON' if self.compact_on_close else 'OFF'}")
         # Prevent systray menu windows from triggering an immediate auto-retile.
         now = time.time()
         self.ignore_retile_until = max(self.ignore_retile_until, now + 0.35)
@@ -2756,12 +3275,561 @@ class SmartGrid:
         self.last_known_count = len(known_hwnds)
         self.last_retile_time = now
         self.update_tray_menu()
+
+    def show_layout_picker(self):
+        """Manual layout picker (choose layout + assign windows)."""
+        with self._layout_picker_lock:
+            if self._layout_picker_open:
+                return
+            self._layout_picker_open = True
+
+        old_ignore = self.ignore_retile_until
+        self.ignore_retile_until = float('inf')
+        self.drag_drop_lock = True
+        try:
+            mon_idx = self.current_monitor_index
+            with self.lock:
+                active_ws_at_open = self.current_workspace.get(mon_idx, 0)
+                active_grid_count = sum(
+                    1
+                    for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items()
+                    if m == mon_idx and user32.IsWindow(hwnd)
+                )
+                current_layout_sig = self.layout_signature.get(mon_idx)
+            current_layout = (
+                self.layout_engine.choose_layout(active_grid_count)
+                if active_grid_count > 0
+                else current_layout_sig
+            )
+
+            import tkinter as tk
+            import tkinter.font as tkfont
+            from tkinter import ttk, messagebox
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+
+            dialog = tk.Toplevel(root)
+            dialog.title("SmartGrid Layout Manager")
+            dialog.geometry("660x620")
+            dialog.attributes("-topmost", True)
+            dialog.resizable(False, False)
+            with self._layout_picker_lock:
+                self._layout_picker_hwnd = int(dialog.winfo_id())
+
+            accent = "#3A7BD5"
+            accent_dark = "#2E64AE"
+            accent_hover = "#2F6FD0"
+            section_bg = "#F5F5F7"
+
+            header = tk.Label(
+                dialog,
+                text="Layout Manager",
+                font=("Arial", 12, "bold"),
+                bg=accent,
+                fg="white",
+            )
+            header.pack(fill=tk.X, pady=(8, 6))
+
+            layout_frame = tk.LabelFrame(
+                dialog,
+                text="🧩 Choose Layout to Customize",
+                padx=10,
+                pady=10,
+                font=("Arial", 9, "bold"),
+                bg=section_bg,
+            )
+            layout_frame.pack(fill=tk.X, padx=12, pady=6)
+
+            layout_presets = self._get_layout_presets()
+            layout_labels = [label for label, _ in layout_presets]
+
+            def get_default_label():
+                default = layout_labels[0]
+                if current_layout:
+                    cur_label = self._layout_label(*current_layout)
+                    if cur_label in layout_labels:
+                        return cur_label
+                return default
+
+            layout_var = tk.StringVar(value=get_default_label())
+
+            note_frame = tk.Frame(layout_frame, bg=section_bg)
+            note_frame.pack(fill=tk.X, padx=4, pady=(0, 6))
+            tk.Label(
+                note_frame,
+                text="This section applies only to the active monitor.",
+                font=("Arial", 8),
+                fg="gray",
+                bg=section_bg,
+                anchor="w",
+            ).pack(side=tk.LEFT)
+
+            monitor_badge = tk.Label(
+                note_frame,
+                text=f"CURRENT MONITOR {mon_idx + 1} · WS{active_ws_at_open + 1}",
+                font=("Arial", 8, "bold"),
+                bg="#EFEFEF",
+                fg="#444444",
+                padx=6,
+                pady=1,
+                relief="solid",
+                bd=1,
+            )
+            monitor_badge.pack(side=tk.LEFT, padx=(8, 0))
+
+            current_badge = tk.Label(
+                note_frame,
+                text="CURRENT",
+                font=("Arial", 8, "bold"),
+                bg="#E7F1FF",
+                fg=accent_dark,
+                padx=6,
+                pady=1,
+                relief="solid",
+                bd=1,
+            )
+            current_badge.pack(side=tk.LEFT, padx=(6, 0))
+
+            layout_top = tk.Frame(layout_frame, bg=section_bg)
+            layout_top.pack(fill=tk.X)
+            layout_top.columnconfigure(0, weight=0)
+            layout_top.columnconfigure(1, weight=0)
+            layout_top.columnconfigure(2, weight=1)
+
+            layout_combo = ttk.Combobox(
+                layout_top,
+                textvariable=layout_var,
+                values=layout_labels,
+                state="readonly",
+                width=24,
+            )
+            layout_combo.grid(row=0, column=0, padx=5, sticky="w")
+            tk.Frame(layout_top, bg=section_bg).grid(row=0, column=2, sticky="ew")
+            current_badge.pack_forget()
+
+            layout_canvas = tk.Canvas(
+                layout_frame,
+                height=120,
+                bg="white",
+                highlightthickness=1,
+                highlightbackground="#cfcfcf",
+            )
+            layout_canvas.pack(fill=tk.X, pady=(6, 2))
+
+            font = tkfont.nametofont("TkDefaultFont")
+            screen_w = dialog.winfo_screenwidth()
+            display_labels = []
+            label_to_hwnd = {}
+            hwnd_to_label = {}
+            combo_width = 30
+            dialog_size = {"width": 620}
+
+            def refresh_window_choices():
+                nonlocal display_labels, label_to_hwnd, hwnd_to_label, combo_width
+                window_choices = self._get_window_choices_for_monitor(mon_idx)
+                display_labels = []
+                label_to_hwnd = {}
+                hwnd_to_label = {}
+                for idx, (hwnd, desc) in enumerate(window_choices, start=1):
+                    title = desc.get("title") or "(untitled)"
+                    proc = desc.get("process") or "unknown"
+                    label = f"{idx}. {title} [{proc}]"
+                    display_labels.append(label)
+                    label_to_hwnd[label] = hwnd
+                    hwnd_to_label[hwnd] = label
+
+                max_label_len = max((len(label) for label in display_labels), default=40)
+                max_label_px = max((font.measure(label) for label in display_labels), default=320)
+                slot_label_px = font.measure("Slot 99 (9,9)") + 20
+                combo_px = max_label_px + 40
+                combo_width = max(30, max_label_len + 2)
+                dialog_width = max(620, slot_label_px + combo_px + 120)
+                dialog_width = min(screen_w - 80, dialog_width)
+                if dialog_width > dialog_size["width"]:
+                    dialog_size["width"] = dialog_width
+                    cur_h = dialog.winfo_height() or 620
+                    dialog.geometry(f"{dialog_size['width']}x{cur_h}")
+                return bool(display_labels)
+
+            refresh_window_choices()
+            dialog.geometry(f"{dialog_size['width']}x620")
+            self._center_tk_window(dialog, dialog_size["width"], 620)
+
+            slots_frame = tk.LabelFrame(
+                dialog,
+                text="🧷 Assign windows/apps to slots",
+                padx=10,
+                pady=10,
+                font=("Arial", 9, "bold"),
+                bg=section_bg,
+            )
+            slots_frame.pack(fill=tk.X, expand=False, padx=12, pady=6)
+
+            slot_vars = []
+            slot_widgets = []
+            apply_btn = None
+
+            def resize_dialog_to_content():
+                dialog.update_idletasks()
+                req_h = dialog.winfo_reqheight()
+                target_height = max(340, req_h + 10)
+                dialog.geometry(f"{dialog_size['width']}x{target_height}")
+
+            def draw_layout_preview(positions, grid_coords, selected_coords=None):
+                layout_canvas.delete("all")
+                layout_canvas.update_idletasks()
+                cw = layout_canvas.winfo_width()
+                ch = layout_canvas.winfo_height()
+                if cw < 10:
+                    cw = layout_canvas.winfo_reqwidth() or 220
+                if ch < 10:
+                    ch = layout_canvas.winfo_reqheight() or 120
+                pad = 6
+                selected_coords = selected_coords or set()
+
+                if not positions:
+                    return
+                min_x = min(x for x, y, w, h in positions)
+                min_y = min(y for x, y, w, h in positions)
+                max_x = max(x + w for x, y, w, h in positions)
+                max_y = max(y + h for x, y, w, h in positions)
+                span_x = max(1, max_x - min_x)
+                span_y = max(1, max_y - min_y)
+                scale = min((cw - 2 * pad) / span_x, (ch - 2 * pad) / span_y)
+
+                for i, (pos, coord) in enumerate(zip(positions, grid_coords), start=1):
+                    x, y, w, h = pos
+                    sx = pad + (x - min_x) * scale
+                    sy = pad + (y - min_y) * scale
+                    sw = w * scale
+                    sh = h * scale
+                    fill = "#D7E6FA" if coord in selected_coords else "white"
+                    layout_canvas.create_rectangle(sx, sy, sx + sw, sy + sh, outline="#4a4a4a", fill=fill)
+                    layout_canvas.create_text(sx + sw / 2, sy + sh / 2, text=str(i), fill="#555", font=("Arial", 8))
+
+            def close_picker():
+                try:
+                    if dialog.winfo_exists():
+                        dialog.destroy()
+                except Exception:
+                    pass
+                try:
+                    if root.winfo_exists():
+                        root.destroy()
+                except Exception:
+                    pass
+
+            def poll_shutdown():
+                # If a global quit is requested (e.g. from systray), close picker promptly.
+                try:
+                    if not dialog.winfo_exists():
+                        return
+                    if self._stop_event.is_set():
+                        close_picker()
+                        return
+                    dialog.after(120, poll_shutdown)
+                except Exception:
+                    pass
+
+            def quit_from_picker(_event=None):
+                close_picker()
+                threading.Thread(target=self.on_quit_from_tray, daemon=True).start()
+                return "break"
+
+            def add_hover(button, base_color, hover_color):
+                def _enter(_):
+                    if str(button["state"]) != "disabled":
+                        button.config(bg=hover_color)
+
+                def _leave(_):
+                    if str(button["state"]) != "disabled":
+                        button.config(bg=base_color)
+
+                button.bind("<Enter>", _enter)
+                button.bind("<Leave>", _leave)
+
+            def update_current_badge():
+                with self.lock:
+                    grid_count = sum(
+                        1
+                        for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items()
+                        if m == mon_idx and user32.IsWindow(hwnd)
+                    )
+                    sig = self.layout_signature.get(mon_idx)
+                    ws_num = self.current_workspace.get(mon_idx, active_ws_at_open) + 1
+                monitor_badge.config(text=f"CURRENT MONITOR {mon_idx + 1} · WS{ws_num}")
+                cur_layout = self.layout_engine.choose_layout(grid_count) if grid_count > 0 else sig
+                if not cur_layout:
+                    if current_badge.winfo_manager():
+                        current_badge.pack_forget()
+                    return
+                cur_label = self._layout_label(*cur_layout)
+                current_badge.config(text=f"CURRENT · {cur_label}")
+                if layout_var.get() == cur_label:
+                    if not current_badge.winfo_manager():
+                        current_badge.pack(side=tk.LEFT, padx=(6, 0))
+                else:
+                    if current_badge.winfo_manager():
+                        current_badge.pack_forget()
+
+            def update_apply_state():
+                if apply_btn is None:
+                    return
+                filled = sum(1 for _coord, var in slot_vars if var.get().strip())
+                apply_btn.config(state=tk.NORMAL if filled > 0 else tk.DISABLED)
+
+            def get_current_grid_prefill(layout, info, grid_coords):
+                """Return { (col,row): display_label } for current active grid when layout matches."""
+                with self.lock:
+                    active_ws = self.current_workspace.get(mon_idx, active_ws_at_open)
+                    sig = self.layout_signature.get(mon_idx)
+                    grid_items = [
+                        (hwnd, c, r)
+                        for hwnd, (m, c, r) in self.window_mgr.grid_state.items()
+                        if m == mon_idx and user32.IsWindow(hwnd)
+                    ]
+
+                # Keep only windows that belong to the currently active workspace.
+                filtered = []
+                for hwnd, c, r in grid_items:
+                    owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
+                    if owner_ws is not None and owner_ws != active_ws:
+                        continue
+                    filtered.append((hwnd, c, r))
+
+                if sig is not None:
+                    current_layout = sig
+                else:
+                    current_layout = self.layout_engine.choose_layout(len(filtered)) if filtered else None
+
+                if current_layout != (layout, info):
+                    return {}
+
+                valid_coords = set(grid_coords)
+                prefill = {}
+                for hwnd, c, r in filtered:
+                    coord = (c, r)
+                    if coord not in valid_coords:
+                        continue
+                    label = hwnd_to_label.get(hwnd)
+                    if label:
+                        prefill[coord] = label
+                return prefill
+
+            def rebuild_slots(*_):
+                nonlocal combo_width
+                for w in slots_frame.winfo_children():
+                    w.destroy()
+                slot_vars.clear()
+                slot_widgets.clear()
+                no_windows_available = not display_labels
+
+                sel_label = layout_var.get()
+                sel_idx = layout_combo.current()
+                if sel_idx is not None and sel_idx >= 0:
+                    layout, info = layout_presets[sel_idx][1]
+                else:
+                    layout, info = dict(layout_presets).get(sel_label, ("full", None))
+
+                capacity = self._layout_capacity(layout, info)
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx], capacity, self.gap, self.edge_padding, layout, info
+                )
+
+                if no_windows_available:
+                    tk.Label(
+                        slots_frame,
+                        text="No windows detected on this monitor. Slots are shown for preview.",
+                        font=("Arial", 9, "italic"),
+                        fg="gray",
+                        bg=section_bg,
+                        anchor="w",
+                    ).pack(anchor="w", pady=(0, 4))
+
+                for i, (col, row) in enumerate(grid_coords, start=1):
+                    row_frame = tk.Frame(slots_frame, bg=section_bg)
+                    row_frame.pack(fill=tk.X, pady=2)
+                    row_frame.columnconfigure(1, weight=1)
+
+                    tk.Label(
+                        row_frame,
+                        text=f"Slot {i} ({col},{row})",
+                        width=16,
+                        anchor="w",
+                        bg=section_bg,
+                    ).grid(row=0, column=0, sticky="w")
+
+                    var = tk.StringVar()
+                    combo = ttk.Combobox(
+                        row_frame,
+                        textvariable=var,
+                        values=display_labels if display_labels else [],
+                        state="readonly" if display_labels else "disabled",
+                        width=combo_width,
+                    )
+                    combo.grid(row=0, column=1, sticky="ew", padx=5)
+
+                    proc_label = tk.Label(
+                        row_frame,
+                        text="",
+                        fg=accent,
+                        bg=section_bg,
+                        font=("Arial", 8, "bold"),
+                        anchor="w",
+                    )
+                    proc_label.grid(row=0, column=2, sticky="e", padx=6)
+
+                    slot_vars.append(((col, row), var))
+                    slot_widgets.append((var, combo, proc_label))
+
+                def update_proc_label(label_text, target_label):
+                    if not label_text:
+                        target_label.config(text="")
+                        return
+                    if "[" in label_text and "]" in label_text:
+                        proc = label_text[label_text.rfind("[") + 1: label_text.rfind("]")]
+                        target_label.config(text=proc)
+                    else:
+                        target_label.config(text="")
+
+                def get_selected_coords():
+                    return {coord for coord, var in slot_vars if var.get().strip()}
+
+                def refresh_options(*_):
+                    for v, c, pl in slot_widgets:
+                        c["values"] = display_labels
+                        update_proc_label(v.get().strip(), pl)
+                    update_apply_state()
+                    draw_layout_preview(positions, grid_coords, get_selected_coords())
+
+                def on_select(current_var):
+                    label = current_var.get().strip()
+                    if not label:
+                        return
+                    for v, _c, _pl in slot_widgets:
+                        if v is not current_var and v.get() == label:
+                            v.set("")
+                    refresh_options()
+
+                def on_combo_selected(current_var, current_proc_label):
+                    on_select(current_var)
+                    update_proc_label(current_var.get(), current_proc_label)
+
+                for v, c, pl in slot_widgets:
+                    c.bind("<<ComboboxSelected>>", lambda _e, var=v, pl=pl: on_combo_selected(var, pl))
+
+                # Auto-prefill from currently active tiled grid when selected layout matches it.
+                prefill_by_coord = get_current_grid_prefill(layout, info, grid_coords)
+                for coord, var in slot_vars:
+                    label = prefill_by_coord.get(coord)
+                    if label:
+                        var.set(label)
+
+                refresh_options()
+                draw_layout_preview(positions, grid_coords, get_selected_coords())
+                layout_canvas.after(0, lambda p=positions, g=grid_coords: draw_layout_preview(p, g, get_selected_coords()))
+                update_current_badge()
+                resize_dialog_to_content()
+
+            def apply_layout():
+                sel_label = layout_var.get()
+                sel_idx = layout_combo.current()
+                if sel_idx is not None and sel_idx >= 0:
+                    layout, info = layout_presets[sel_idx][1]
+                else:
+                    layout, info = dict(layout_presets).get(sel_label, ("full", None))
+
+                assignments = {}
+                used = set()
+                for (col, row), var in slot_vars:
+                    label = var.get().strip()
+                    if not label:
+                        continue
+                    hwnd = label_to_hwnd.get(label)
+                    if hwnd is None:
+                        messagebox.showwarning("SmartGrid", "Invalid window selection.")
+                        return
+                    if hwnd in used:
+                        messagebox.showwarning("SmartGrid", "Duplicate window selected.")
+                        return
+                    used.add(hwnd)
+                    assignments[(col, row)] = hwnd
+
+                if not assignments:
+                    messagebox.showwarning("SmartGrid", "Select at least one slot to apply.")
+                    return
+                if not self._apply_manual_layout(mon_idx, layout, info, assignments):
+                    messagebox.showwarning("SmartGrid", "Failed to apply layout.")
+                    return
+                close_picker()
+
+            apply_btn = tk.Button(
+                layout_top,
+                text="Apply Layout",
+                command=apply_layout,
+                width=14,
+                bg=accent,
+                fg="white",
+                activebackground=accent_dark,
+                activeforeground="white",
+            )
+            apply_btn.grid(row=0, column=1, padx=6, sticky="w")
+            add_hover(apply_btn, accent, accent_hover)
+
+            layout_combo.bind("<<ComboboxSelected>>", rebuild_slots)
+            layout_var.trace_add("write", lambda *_: rebuild_slots())
+            refresh_window_choices()
+            rebuild_slots()
+            update_apply_state()
+
+            btn_frame = tk.Frame(dialog)
+            btn_frame.pack(pady=8)
+            tk.Button(btn_frame, text="Cancel", command=close_picker, width=10).pack(side=tk.LEFT, padx=6)
+            # Recompute final size after footer buttons are created, so Cancel is never clipped.
+            resize_dialog_to_content()
+
+            dialog.protocol("WM_DELETE_WINDOW", close_picker)
+            dialog.bind("<Control-Alt-q>", quit_from_picker)
+            dialog.bind("<Control-Alt-Q>", quit_from_picker)
+            dialog.after(120, poll_shutdown)
+            dialog.mainloop()
+
+        except Exception as e:
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+                err_root = tk.Tk()
+                err_root.withdraw()
+                err_root.attributes("-topmost", True)
+                messagebox.showerror("SmartGrid Layout Manager", f"Layout Manager failed to open:\n{e}")
+                err_root.destroy()
+            except Exception:
+                pass
+            log(f"[ERROR] show_layout_picker: {e}")
+        finally:
+            self.ignore_retile_until = old_ignore
+            self.drag_drop_lock = False
+            with self._layout_picker_lock:
+                self._layout_picker_open = False
+                self._layout_picker_hwnd = None
     
     def on_quit_from_tray(self, icon=None, item=None):
         """Quit from systray."""
         log("[TRAY] Quit requested")
         
         try:
+            # If the layout picker is open, ask Windows to close it first so
+            # the main thread can return from Tk mainloop.
+            with self._layout_picker_lock:
+                picker_hwnd = self._layout_picker_hwnd
+            if picker_hwnd and user32.IsWindow(picker_hwnd):
+                try:
+                    user32.PostMessageW(picker_hwnd, win32con.WM_CLOSE, 0, 0)
+                except Exception:
+                    pass
+
             # Stop the systray icon
             if self.tray_icon:
                 self.tray_icon.stop()
@@ -2831,8 +3899,7 @@ class SmartGrid:
                 current_monitors = get_monitors()
                 if len(current_monitors) != last_monitor_count:
                     log(f"[MONITOR] Configuration changed: {last_monitor_count} → {len(current_monitors)}")
-                    self.monitors_cache = current_monitors
-                    self._init_workspaces()
+                    self._reconcile_workspaces_after_monitor_change(current_monitors)
                     if self.is_active:
                         self.smart_tile_with_restore()
                     last_monitor_count = len(current_monitors)
@@ -2859,6 +3926,10 @@ class SmartGrid:
 
                     # Lightweight cleanup (safe during maximize freeze)
                     self.window_mgr.cleanup_dead_windows()
+                    self._backfill_window_state_ws()
+                    cleanup_minimized_moved = self.window_mgr.last_cleanup_minimized_moved
+                    if cleanup_minimized_moved > 0:
+                        minimized_moved += cleanup_minimized_moved
 
                     # Hard rule: while ANY window is maximized, do not auto-retile/reflow.
                     # This prevents "background retiles" from moving other windows (Hyprland-like).
@@ -2924,12 +3995,32 @@ class SmartGrid:
                         known_hwnds = (set(self.window_mgr.grid_state.keys()) |
                                        set(self.window_mgr.minimized_windows.keys()) |
                                        set(self.window_mgr.maximized_windows.keys()))
+                        has_minimized_windows = len(self.window_mgr.minimized_windows) > 0
                     known_count = len(known_hwnds)
                     new_windows = [h for h in visible_hwnds if h not in known_hwnds]
                     closed_windows = known_count < self.last_known_count
+
+                    # Robust fallback: if a minimize transition was missed by state sync,
+                    # still compact when we detect a "hole" pattern.
+                    now = time.time()
+                    minimize_hole_detected = (
+                        self.compact_on_minimize and
+                        not minimized_moved and
+                        has_minimized_windows and
+                        current_count < self.last_visible_count and
+                        known_count == self.last_known_count and
+                        not new_windows
+                    )
+                    if minimize_hole_detected and now >= self.ignore_retile_until:
+                        log(f"[AUTO-COMPACT] minimize fallback {self.last_visible_count} → {current_count} windows")
+                        self._compact_grid_after_minimize()
+                        self.last_visible_count = current_count
+                        self.last_known_count = known_count
+                        self.last_retile_time = now
+                        time.sleep(0.08)
+                        continue
                     
                     # Debounced retiling
-                    now = time.time()
                     if now >= self.ignore_retile_until and current_count > 0:
                         should_retile = False
                         if new_windows:
@@ -2993,19 +4084,25 @@ class SmartGrid:
                         elif msg.wParam == HOTKEY_SWAP_CONFIRM:
                             self.exit_swap_mode()
                     elif msg.wParam == HOTKEY_WS1:
-                        self.ws_switch(0)
+                        threading.Thread(target=self.ws_switch, args=(0,), daemon=True).start()
                     elif msg.wParam == HOTKEY_WS2:
-                        self.ws_switch(1)
+                        threading.Thread(target=self.ws_switch, args=(1,), daemon=True).start()
                     elif msg.wParam == HOTKEY_WS3:
-                        self.ws_switch(2)
+                        threading.Thread(target=self.ws_switch, args=(2,), daemon=True).start()
                     elif msg.wParam == HOTKEY_FLOAT_TOGGLE:
                         self.toggle_floating_selected()
+                    elif msg.wParam == HOTKEY_LAYOUT_PICKER:
+                        self.show_layout_picker()
                 
                 elif msg.message == CUSTOM_TOGGLE_SWAP:
                     if self.swap_mode_lock:
                         self.exit_swap_mode()
                     else:
                         self.enter_swap_mode()
+                elif msg.message == CUSTOM_OPEN_LAYOUT_PICKER:
+                    self.show_layout_picker()
+                elif msg.message == CUSTOM_OPEN_SETTINGS:
+                    self.show_settings_dialog()
                 
                 # HANDLE WM_QUIT EXPLICITLY
                 elif msg.message == win32con.WM_QUIT:
@@ -3044,9 +4141,10 @@ def show_hotkeys_tooltip():
             "Ctrl+Alt+S       →  Enter Swap Mode (red border + arrows)\n"
             "Ctrl+Alt+M      →  Move workspace to next monitor\n"
             "Ctrl+Alt+F       →  Toggle Floating Selected Window\n\n"
+            "Ctrl+Alt+P       →  Layout Manager\n\n"
             "---------- OPTIONS\n\n"
-            "Compact on Minimize → Fills empty slot\n"
-            "Compact on Close   → Fills empty slot\n\n"
+            "Auto-Compact on Minimize → Fills empty slot\n"
+            "Auto-Compact on Close    → Fills empty slot\n\n"
             "---------- WORKSPACES\n\n"
             "Ctrl+Alt+1/2/3   →  Switch workspace\n\n"
             "---------- EXIT\n\n"
@@ -3073,6 +4171,7 @@ if __name__ == "__main__":
     print("Ctrl+Alt+S     → Enter Swap Mode (red border + arrows)")
     print("Ctrl+Alt+M     → Move workspace to next monitor")
     print("Ctrl+Alt+F     → Toggle Floating Selected Window")
+    print("Ctrl+Alt+P     → Layout Manager")
     print("Ctrl+Alt+1/2/3 → Switch workspace")
     print("Ctrl+Alt+Q     → Quit")
     print("-"*70)
