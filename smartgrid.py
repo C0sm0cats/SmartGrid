@@ -3470,6 +3470,9 @@ class SmartGrid:
             slot_vars = []
             slot_widgets = []
             apply_btn = None
+            poll_shutdown_job = None
+            preview_job = None
+            picker_closing = False
 
             def resize_dialog_to_content():
                 dialog.update_idletasks()
@@ -3510,6 +3513,22 @@ class SmartGrid:
                     layout_canvas.create_text(sx + sw / 2, sy + sh / 2, text=str(i), fill="#555", font=("Arial", 8))
 
             def close_picker():
+                nonlocal poll_shutdown_job, preview_job, picker_closing
+                if picker_closing:
+                    return
+                picker_closing = True
+                try:
+                    if poll_shutdown_job is not None and dialog.winfo_exists():
+                        dialog.after_cancel(poll_shutdown_job)
+                        poll_shutdown_job = None
+                except Exception:
+                    pass
+                try:
+                    if preview_job is not None and layout_canvas.winfo_exists():
+                        layout_canvas.after_cancel(preview_job)
+                        preview_job = None
+                except Exception:
+                    pass
                 try:
                     if dialog.winfo_exists():
                         dialog.destroy()
@@ -3522,14 +3541,17 @@ class SmartGrid:
                     pass
 
             def poll_shutdown():
+                nonlocal poll_shutdown_job
                 # If a global quit is requested (e.g. from systray), close picker promptly.
                 try:
+                    if picker_closing:
+                        return
                     if not dialog.winfo_exists():
                         return
                     if self._stop_event.is_set():
                         close_picker()
                         return
-                    dialog.after(120, poll_shutdown)
+                    poll_shutdown_job = dialog.after(120, poll_shutdown)
                 except Exception:
                     pass
 
@@ -3619,7 +3641,7 @@ class SmartGrid:
                 return prefill
 
             def rebuild_slots(*_):
-                nonlocal combo_width
+                nonlocal combo_width, preview_job
                 for w in slots_frame.winfo_children():
                     w.destroy()
                 slot_vars.clear()
@@ -3729,7 +3751,15 @@ class SmartGrid:
 
                 refresh_options()
                 draw_layout_preview(positions, grid_coords, get_selected_coords())
-                layout_canvas.after(0, lambda p=positions, g=grid_coords: draw_layout_preview(p, g, get_selected_coords()))
+                try:
+                    if preview_job is not None and layout_canvas.winfo_exists():
+                        layout_canvas.after_cancel(preview_job)
+                except Exception:
+                    pass
+                preview_job = layout_canvas.after(
+                    0,
+                    lambda p=positions, g=grid_coords: draw_layout_preview(p, g, get_selected_coords())
+                )
                 update_current_badge()
                 resize_dialog_to_content()
 
@@ -3793,7 +3823,7 @@ class SmartGrid:
             dialog.protocol("WM_DELETE_WINDOW", close_picker)
             dialog.bind("<Control-Alt-q>", quit_from_picker)
             dialog.bind("<Control-Alt-Q>", quit_from_picker)
-            dialog.after(120, poll_shutdown)
+            poll_shutdown_job = dialog.after(120, poll_shutdown)
             dialog.mainloop()
 
         except Exception as e:
