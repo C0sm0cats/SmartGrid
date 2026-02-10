@@ -1652,6 +1652,60 @@ class SmartGrid:
         self.last_known_count = len(known_hwnds)
         self.last_retile_time = now
         return True
+
+    def _sync_manual_cross_monitor_moves(self):
+        """
+        Detect tiled windows manually dragged to another monitor and trigger a retile.
+        This covers plain OS drags that bypass SmartGrid drag/snap drop handling.
+        """
+        try:
+            # Avoid reassigning while the user is still holding the mouse button.
+            if win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000:
+                return False
+        except Exception:
+            pass
+
+        with self.lock:
+            grid_snapshot = list(self.window_mgr.grid_state.items())
+
+        moved = []
+        touched_monitors = set()
+        for hwnd, (mon_idx, col, row) in grid_snapshot:
+            if not user32.IsWindow(hwnd):
+                continue
+            if get_window_state(hwnd) != "normal":
+                continue
+            rect = wintypes.RECT()
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                continue
+            physical_mon = self._get_monitor_index_for_rect(rect)
+            if physical_mon != mon_idx:
+                moved.append((hwnd, mon_idx, physical_mon, col, row))
+                touched_monitors.add(mon_idx)
+                touched_monitors.add(physical_mon)
+
+        if not moved:
+            return False
+
+        with self.lock:
+            for hwnd, old_mon, new_mon, col, row in moved:
+                cur = self.window_mgr.grid_state.get(hwnd)
+                if not cur:
+                    continue
+                cur_mon, cur_col, cur_row = cur
+                if cur_mon != old_mon:
+                    continue
+                # Keep slot hint; tiler will remap safely if slot is invalid on target layout.
+                self.window_mgr.grid_state[hwnd] = (new_mon, cur_col if cur_col is not None else col, cur_row if cur_row is not None else row)
+
+            for mon in touched_monitors:
+                self.layout_signature.pop(mon, None)
+                self.layout_capacity.pop(mon, None)
+            self.ignore_retile_until = 0.0
+
+        log(f"[MONITOR-DRIFT] Reassigned {len(moved)} window(s) after manual cross-monitor drag")
+        self.smart_tile_with_restore()
+        return True
     
     def apply_grid_state(self):
         """Reapply all saved grid positions physically."""
@@ -4039,6 +4093,22 @@ class SmartGrid:
                     cleanup_minimized_moved = self.window_mgr.last_cleanup_minimized_moved
                     if cleanup_minimized_moved > 0:
                         minimized_moved += cleanup_minimized_moved
+
+                    if self._sync_manual_cross_monitor_moves():
+                        visible_windows = self.window_mgr.get_visible_windows(
+                            self.monitors_cache, self.overlay_hwnd
+                        )
+                        self.last_visible_count = len(visible_windows)
+                        with self.lock:
+                            known_hwnds = (
+                                set(self.window_mgr.grid_state.keys())
+                                | set(self.window_mgr.minimized_windows.keys())
+                                | set(self.window_mgr.maximized_windows.keys())
+                            )
+                        self.last_known_count = len(known_hwnds)
+                        self.last_retile_time = time.time()
+                        time.sleep(0.08)
+                        continue
 
                     # Hard rule: while ANY window is maximized, do not auto-retile/reflow.
                     # This prevents "background retiles" from moving other windows (Hyprland-like).
