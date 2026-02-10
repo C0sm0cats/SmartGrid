@@ -745,6 +745,8 @@ class SmartGrid:
         self._maximize_freeze_active = False
         self.compact_on_minimize = True
         self.compact_on_close = True
+        self._pending_compact_minimize = False
+        self._pending_compact_close = False
         self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
         
         # Multi-monitor & workspaces
@@ -1343,26 +1345,21 @@ class SmartGrid:
                     continue
                 state = get_window_state(hwnd)
                 if state == 'normal' and user32.IsWindowVisible(hwnd):
-                    rect = wintypes.RECT()
-                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                        mon = self._get_monitor_index_for_rect(rect)
-                    active_ws = self.current_workspace.get(mon, 0)
-                    origin_ws = self.window_state_ws.get(hwnd)
-                    slot = self._get_workspace_slot(mon, active_ws, hwnd)
-                    if origin_ws is not None and origin_ws != active_ws and slot is None:
-                        self.window_mgr.maximized_windows.pop(hwnd, None)
-                        self.window_state_ws.pop(hwnd, None)
-                        continue
-                    if slot is None:
-                        # No slot for this window in active workspace: treat it as new there.
-                        self.window_mgr.maximized_windows.pop(hwnd, None)
-                        self.window_state_ws.pop(hwnd, None)
-                        continue
-                    col, row = slot
+                    # Critical: restore to the exact slot captured at maximize time.
+                    # Do not recalculate from workspace maps here, otherwise stale
+                    # workspace snapshots can cause unintended slot swaps.
+                    target_mon = mon
+                    if target_mon < 0 or target_mon >= len(self.monitors_cache):
+                        # Monitor topology changed while maximized: fallback to current physical monitor.
+                        rect = wintypes.RECT()
+                        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                            target_mon = self._get_monitor_index_for_rect(rect)
+                        else:
+                            target_mon = 0
                     self.window_mgr.maximized_windows.pop(hwnd, None)
                     self.window_state_ws.pop(hwnd, None)
-                    self.window_mgr.grid_state[hwnd] = (mon, col, row)
-                    restored.append((hwnd, mon, col, row))
+                    self.window_mgr.grid_state[hwnd] = (target_mon, col, row)
+                    restored.append((hwnd, target_mon, col, row))
                 elif state == 'minimized':
                     self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
                     self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
@@ -1614,6 +1611,47 @@ class SmartGrid:
     def _compact_grid_after_close(self):
         """Compact grid after a window closes (hybrid layout change)."""
         self._compact_grid_after_minimize()
+
+    def _run_deferred_compactions(self):
+        """Apply deferred compact operations once locks/freeze allow it."""
+        with self.lock:
+            has_maximized = any(
+                user32.IsWindow(hwnd) for hwnd in self.window_mgr.maximized_windows.keys()
+            )
+            do_minimize = self.compact_on_minimize and self._pending_compact_minimize
+            do_close = self.compact_on_close and self._pending_compact_close
+
+        if has_maximized or not (do_minimize or do_close):
+            return False
+
+        # Prioritize minimize compaction when both are pending.
+        if do_minimize:
+            log("[AUTO-COMPACT] running deferred minimize compaction")
+            self._compact_grid_after_minimize()
+        else:
+            log("[AUTO-COMPACT] running deferred close compaction")
+            self._compact_grid_after_close()
+
+        now = time.time()
+        visible_windows = self.window_mgr.get_visible_windows(
+            self.monitors_cache, self.overlay_hwnd
+        )
+        current_count = len(visible_windows)
+        with self.lock:
+            known_hwnds = (
+                set(self.window_mgr.grid_state.keys())
+                | set(self.window_mgr.minimized_windows.keys())
+                | set(self.window_mgr.maximized_windows.keys())
+            )
+            if do_minimize:
+                self._pending_compact_minimize = False
+            if do_close:
+                self._pending_compact_close = False
+
+        self.last_visible_count = current_count
+        self.last_known_count = len(known_hwnds)
+        self.last_retile_time = now
+        return True
     
     def apply_grid_state(self):
         """Reapply all saved grid positions physically."""
@@ -2350,6 +2388,7 @@ class SmartGrid:
         last_valid_rect = None
 
         WM_NCHITTEST = 0x0084
+        HTCLIENT = 1
         HTCAPTION = 2
         
         while not self._stop_event.is_set():
@@ -2391,8 +2430,10 @@ class SmartGrid:
                     candidate_hwnd = None
                     candidate_start = None
 
-                    # Only consider drag from title bar (prevents false drags when clicking
-                    # buttons like maximize/minimize/close, and avoids "retile" jitter).
+                    # Only consider drag from title-like areas. Some modern apps report
+                    # HTCLIENT on custom title bars (Teams/Electron/Chromium), so allow
+                    # HTCLIENT only in a constrained top region and exclude the right-side
+                    # caption controls zone.
                     if hwnd and user32.IsWindowVisible(hwnd):
                         try:
                             lparam = win32api.MAKELONG(pt[0] & 0xFFFF, pt[1] & 0xFFFF)
@@ -2400,7 +2441,30 @@ class SmartGrid:
                         except Exception:
                             hit = None
 
+                        allow_drag_source = False
                         if hit == HTCAPTION:
+                            allow_drag_source = True
+                        elif hit == HTCLIENT:
+                            try:
+                                rect = win32gui.GetWindowRect(hwnd)
+                                ww = max(1, rect[2] - rect[0])
+                                wh = max(1, rect[3] - rect[1])
+                                rel_x = pt[0] - rect[0]
+                                rel_y = pt[1] - rect[1]
+
+                                # Heuristic title bar zone (top strip only).
+                                title_zone_h = max(28, min(72, int(wh * 0.14)))
+                                in_title_zone = 0 <= rel_y <= title_zone_h
+
+                                # Exclude right controls region (min/max/close).
+                                controls_zone_w = max(120, min(220, int(ww * 0.20)))
+                                in_controls_zone = (rel_x >= ww - controls_zone_w) and (rel_y <= title_zone_h + 10)
+
+                                allow_drag_source = in_title_zone and not in_controls_zone
+                            except Exception:
+                                allow_drag_source = False
+
+                        if allow_drag_source:
                             with self.lock:
                                 is_in_grid = hwnd in self.window_mgr.grid_state
                             if is_in_grid:
@@ -2919,15 +2983,31 @@ class SmartGrid:
     # SETTINGS
     # ==========================================================================
 
-    def _center_tk_window(self, window, width, height):
-        """Center a Tk/Toplevel window on screen with fixed size."""
+    def _center_tk_window(self, window, width, height, monitor_idx=None):
+        """Center a Tk/Toplevel window on the target monitor work area."""
         try:
             window.update_idletasks()
-            screen_w = window.winfo_screenwidth()
-            screen_h = window.winfo_screenheight()
-            x = max(0, (screen_w - width) // 2)
-            y = max(0, (screen_h - height) // 2)
-            window.geometry(f"{width}x{height}+{x}+{y}")
+            w = int(width)
+            h = int(height)
+
+            x = y = None
+            if monitor_idx is not None:
+                monitors = self.monitors_cache or get_monitors()
+                if 0 <= monitor_idx < len(monitors):
+                    mx, my, mw, mh = monitors[monitor_idx]
+                    x = int(mx + (mw - w) // 2)
+                    y = int(my + (mh - h) // 2)
+
+            if x is None or y is None:
+                screen_w = window.winfo_screenwidth()
+                screen_h = window.winfo_screenheight()
+                x = max(0, (screen_w - w) // 2)
+                y = max(0, (screen_h - h) // 2)
+
+            # Tk geometry expects signed offsets without a redundant '+' for negatives.
+            x_part = f"+{x}" if x >= 0 else f"{x}"
+            y_part = f"+{y}" if y >= 0 else f"{y}"
+            window.geometry(f"{w}x{h}{x_part}{y_part}")
         except Exception:
             # Non-fatal: fallback to caller's existing geometry.
             pass
@@ -2949,7 +3029,7 @@ class SmartGrid:
             dialog.title("SmartGrid Settings")
             dialog.attributes('-topmost', True)
             dialog.resizable(False, False)
-            self._center_tk_window(dialog, 350, 250)
+            self._center_tk_window(dialog, 350, 250, monitor_idx=self.current_monitor_index)
             
             title = tk.Label(dialog, text="SmartGrid Settings", font=("Arial", 12, "bold"))
             title.pack(pady=10)
@@ -3450,12 +3530,11 @@ class SmartGrid:
                 if dialog_width > dialog_size["width"]:
                     dialog_size["width"] = dialog_width
                     cur_h = dialog.winfo_height() or 620
-                    dialog.geometry(f"{dialog_size['width']}x{cur_h}")
+                    self._center_tk_window(dialog, dialog_size["width"], cur_h, monitor_idx=mon_idx)
                 return bool(display_labels)
 
             refresh_window_choices()
-            dialog.geometry(f"{dialog_size['width']}x620")
-            self._center_tk_window(dialog, dialog_size["width"], 620)
+            self._center_tk_window(dialog, dialog_size["width"], 620, monitor_idx=mon_idx)
 
             slots_frame = tk.LabelFrame(
                 dialog,
@@ -3478,7 +3557,7 @@ class SmartGrid:
                 dialog.update_idletasks()
                 req_h = dialog.winfo_reqheight()
                 target_height = max(340, req_h + 10)
-                dialog.geometry(f"{dialog_size['width']}x{target_height}")
+                self._center_tk_window(dialog, dialog_size["width"], target_height, monitor_idx=mon_idx)
 
             def draw_layout_preview(positions, grid_coords, selected_coords=None):
                 layout_canvas.delete("all")
@@ -3973,6 +4052,18 @@ class SmartGrid:
                         log("[FREEZE] Maximize cleared -> auto-retile resumed")
                     self._maximize_freeze_active = has_maximized
                     if has_maximized:
+                        if minimized_moved and self.compact_on_minimize:
+                            with self.lock:
+                                self._pending_compact_minimize = True
+                        with self.lock:
+                            known_hwnds_pre = (
+                                set(self.window_mgr.grid_state.keys())
+                                | set(self.window_mgr.minimized_windows.keys())
+                                | set(self.window_mgr.maximized_windows.keys())
+                            )
+                        if self.compact_on_close and len(known_hwnds_pre) < self.last_known_count:
+                            with self.lock:
+                                self._pending_compact_close = True
                         # Keep the counters in sync to avoid a retile storm when unmaximizing.
                         visible_windows = self.window_mgr.get_visible_windows(
                             self.monitors_cache, self.overlay_hwnd
@@ -3987,11 +4078,17 @@ class SmartGrid:
                         time.sleep(0.06)
                         continue
 
+                    if self._run_deferred_compactions():
+                        time.sleep(0.08)
+                        continue
+
                     if minimized_moved:
                         # Minimizing a tiled window reduces the effective count; do a single
                         # reflow so the remaining windows fill the layout.
                         if self.compact_on_minimize:
                             self._compact_grid_after_minimize()
+                            with self.lock:
+                                self._pending_compact_minimize = False
                         else:
                             self.smart_tile_with_restore()
 
@@ -4064,6 +4161,8 @@ class SmartGrid:
                             if self.compact_on_close and closed_windows and not new_windows:
                                 log(f"[AUTO-RETILE] close compaction {self.last_visible_count} → {current_count} windows")
                                 self._compact_grid_after_close()
+                                with self.lock:
+                                    self._pending_compact_close = False
                             else:
                                 log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
                                 self.smart_tile_with_restore()
@@ -4071,6 +4170,9 @@ class SmartGrid:
                             self.last_known_count = known_count
                             self.last_retile_time = now
                             time.sleep(0.2)
+                        elif should_retile and self.compact_on_close and closed_windows and not new_windows:
+                            with self.lock:
+                                self._pending_compact_close = True
                         elif not should_retile:
                             self.last_visible_count = current_count
                             self.last_known_count = known_count
