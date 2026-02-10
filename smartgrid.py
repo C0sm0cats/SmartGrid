@@ -1312,26 +1312,28 @@ class SmartGrid:
                     continue
                 state = get_window_state(hwnd)
                 if state == 'normal' and user32.IsWindowVisible(hwnd):
-                    rect = wintypes.RECT()
-                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                        mon = self._get_monitor_index_for_rect(rect)
-                    active_ws = self.current_workspace.get(mon, 0)
+                    # Restore to the exact slot captured at minimize time.
+                    # This mirrors maximize restore behavior and avoids slot drift/swap.
+                    target_mon = mon
+                    if target_mon < 0 or target_mon >= len(self.monitors_cache):
+                        rect = wintypes.RECT()
+                        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                            target_mon = self._get_monitor_index_for_rect(rect)
+                        else:
+                            target_mon = 0
+
+                    active_ws = self.current_workspace.get(target_mon, 0)
                     origin_ws = self.window_state_ws.get(hwnd)
-                    slot = self._get_workspace_slot(mon, active_ws, hwnd)
-                    if origin_ws is not None and origin_ws != active_ws and slot is None:
+                    if origin_ws is not None and origin_ws != active_ws:
+                        # Window restored from another workspace context: do not force old slot.
                         self.window_mgr.minimized_windows.pop(hwnd, None)
                         self.window_state_ws.pop(hwnd, None)
                         continue
-                    if slot is None:
-                        # No slot for this window in active workspace: treat it as new there.
-                        self.window_mgr.minimized_windows.pop(hwnd, None)
-                        self.window_state_ws.pop(hwnd, None)
-                        continue
-                    col, row = slot
+
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     self.window_state_ws.pop(hwnd, None)
-                    self.window_mgr.grid_state[hwnd] = (mon, col, row)
-                    restored.append((hwnd, mon, col, row))
+                    self.window_mgr.grid_state[hwnd] = (target_mon, col, row)
+                    restored.append((hwnd, target_mon, col, row))
                 elif state == 'maximized':
                     self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
                     self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
