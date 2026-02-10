@@ -748,6 +748,8 @@ class SmartGrid:
         self._pending_compact_minimize = False
         self._pending_compact_close = False
         self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
+        # hwnd -> minimize snapshot (for exact full-grid restore when context matches)
+        self.minimize_restore_snapshots = {}
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -1288,6 +1290,9 @@ class SmartGrid:
             for hwnd in list(self.window_state_ws.keys()):
                 if not user32.IsWindow(hwnd):
                     self.window_state_ws.pop(hwnd, None)
+            for hwnd in list(self.minimize_restore_snapshots.keys()):
+                if not user32.IsWindow(hwnd):
+                    self.minimize_restore_snapshots.pop(hwnd, None)
 
             # Move minimized/maximized windows out of grid_state (keep their slot)
             for hwnd, (mon, col, row) in list(self.window_mgr.grid_state.items()):
@@ -1295,11 +1300,26 @@ class SmartGrid:
                     continue
                 state = get_window_state(hwnd)
                 if state == 'minimized':
+                    # Capture full monitor snapshot before removing the minimized window from grid_state.
+                    # This allows restoring all windows to their exact pre-minimize slots if context matches.
+                    snapshot_slots = {
+                        h: (c, r)
+                        for h, (m, c, r) in self.window_mgr.grid_state.items()
+                        if m == mon and user32.IsWindow(h)
+                    }
+                    self.minimize_restore_snapshots[hwnd] = {
+                        "monitor": mon,
+                        "workspace": self.current_workspace.get(mon, 0),
+                        "slots": snapshot_slots,
+                        "layout": self.layout_signature.get(mon),
+                        "captured_at": time.time(),
+                    }
                     self.window_mgr.minimized_windows[hwnd] = (mon, col, row)
                     self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.grid_state.pop(hwnd, None)
                     minimized_moved += 1
                 elif state == 'maximized':
+                    self.minimize_restore_snapshots.pop(hwnd, None)
                     self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
                     self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.grid_state.pop(hwnd, None)
@@ -1308,31 +1328,36 @@ class SmartGrid:
             # Restore minimized windows that returned to normal
             for hwnd, (mon, col, row) in list(self.window_mgr.minimized_windows.items()):
                 if not user32.IsWindow(hwnd):
+                    self.minimize_restore_snapshots.pop(hwnd, None)
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     continue
                 state = get_window_state(hwnd)
                 if state == 'normal' and user32.IsWindowVisible(hwnd):
-                    rect = wintypes.RECT()
-                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                        mon = self._get_monitor_index_for_rect(rect)
-                    active_ws = self.current_workspace.get(mon, 0)
+                    snapshot = self.minimize_restore_snapshots.pop(hwnd, None)
+                    # Restore to the exact slot captured at minimize time.
+                    # This mirrors maximize restore behavior and avoids slot drift/swap.
+                    target_mon = mon
+                    if target_mon < 0 or target_mon >= len(self.monitors_cache):
+                        rect = wintypes.RECT()
+                        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                            target_mon = self._get_monitor_index_for_rect(rect)
+                        else:
+                            target_mon = 0
+
+                    active_ws = self.current_workspace.get(target_mon, 0)
                     origin_ws = self.window_state_ws.get(hwnd)
-                    slot = self._get_workspace_slot(mon, active_ws, hwnd)
-                    if origin_ws is not None and origin_ws != active_ws and slot is None:
+                    if origin_ws is not None and origin_ws != active_ws:
+                        # Window restored from another workspace context: do not force old slot.
                         self.window_mgr.minimized_windows.pop(hwnd, None)
                         self.window_state_ws.pop(hwnd, None)
                         continue
-                    if slot is None:
-                        # No slot for this window in active workspace: treat it as new there.
-                        self.window_mgr.minimized_windows.pop(hwnd, None)
-                        self.window_state_ws.pop(hwnd, None)
-                        continue
-                    col, row = slot
+
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     self.window_state_ws.pop(hwnd, None)
-                    self.window_mgr.grid_state[hwnd] = (mon, col, row)
-                    restored.append((hwnd, mon, col, row))
+                    self.window_mgr.grid_state[hwnd] = (target_mon, col, row)
+                    restored.append((hwnd, target_mon, col, row, snapshot))
                 elif state == 'maximized':
+                    self.minimize_restore_snapshots.pop(hwnd, None)
                     self.window_mgr.maximized_windows[hwnd] = (mon, col, row)
                     self.window_state_ws[hwnd] = self.current_workspace.get(mon, 0)
                     self.window_mgr.minimized_windows.pop(hwnd, None)
@@ -1454,12 +1479,174 @@ class SmartGrid:
             with self.lock:
                 grid_snapshot = dict(self.window_mgr.grid_state)
 
+            def _apply_snapshot_restore_if_possible(mon_idx, snapshot):
+                if not isinstance(snapshot, dict):
+                    return False
+                snap_mon = snapshot.get("monitor")
+                if snap_mon != mon_idx:
+                    return False
+                snap_ws = snapshot.get("workspace")
+                if snap_ws != self.current_workspace.get(mon_idx, 0):
+                    return False
+
+                slots = snapshot.get("slots")
+                if not isinstance(slots, dict) or not slots:
+                    return False
+
+                current_mon_windows = {
+                    h for h, (m, _c, _r) in grid_snapshot.items()
+                    if m == mon_idx and user32.IsWindow(h)
+                }
+                snapshot_windows = {h for h in slots.keys() if user32.IsWindow(h)}
+                if not snapshot_windows or current_mon_windows != snapshot_windows:
+                    return False
+
+                layout_sig = snapshot.get("layout")
+                if not layout_sig:
+                    layout_sig = self.layout_engine.choose_layout(len(snapshot_windows))
+                layout, info = layout_sig
+                capacity = self._layout_capacity(layout, info)
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx], capacity, self.gap, self.edge_padding, layout, info
+                )
+                pos_map = dict(zip(grid_coords, positions))
+                coord_order = {coord: i for i, coord in enumerate(grid_coords)}
+
+                restored_slots = {}
+                used_coords = set()
+                for h in snapshot_windows:
+                    coord = slots.get(h)
+                    if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+                        return False
+                    try:
+                        c = int(coord[0])
+                        r = int(coord[1])
+                    except Exception:
+                        return False
+                    key = (c, r)
+                    if key not in pos_map or key in used_coords:
+                        return False
+                    used_coords.add(key)
+                    restored_slots[h] = key
+
+                ordered_hwnds = sorted(
+                    snapshot_windows,
+                    key=lambda h: coord_order.get(restored_slots[h], 10_000),
+                )
+
+                with self.lock:
+                    for h in ordered_hwnds:
+                        c, r = restored_slots[h]
+                        self.window_mgr.grid_state[h] = (mon_idx, c, r)
+                        grid_snapshot[h] = (mon_idx, c, r)
+
+                for h in ordered_hwnds:
+                    c, r = restored_slots[h]
+                    x, y, w, hh = pos_map[(c, r)]
+                    self.window_mgr.force_tile_resizable(h, x, y, w, hh)
+                    time.sleep(0.006)
+                return True
+
+            def _repack_monitor_without_holes(mon_idx, preferred_slots=None):
+                """Pack monitor windows into earliest slots to avoid restore holes."""
+                if mon_idx < 0 or mon_idx >= len(self.monitors_cache):
+                    return False
+
+                mon_windows = [
+                    (h, c, r)
+                    for h, (m, c, r) in grid_snapshot.items()
+                    if m == mon_idx and user32.IsWindow(h)
+                ]
+                if not mon_windows:
+                    return False
+
+                count = len(mon_windows)
+                layout, info = self.layout_engine.choose_layout(count)
+                capacity = self._layout_capacity(layout, info)
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx], capacity, self.gap, self.edge_padding, layout, info
+                )
+                if not grid_coords:
+                    return False
+
+                packed_coords = list(grid_coords[:count])
+                coord_order = {coord: i for i, coord in enumerate(grid_coords)}
+                packed_set = set(packed_coords)
+                pos_map = dict(zip(grid_coords, positions))
+                present_hwnds = {h for h, _c, _r in mon_windows}
+                preferred_slots = preferred_slots or {}
+
+                assigned = {}
+                for h, coord in preferred_slots.items():
+                    if h not in present_hwnds:
+                        continue
+                    if not isinstance(coord, (list, tuple)) or len(coord) != 2:
+                        continue
+                    try:
+                        key = (int(coord[0]), int(coord[1]))
+                    except Exception:
+                        continue
+                    if key in packed_set and key not in assigned.values():
+                        assigned[h] = key
+
+                available_coords = [coord for coord in packed_coords if coord not in assigned.values()]
+
+                def _coord_idx(c, r):
+                    return coord_order.get((c, r), 10_000)
+
+                remaining = [
+                    (h, c, r)
+                    for h, c, r in mon_windows
+                    if h not in assigned
+                ]
+                remaining.sort(key=lambda item: (_coord_idx(item[1], item[2]), item[0]))
+                for idx, (h, _c, _r) in enumerate(remaining):
+                    if idx >= len(available_coords):
+                        break
+                    assigned[h] = available_coords[idx]
+
+                ordered_hwnds = sorted(
+                    assigned.keys(),
+                    key=lambda h: coord_order.get(assigned[h], 10_000),
+                )
+
+                with self.lock:
+                    self.layout_signature[mon_idx] = (layout, info)
+                    self.layout_capacity[mon_idx] = capacity
+                    for h in ordered_hwnds:
+                        c, r = assigned[h]
+                        self.window_mgr.grid_state[h] = (mon_idx, c, r)
+                        grid_snapshot[h] = (mon_idx, c, r)
+
+                for h in ordered_hwnds:
+                    c, r = assigned[h]
+                    x, y, w, hh = pos_map[(c, r)]
+                    self.window_mgr.force_tile_resizable(h, x, y, w, hh)
+                    time.sleep(0.006)
+                return True
+
             need_full_retile = False
-            for hwnd, mon_idx, col, row in restored:
+            snapshot_restored_monitors = set()
+            fallback_restore_slots = {}
+            for item in restored:
+                snapshot = None
+                if len(item) >= 5:
+                    hwnd, mon_idx, col, row, snapshot = item
+                else:
+                    hwnd, mon_idx, col, row = item
                 if mon_idx >= len(self.monitors_cache):
                     continue
                 if not user32.IsWindow(hwnd):
                     continue
+                if mon_idx in snapshot_restored_monitors:
+                    continue
+
+                if snapshot and _apply_snapshot_restore_if_possible(mon_idx, snapshot):
+                    snapshot_restored_monitors.add(mon_idx)
+                    continue
+
+                fallback_restore_slots.setdefault(mon_idx, {})[hwnd] = (col, row)
+
                 count = self._get_layout_count_for_monitor(mon_idx)
                 if count <= 0:
                     continue
@@ -1529,6 +1716,13 @@ class SmartGrid:
                 with self.lock:
                     self.ignore_retile_until = 0.0
                 self.smart_tile_with_restore()
+                with self.lock:
+                    grid_snapshot = dict(self.window_mgr.grid_state)
+
+            for mon_idx, preferred in fallback_restore_slots.items():
+                if mon_idx in snapshot_restored_monitors:
+                    continue
+                _repack_monitor_without_holes(mon_idx, preferred_slots=preferred)
 
     def _compact_grid_after_minimize(self):
         """Fill earliest empty slots by moving windows from the end of the layout."""
