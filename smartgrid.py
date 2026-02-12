@@ -1147,8 +1147,10 @@ class SmartGrid:
                     if prev_capacity:
                         effective_count = max(effective_count, prev_capacity)
 
+                prev_sig = self.layout_signature.get(mon_idx)
                 layout, info = self.layout_engine.choose_layout(effective_count)
                 capacity = self._layout_capacity(layout, info)
+                layout_changed = prev_sig is not None and prev_sig != (layout, info)
                 self.layout_signature[mon_idx] = (layout, info)
                 self.layout_capacity[mon_idx] = capacity
                 active_ws = self.current_workspace.get(mon_idx, 0)
@@ -1161,6 +1163,7 @@ class SmartGrid:
                     info,
                     capacity,
                     reserved_slots=reserved_slots,
+                    compact_after_restore=layout_changed,
                 )
             
             # Update grid_state with lock - ONLY ONCE
@@ -1234,7 +1237,17 @@ class SmartGrid:
         
         return wins_by_monitor
     
-    def _tile_monitor(self, mon_idx, windows, new_grid, layout=None, info=None, capacity=None, reserved_slots=None):
+    def _tile_monitor(
+        self,
+        mon_idx,
+        windows,
+        new_grid,
+        layout=None,
+        info=None,
+        capacity=None,
+        reserved_slots=None,
+        compact_after_restore=False,
+    ):
         """Tile windows on a specific monitor."""
         monitor_rect = self.monitors_cache[mon_idx]
         visible_count = len(windows)
@@ -1299,6 +1312,34 @@ class SmartGrid:
             new_grid[hwnd] = (mon_idx, col, row)
             log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
             time.sleep(0.015)
+
+        # Layout changed: keep restore-first behavior, then compact holes.
+        if compact_after_restore:
+            coord_order = {coord: idx for idx, coord in enumerate(grid_coords)}
+            tiled = []
+            for hwnd, (m, c, r) in new_grid.items():
+                coord = (c, r)
+                if m != mon_idx or coord not in coord_order:
+                    continue
+                tiled.append((coord_order[coord], hwnd, coord))
+
+            if len(tiled) > 1:
+                tiled.sort(key=lambda item: item[0])
+                target_coords = grid_coords[:len(tiled)]
+
+                for target_idx, (_old_idx, hwnd, old_coord) in enumerate(tiled):
+                    target_coord = target_coords[target_idx]
+                    if old_coord == target_coord:
+                        continue
+
+                    x, y, w, h = pos_map[target_coord]
+                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                    new_grid[hwnd] = (mon_idx, target_coord[0], target_coord[1])
+                    log(
+                        f"   ↻ COMPACT ({old_coord[0]},{old_coord[1]}) -> "
+                        f"({target_coord[0]},{target_coord[1]})"
+                    )
+                    time.sleep(0.01)
 
     def _sync_window_state_changes(self):
         """Track min/max/restore state transitions for stable retile decisions."""
