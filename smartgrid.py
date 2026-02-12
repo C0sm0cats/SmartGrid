@@ -742,6 +742,7 @@ class SmartGrid:
         self.last_known_count = 0
         self.layout_signature = {}
         self.layout_capacity = {}
+        self.workspace_layout_signature = {}  # (monitor_idx, ws_idx) -> (layout, info)
         self._maximize_freeze_active = False
         self.compact_on_minimize = True
         self.compact_on_close = True
@@ -801,6 +802,7 @@ class SmartGrid:
             old_current_workspace = dict(self.current_workspace)
             old_layout_signature = dict(self.layout_signature)
             old_layout_capacity = dict(self.layout_capacity)
+            old_workspace_layout_signature = dict(self.workspace_layout_signature)
 
             for i in range(new_count):
                 ws_maps = old_workspaces.get(i)
@@ -829,6 +831,11 @@ class SmartGrid:
             self.layout_capacity = {
                 mon: cap for mon, cap in old_layout_capacity.items()
                 if mon < new_count
+            }
+            self.workspace_layout_signature = {
+                (mon, ws): sig
+                for (mon, ws), sig in old_workspace_layout_signature.items()
+                if mon < new_count and ws in (0, 1, 2)
             }
 
     # ==========================================================================
@@ -878,55 +885,45 @@ class SmartGrid:
         return {"title": title, "process": process}
 
     def _get_window_choices_for_monitor(self, mon_idx):
-        """Return list of (hwnd, descriptor) for windows on a monitor (visible + minimized/maximized)."""
+        """Return list of (hwnd, descriptor) for windows on a monitor across all workspaces."""
         choices = []
         seen = set()
-        active_ws = self.current_workspace.get(mon_idx, 0)
+
+        def _add_choice(hwnd):
+            if not hwnd or hwnd in seen or not user32.IsWindow(hwnd):
+                return
+            seen.add(hwnd)
+            choices.append((hwnd, self._build_window_descriptor(hwnd)))
+
         visible = self.window_mgr.get_visible_windows(self.monitors_cache, self.overlay_hwnd)
         for hwnd, _title, rect in visible:
             if self._get_monitor_index_for_rect(rect) != mon_idx:
                 continue
-            choices.append((hwnd, self._build_window_descriptor(hwnd)))
-            seen.add(hwnd)
+            _add_choice(hwnd)
 
         with self.lock:
             minimized_snapshot = dict(self.window_mgr.minimized_windows)
             maximized_snapshot = dict(self.window_mgr.maximized_windows)
             grid_snapshot = dict(self.window_mgr.grid_state)
-            state_ws_snapshot = dict(self.window_state_ws)
+            ws_snapshot = []
+            for ws_map in self.workspaces.get(mon_idx, []):
+                ws_snapshot.append(dict(ws_map) if isinstance(ws_map, dict) else {})
 
+        # Runtime tracked windows on this monitor.
         for hwnd, (m, _c, _r) in minimized_snapshot.items():
-            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
-                continue
-            origin_ws = state_ws_snapshot.get(hwnd)
-            if origin_ws is not None and origin_ws != active_ws:
-                continue
-            if origin_ws is None:
-                owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
-                if owner_ws is not None and owner_ws != active_ws:
-                    continue
-            choices.append((hwnd, self._build_window_descriptor(hwnd)))
-            seen.add(hwnd)
-
+            if m == mon_idx:
+                _add_choice(hwnd)
         for hwnd, (m, _c, _r) in maximized_snapshot.items():
-            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
-                continue
-            origin_ws = state_ws_snapshot.get(hwnd)
-            if origin_ws is not None and origin_ws != active_ws:
-                continue
-            if origin_ws is None:
-                owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
-                if owner_ws is not None and owner_ws != active_ws:
-                    continue
-            choices.append((hwnd, self._build_window_descriptor(hwnd)))
-            seen.add(hwnd)
-
-        # Ensure all currently tiled windows are included, even if filtered by title/class.
+            if m == mon_idx:
+                _add_choice(hwnd)
         for hwnd, (m, _c, _r) in grid_snapshot.items():
-            if m != mon_idx or hwnd in seen or not user32.IsWindow(hwnd):
-                continue
-            choices.append((hwnd, self._build_window_descriptor(hwnd)))
-            seen.add(hwnd)
+            if m == mon_idx:
+                _add_choice(hwnd)
+
+        # Include windows referenced by any workspace map on this monitor.
+        for ws_map in ws_snapshot:
+            for hwnd in ws_map.keys():
+                _add_choice(hwnd)
 
         if not choices:
             def enum(hwnd, _):
@@ -968,13 +965,32 @@ class SmartGrid:
 
         return choices
 
-    def _apply_manual_layout(self, mon_idx, layout, info, assignments):
+    def _apply_manual_layout(self, mon_idx, layout, info, assignments, target_ws=None, activate_target=True):
         """Apply manual layout with explicit slot assignments."""
         capacity = self._layout_capacity(layout, info)
         if not assignments or len(assignments) > capacity:
             return False
 
         selected_hwnds = set(assignments.values())
+        with self.lock:
+            active_ws = self.current_workspace.get(mon_idx, 0)
+        if target_ws is None or target_ws not in (0, 1, 2):
+            target_ws = active_ws
+        with self.lock:
+            self.workspace_layout_signature[(mon_idx, target_ws)] = (layout, info)
+
+        workspace_layout = {
+            hwnd: {"pos": (0, 0, 800, 600), "grid": (int(col), int(row)), "state": "normal"}
+            for (col, row), hwnd in assignments.items()
+        }
+
+        # Editing an inactive workspace only updates its map; visual apply happens on switch.
+        if (not activate_target) or (target_ws != active_ws):
+            with self.lock:
+                ws_list = self.workspaces.get(mon_idx, [])
+                if 0 <= target_ws < len(ws_list):
+                    ws_list[target_ws] = workspace_layout
+            return True
 
         monitor_rect = self.monitors_cache[mon_idx]
         positions, grid_coords = self.layout_engine.calculate_positions(
@@ -1004,7 +1020,6 @@ class SmartGrid:
 
         with self._tiling_lock:
             with self.lock:
-                active_ws = self.current_workspace.get(mon_idx, 0)
                 for hwnd in selected_hwnds:
                     self.window_mgr.override_windows.discard(hwnd)
                 # Hide non-selected visible windows on this monitor, but do not persist
@@ -1039,6 +1054,9 @@ class SmartGrid:
                     self.window_state_ws.pop(hwnd, None)
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     self.window_mgr.maximized_windows.pop(hwnd, None)
+                ws_list = self.workspaces.get(mon_idx, [])
+                if 0 <= target_ws < len(ws_list):
+                    ws_list[target_ws] = workspace_layout
 
             for (col, row), hwnd in assignments.items():
                 if (col, row) in pos_map:
@@ -1133,6 +1151,8 @@ class SmartGrid:
                 capacity = self._layout_capacity(layout, info)
                 self.layout_signature[mon_idx] = (layout, info)
                 self.layout_capacity[mon_idx] = capacity
+                active_ws = self.current_workspace.get(mon_idx, 0)
+                self.workspace_layout_signature[(mon_idx, active_ws)] = (layout, info)
                 self._tile_monitor(
                     mon_idx,
                     windows,
@@ -2864,6 +2884,11 @@ class SmartGrid:
                 'grid': (col, row),
                 'state': 'maximized'
             }
+
+        with self.lock:
+            current_sig = self.layout_signature.get(monitor_idx)
+            if current_sig is not None:
+                self.workspace_layout_signature[(monitor_idx, ws)] = current_sig
         
         log(f"[WS] ✓ Workspace {ws+1} saved ({len(self.workspaces[monitor_idx][ws])} windows)")
     
@@ -3134,6 +3159,9 @@ class SmartGrid:
 
                     self.workspaces[old_mon][old_ws] = {}
                     self.workspaces[new_mon][old_ws] = moved_payload
+                    moved_sig = self.workspace_layout_signature.pop((old_mon, old_ws), None)
+                    if moved_sig is not None:
+                        self.workspace_layout_signature[(new_mon, old_ws)] = moved_sig
 
                     # Invalidate stale monitor layout caches after move.
                     self.layout_signature.pop(old_mon, None)
@@ -3672,16 +3700,39 @@ class SmartGrid:
 
             layout_presets = self._get_layout_presets()
             layout_labels = [label for label, _ in layout_presets]
+            ws_labels = [f"Workspace {i+1}" for i in range(3)]
+            target_ws_var = tk.StringVar(value=ws_labels[active_ws_at_open])
 
-            def get_default_label():
+            def get_target_ws_index():
+                try:
+                    return ws_labels.index(target_ws_var.get().strip())
+                except Exception:
+                    return active_ws_at_open
+
+            def get_default_label_for_ws(ws_idx):
                 default = layout_labels[0]
-                if current_layout:
-                    cur_label = self._layout_label(*current_layout)
+                with self.lock:
+                    remembered = self.workspace_layout_signature.get((mon_idx, ws_idx))
+                    if remembered is None and ws_idx == self.current_workspace.get(mon_idx, active_ws_at_open):
+                        remembered = current_layout
+                    ws_list = self.workspaces.get(mon_idx, [])
+                    ws_map = {}
+                    if 0 <= ws_idx < len(ws_list) and isinstance(ws_list[ws_idx], dict):
+                        ws_map = dict(ws_list[ws_idx])
+
+                layout_sig = remembered
+                if layout_sig is None:
+                    ws_count = sum(1 for hwnd in ws_map.keys() if user32.IsWindow(hwnd))
+                    if ws_count > 0:
+                        layout_sig = self.layout_engine.choose_layout(ws_count)
+
+                if layout_sig:
+                    cur_label = self._layout_label(*layout_sig)
                     if cur_label in layout_labels:
                         return cur_label
                 return default
 
-            layout_var = tk.StringVar(value=get_default_label())
+            layout_var = tk.StringVar(value=get_default_label_for_ws(active_ws_at_open))
 
             note_frame = tk.Frame(layout_frame, bg=section_bg)
             note_frame.pack(fill=tk.X, padx=4, pady=(0, 6))
@@ -3706,6 +3757,22 @@ class SmartGrid:
                 bd=1,
             )
             monitor_badge.pack(side=tk.LEFT, padx=(8, 0))
+
+            tk.Label(
+                note_frame,
+                text="Target:",
+                font=("Arial", 8, "bold"),
+                fg="#555555",
+                bg=section_bg,
+            ).pack(side=tk.LEFT, padx=(8, 3))
+            target_ws_combo = ttk.Combobox(
+                note_frame,
+                textvariable=target_ws_var,
+                values=ws_labels,
+                state="readonly",
+                width=11,
+            )
+            target_ws_combo.pack(side=tk.LEFT)
 
             current_badge = tk.Label(
                 note_frame,
@@ -3923,15 +3990,32 @@ class SmartGrid:
                     if current_badge.winfo_manager():
                         current_badge.pack_forget()
 
+            def update_apply_button_label():
+                if apply_btn is None:
+                    return
+                target_ws = get_target_ws_index()
+                with self.lock:
+                    active_ws = self.current_workspace.get(mon_idx, active_ws_at_open)
+                if target_ws == active_ws:
+                    apply_btn.config(text="Apply Layout")
+                else:
+                    apply_btn.config(text="Apply & Switch")
+
             def update_apply_state():
                 if apply_btn is None:
                     return
+                update_apply_button_label()
                 filled = sum(1 for _coord, var in slot_vars if var.get().strip())
                 apply_btn.config(state=tk.NORMAL if filled > 0 else tk.DISABLED)
 
             def get_current_grid_prefill(layout, info, grid_coords):
-                """Return { (col,row): display_label } for current active grid when layout matches."""
+                """Return {(col,row): label} for the target workspace."""
+                target_ws = get_target_ws_index()
                 with self.lock:
+                    ws_list = self.workspaces.get(mon_idx, [])
+                    ws_map = {}
+                    if 0 <= target_ws < len(ws_list) and isinstance(ws_list[target_ws], dict):
+                        ws_map = dict(ws_list[target_ws])
                     active_ws = self.current_workspace.get(mon_idx, active_ws_at_open)
                     sig = self.layout_signature.get(mon_idx)
                     grid_items = [
@@ -3940,25 +4024,40 @@ class SmartGrid:
                         if m == mon_idx and user32.IsWindow(hwnd)
                     ]
 
-                # Keep only windows that belong to the currently active workspace.
-                filtered = []
-                for hwnd, c, r in grid_items:
-                    owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=active_ws)
-                    if owner_ws is not None and owner_ws != active_ws:
-                        continue
-                    filtered.append((hwnd, c, r))
-
-                if sig is not None:
-                    current_layout = sig
-                else:
-                    current_layout = self.layout_engine.choose_layout(len(filtered)) if filtered else None
-
-                if current_layout != (layout, info):
-                    return {}
-
                 valid_coords = set(grid_coords)
                 prefill = {}
-                for hwnd, c, r in filtered:
+
+                # For the active workspace, prefer current runtime grid when layout matches.
+                if target_ws == active_ws:
+                    filtered = [(hwnd, c, r) for hwnd, c, r in grid_items if user32.IsWindow(hwnd)]
+                    if sig is not None:
+                        current_layout = sig
+                    else:
+                        current_layout = self.layout_engine.choose_layout(len(filtered)) if filtered else None
+
+                    if current_layout == (layout, info):
+                        for hwnd, c, r in filtered:
+                            coord = (c, r)
+                            if coord not in valid_coords:
+                                continue
+                            label = hwnd_to_label.get(hwnd)
+                            if label:
+                                prefill[coord] = label
+                        if prefill:
+                            return prefill
+
+                # Fallback: use stored workspace map.
+                for hwnd, data in ws_map.items():
+                    if not user32.IsWindow(hwnd) or not isinstance(data, dict):
+                        continue
+                    grid = data.get("grid")
+                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                        continue
+                    try:
+                        c = int(grid[0])
+                        r = int(grid[1])
+                    except Exception:
+                        continue
                     coord = (c, r)
                     if coord not in valid_coords:
                         continue
@@ -3976,11 +4075,13 @@ class SmartGrid:
                 no_windows_available = not display_labels
 
                 sel_label = layout_var.get()
-                sel_idx = layout_combo.current()
-                if sel_idx is not None and sel_idx >= 0:
-                    layout, info = layout_presets[sel_idx][1]
-                else:
-                    layout, info = dict(layout_presets).get(sel_label, ("full", None))
+                layout, info = dict(layout_presets).get(sel_label, (None, None))
+                if layout is None:
+                    sel_idx = layout_combo.current()
+                    if sel_idx is not None and 0 <= sel_idx < len(layout_presets):
+                        layout, info = layout_presets[sel_idx][1]
+                    else:
+                        layout, info = ("full", None)
 
                 capacity = self._layout_capacity(layout, info)
                 positions, grid_coords = self.layout_engine.calculate_positions(
@@ -4016,9 +4117,15 @@ class SmartGrid:
                         textvariable=var,
                         values=display_labels if display_labels else [],
                         state="readonly" if display_labels else "disabled",
+                        height=15,
                         width=combo_width,
                     )
                     combo.grid(row=0, column=1, sticky="ew", padx=5)
+
+                    # Prevent accidental slot reassignment from mouse wheel over the field.
+                    combo.bind("<MouseWheel>", lambda _e: "break")
+                    combo.bind("<Button-4>", lambda _e: "break")  # Linux scroll up
+                    combo.bind("<Button-5>", lambda _e: "break")  # Linux scroll down
 
                     proc_label = tk.Label(
                         row_frame,
@@ -4092,11 +4199,13 @@ class SmartGrid:
 
             def apply_layout():
                 sel_label = layout_var.get()
-                sel_idx = layout_combo.current()
-                if sel_idx is not None and sel_idx >= 0:
-                    layout, info = layout_presets[sel_idx][1]
-                else:
-                    layout, info = dict(layout_presets).get(sel_label, ("full", None))
+                layout, info = dict(layout_presets).get(sel_label, (None, None))
+                if layout is None:
+                    sel_idx = layout_combo.current()
+                    if sel_idx is not None and 0 <= sel_idx < len(layout_presets):
+                        layout, info = layout_presets[sel_idx][1]
+                    else:
+                        layout, info = ("full", None)
 
                 assignments = {}
                 used = set()
@@ -4117,16 +4226,31 @@ class SmartGrid:
                 if not assignments:
                     messagebox.showwarning("SmartGrid", "Select at least one slot to apply.")
                     return
-                if not self._apply_manual_layout(mon_idx, layout, info, assignments):
+
+                target_ws = get_target_ws_index()
+                with self.lock:
+                    active_ws = self.current_workspace.get(mon_idx, active_ws_at_open)
+                apply_now = target_ws == active_ws
+
+                if not self._apply_manual_layout(
+                    mon_idx,
+                    layout,
+                    info,
+                    assignments,
+                    target_ws=target_ws,
+                    activate_target=apply_now,
+                ):
                     messagebox.showwarning("SmartGrid", "Failed to apply layout.")
                     return
                 close_picker()
+                if not apply_now:
+                    threading.Thread(target=self.ws_switch, args=(target_ws,), daemon=True).start()
 
             apply_btn = tk.Button(
                 layout_top,
                 text="Apply Layout",
                 command=apply_layout,
-                width=14,
+                width=16,
                 bg=accent,
                 fg="white",
                 activebackground=accent_dark,
@@ -4137,6 +4261,15 @@ class SmartGrid:
 
             layout_combo.bind("<<ComboboxSelected>>", rebuild_slots)
             layout_var.trace_add("write", lambda *_: rebuild_slots())
+            def on_target_ws_selected(_event=None):
+                target_ws = get_target_ws_index()
+                target_label = get_default_label_for_ws(target_ws)
+                if layout_var.get() != target_label:
+                    layout_var.set(target_label)
+                else:
+                    rebuild_slots()
+
+            target_ws_combo.bind("<<ComboboxSelected>>", on_target_ws_selected)
             refresh_window_choices()
             rebuild_slots()
             update_apply_state()
