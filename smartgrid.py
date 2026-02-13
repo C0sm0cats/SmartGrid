@@ -1789,6 +1789,7 @@ class SmartGrid:
             fallback_restore_slots = {}
             for item in restored:
                 snapshot = None
+                from_minimize_restore = len(item) >= 5
                 if len(item) >= 5:
                     hwnd, mon_idx, col, row, snapshot = item
                 else:
@@ -1804,7 +1805,10 @@ class SmartGrid:
                     snapshot_restored_monitors.add(mon_idx)
                     continue
 
-                fallback_restore_slots.setdefault(mon_idx, {})[hwnd] = (col, row)
+                # Only minimized restores need post-repack fallback.
+                # Maximized -> normal should keep exact slots and must not trigger compaction-style repacks.
+                if from_minimize_restore:
+                    fallback_restore_slots.setdefault(mon_idx, {})[hwnd] = (col, row)
 
                 count = self._get_layout_count_for_monitor(mon_idx)
                 if count <= 0:
