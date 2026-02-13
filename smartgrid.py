@@ -1637,6 +1637,9 @@ class SmartGrid:
         with self._tiling_lock:
             with self.lock:
                 grid_snapshot = dict(self.window_mgr.grid_state)
+                layout_sig_snapshot = dict(self.layout_signature)
+                ws_layout_sig_snapshot = dict(self.workspace_layout_signature)
+                current_ws_snapshot = dict(self.current_workspace)
 
             def _apply_snapshot_restore_if_possible(mon_idx, snapshot):
                 if not isinstance(snapshot, dict):
@@ -1705,6 +1708,80 @@ class SmartGrid:
                     self.window_mgr.force_tile_resizable(h, x, y, w, hh)
                     time.sleep(0.006)
                 return True
+
+            def _get_pos_map_for_exact_slot(mon_idx, col, row):
+                """Resolve a monitor position map that contains (col,row), preferring remembered layout."""
+                if mon_idx < 0 or mon_idx >= len(self.monitors_cache):
+                    return None
+
+                candidates = []
+                sig = layout_sig_snapshot.get(mon_idx)
+                if sig:
+                    candidates.append(sig)
+
+                ws_idx = current_ws_snapshot.get(mon_idx, 0)
+                ws_sig = ws_layout_sig_snapshot.get((mon_idx, ws_idx))
+                if ws_sig and ws_sig not in candidates:
+                    candidates.append(ws_sig)
+
+                mon_window_count = sum(
+                    1 for h, (m, _c, _r) in grid_snapshot.items()
+                    if m == mon_idx and user32.IsWindow(h)
+                )
+                if mon_window_count > 0:
+                    auto_sig = self.layout_engine.choose_layout(mon_window_count)
+                    if auto_sig not in candidates:
+                        candidates.append(auto_sig)
+
+                # Fallbacks for dense layouts where count can be transient during staggered unmaximize.
+                for fallback_sig in [
+                    ("grid", (5, 3)),
+                    ("grid", (4, 3)),
+                    ("grid", (3, 3)),
+                    ("grid", (3, 2)),
+                    ("grid", (2, 2)),
+                    ("master_stack", None),
+                    ("side_by_side", None),
+                    ("full", None),
+                ]:
+                    if fallback_sig not in candidates:
+                        candidates.append(fallback_sig)
+
+                target = (col, row)
+                for layout, info in candidates:
+                    cap = self._layout_capacity(layout, info)
+                    positions, grid_coords = self.layout_engine.calculate_positions(
+                        self.monitors_cache[mon_idx], cap, self.gap, self.edge_padding, layout, info
+                    )
+                    if target not in set(grid_coords):
+                        continue
+                    return dict(zip(grid_coords, positions))
+                return None
+
+            def _get_inner_rect(hwnd):
+                """Return client-like rect (x, y, w, h) corrected from extended frame borders."""
+                rect = wintypes.RECT()
+                if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    return None
+                lb, tb, rb, bb = get_frame_borders(hwnd)
+                return (
+                    rect.left + lb,
+                    rect.top + tb,
+                    rect.right - rect.left - lb - rb,
+                    rect.bottom - rect.top - tb - bb,
+                )
+
+            def _slot_is_drifted(hwnd, target_x, target_y, target_w, target_h, tol_pos=8, tol_size=8):
+                cur = _get_inner_rect(hwnd)
+                if not cur:
+                    return False
+                cur_x, cur_y, cur_w, cur_h = cur
+                return (
+                    abs(cur_x - target_x) > tol_pos
+                    or abs(cur_y - target_y) > tol_pos
+                    or abs(cur_w - target_w) > tol_size
+                    or abs(cur_h - target_h) > tol_size
+                )
 
             def _repack_monitor_without_holes(mon_idx, preferred_slots=None):
                 """Pack monitor windows into earliest slots to avoid restore holes."""
@@ -1803,6 +1880,38 @@ class SmartGrid:
 
                 if snapshot and _apply_snapshot_restore_if_possible(mon_idx, snapshot):
                     snapshot_restored_monitors.add(mon_idx)
+                    continue
+
+                # Maximized -> normal restore: enforce exact saved slot directly using
+                # remembered monitor/workspace layout, not transient visible-count layout.
+                if not from_minimize_restore:
+                    pos_map_exact = _get_pos_map_for_exact_slot(mon_idx, col, row)
+                    target_exact = (col, row)
+                    if pos_map_exact and target_exact in pos_map_exact:
+                        with self.lock:
+                            self.window_mgr.grid_state[hwnd] = (mon_idx, col, row)
+                        grid_snapshot[hwnd] = (mon_idx, col, row)
+                        x, y, w, h = pos_map_exact[target_exact]
+                        self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                        # Some apps apply a delayed self-resize right after unmaximize.
+                        # Re-check briefly and clamp again only when drift is detected.
+                        for settle_delay in (0.05, 0.14):
+                            if not user32.IsWindow(hwnd):
+                                break
+                            if get_window_state(hwnd) != "normal":
+                                break
+                            time.sleep(settle_delay)
+                            if not _slot_is_drifted(hwnd, x, y, w, h):
+                                break
+                            log(
+                                f"[RESTORE] Re-clamp maximize restore hwnd={hwnd} "
+                                f"slot=({col},{row})"
+                            )
+                            self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                        continue
+                    # If no exact map is available, avoid aggressive fallback/repack that can
+                    # shuffle slots; keep current slot hint and wait for next stable pass.
+                    log(f"[RESTORE] Deferred exact slot map for maximized restore hwnd={hwnd} ({col},{row})")
                     continue
 
                 # Only minimized restores need post-repack fallback.
