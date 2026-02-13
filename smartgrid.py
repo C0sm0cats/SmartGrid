@@ -11,6 +11,7 @@ import time
 import threading
 import winsound
 import bisect
+import math
 from ctypes import wintypes
 import win32gui
 import win32api
@@ -40,10 +41,10 @@ TEAMS_TOAST_MAX_WIDTH = 400
 TEAMS_TOAST_MAX_HEIGHT = 300
 
 # Timing constants
-ANIMATION_DURATION = 0.20
+ANIMATION_DURATION = 0.08
 ANIMATION_FPS = 60
 DRAG_MONITOR_FPS = 60  # Reduced from 200
-RETILE_DEBOUNCE = 0.5  # 500ms between auto-retiles
+RETILE_DEBOUNCE = 0.05  # 50ms between auto-retiles
 CACHE_TTL = 5.0  # Cache validity duration
 TILE_TIMEOUT = 2.0  # Max time for tiling operation
 MAX_TILE_RETRIES = 10
@@ -293,7 +294,16 @@ def create_icon_image():
     
     return image
 
-def animate_window_move(hwnd, target_x, target_y, target_w, target_h):
+def animate_window_move(
+    hwnd,
+    target_x,
+    target_y,
+    target_w,
+    target_h,
+    duration=ANIMATION_DURATION,
+    fps=ANIMATION_FPS,
+    effect="smoothstep",
+):
     """Animate window movement/resizing with easing"""
     try:
         # Current position
@@ -312,16 +322,88 @@ def animate_window_move(hwnd, target_x, target_y, target_w, target_h):
             abs(start_w - target_w) < 5 and abs(start_h - target_h) < 5):
             return False
         
+        fps = max(1, int(fps))
+        duration = max(0.0, float(duration))
+        if duration <= 0.0:
+            return False
         # Number of frames
-        frames = int(ANIMATION_DURATION * ANIMATION_FPS)
+        frames = max(1, int(duration * fps))
         
         # Interpolation with easing
         for i in range(1, frames + 1):
             t = i / frames
-            ease = t * t * (3 - 2 * t)  # Smoothstep (no overshoot)
+            if effect == "linear":
+                ease = t
+            elif effect == "ease_in":
+                ease = t ** 3
+            elif effect == "ease_in_out":
+                ease = 0.5 * (1.0 - math.cos(math.pi * t))
+            elif effect == "ease_out":
+                ease = 1.0 - ((1.0 - t) ** 3)
+            elif effect == "expo_out":
+                ease = 1.0 if t >= 1.0 else (1.0 - (2.0 ** (-10.0 * t)))
+            elif effect == "back_out":
+                c1 = 1.70158
+                c3 = c1 + 1.0
+                p = t - 1.0
+                ease = 1.0 + (c3 * (p ** 3)) + (c1 * (p ** 2))
+            elif effect == "elastic_out":
+                if t <= 0.0 or t >= 1.0:
+                    ease = t
+                else:
+                    c4 = (2.0 * math.pi) / 3.0
+                    ease = (2.0 ** (-10.0 * t)) * math.sin((t * 10.0 - 0.75) * c4) + 1.0
+            elif effect == "spring_out":
+                if t <= 0.0:
+                    ease = 0.0
+                elif t >= 1.0:
+                    ease = 1.0
+                else:
+                    # Damped spring response (distinct from elastic: less aggressive, more "physical").
+                    zeta = 0.32
+                    omega0 = 10.0
+                    omega_d = omega0 * math.sqrt(max(1e-6, 1.0 - zeta * zeta))
+                    expo = math.exp(-zeta * omega0 * t)
+                    sin_scale = zeta / math.sqrt(max(1e-6, 1.0 - zeta * zeta))
+                    ease = 1.0 - expo * (
+                        math.cos(omega_d * t) + sin_scale * math.sin(omega_d * t)
+                    )
+            elif effect == "crit_damped":
+                if t <= 0.0:
+                    ease = 0.0
+                elif t >= 1.0:
+                    ease = 1.0
+                else:
+                    # Critically damped response: fast settle, no overshoot.
+                    omega = 10.0
+                    ease = 1.0 - math.exp(-omega * t) * (1.0 + omega * t)
+            elif effect == "bounce_out":
+                n1 = 7.5625
+                d1 = 2.75
+                if t < 1.0 / d1:
+                    ease = n1 * t * t
+                elif t < 2.0 / d1:
+                    p = t - 1.5 / d1
+                    ease = n1 * p * p + 0.75
+                elif t < 2.5 / d1:
+                    p = t - 2.25 / d1
+                    ease = n1 * p * p + 0.9375
+                else:
+                    p = t - 2.625 / d1
+                    ease = n1 * p * p + 0.984375
+            elif effect == "arc_wave":
+                ease = 0.5 * (1.0 - math.cos(math.pi * t))
+            else:  # smoothstep (default)
+                ease = t * t * (3 - 2 * t)
 
             x = start_x + (target_x - start_x) * ease
             y = start_y + (target_y - start_y) * ease
+            if effect == "arc_wave":
+                # Curved "fly-in" path for a visibly distinct premium effect.
+                travel = math.hypot(target_x - start_x, target_y - start_y)
+                arc_amp = max(16.0, min(90.0, travel * 0.12))
+                direction = -1.0 if target_y >= start_y else 1.0
+                y += direction * math.sin(math.pi * t) * arc_amp
             w = start_w + (target_w - start_w) * ease
             h = start_h + (target_h - start_h) * ease
             
@@ -336,7 +418,7 @@ def animate_window_move(hwnd, target_x, target_y, target_w, target_h):
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSENDCHANGING
             )
             
-            time.sleep(1.0 / ANIMATION_FPS)
+            time.sleep(1.0 / fps)
         
         return True
     
@@ -431,6 +513,12 @@ class WindowManager:
     def __init__(self, gap=DEFAULT_GAP, edge_padding=DEFAULT_EDGE_PADDING):
         self.gap = gap
         self.edge_padding = edge_padding
+        self.animation_enabled = True
+        self.animation_duration = ANIMATION_DURATION
+        self.animation_fps = ANIMATION_FPS
+        self.animation_effect = "crit_damped"
+        self.tile_timeout = TILE_TIMEOUT
+        self.max_tile_retries = MAX_TILE_RETRIES
         
         # Window tracking
         self.grid_state = {}  # hwnd → (monitor_idx, col, row)
@@ -657,8 +745,17 @@ class WindowManager:
             user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED)
             
-            if animate:
-                animated = animate_window_move(hwnd, x, y, w, h)
+            if animate and self.animation_enabled:
+                animated = animate_window_move(
+                    hwnd,
+                    x,
+                    y,
+                    w,
+                    h,
+                    duration=self.animation_duration,
+                    fps=self.animation_fps,
+                    effect=self.animation_effect,
+                )
                 if animated:
                     # Exact final position after animation
                     lb, tb, rb, bb = get_frame_borders(hwnd)
@@ -675,8 +772,8 @@ class WindowManager:
             
             flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOSENDCHANGING
             
-            for attempt in range(MAX_TILE_RETRIES):
-                if time.time() - start_time > TILE_TIMEOUT:
+            for attempt in range(max(1, int(self.max_tile_retries))):
+                if time.time() - start_time > max(0.2, float(self.tile_timeout)):
                     log(f"[WARN] Tile timeout for hwnd={hwnd}")
                     break
                 
@@ -739,6 +836,7 @@ class SmartGrid:
         self.ignore_retile_until = 0.0
         self.last_visible_count = 0
         self.last_retile_time = 0.0
+        self.retile_debounce = RETILE_DEBOUNCE
         self.last_known_count = 0
         self.layout_signature = {}
         self.layout_capacity = {}
@@ -3330,7 +3428,7 @@ class SmartGrid:
             pass
     
     def show_settings_dialog(self):
-        """Show settings dialog to modify GAP and EDGE_PADDING."""
+        """Show settings dialog to modify layout, speed, animation, and compact options."""
         old_ignore = self.ignore_retile_until
         self.ignore_retile_until = float('inf')  # Block tiling
         
@@ -3345,8 +3443,8 @@ class SmartGrid:
             dialog = tk.Toplevel(root)
             dialog.title("SmartGrid Settings")
             dialog.attributes('-topmost', True)
-            dialog.resizable(False, False)
-            self._center_tk_window(dialog, 350, 250, monitor_idx=self.current_monitor_index)
+            dialog.resizable(True, True)
+            self._center_tk_window(dialog, 500, 680, monitor_idx=self.current_monitor_index)
             
             title = tk.Label(dialog, text="SmartGrid Settings", font=("Arial", 12, "bold"))
             title.pack(pady=10)
@@ -3383,6 +3481,228 @@ class SmartGrid:
             padding_label = tk.Label(padding_frame, text=f"(current: {self.edge_padding}px)",
                                     font=("Arial", 9, "italic"))
             padding_label.pack(side=tk.LEFT, padx=10)
+
+            # Retile speed and stability
+            speed_frame = tk.LabelFrame(dialog, text="Retile Speed & Stability", padx=10, pady=10)
+            speed_frame.pack(fill=tk.X, padx=15, pady=5)
+
+            debounce_values = [50, 100, 200, 350, 500, 750, 1000, 1500, 2000, 3000]
+            current_debounce_ms = int(round(float(self.retile_debounce) * 1000.0))
+            current_debounce_idx = min(
+                range(len(debounce_values)),
+                key=lambda i: abs(debounce_values[i] - current_debounce_ms)
+            )
+            debounce_idx_var = tk.IntVar(value=current_debounce_idx)
+            debounce_display_var = tk.StringVar()
+            debounce_profile_var = tk.StringVar()
+
+            def set_debounce_label():
+                idx = max(0, min(len(debounce_values) - 1, int(debounce_idx_var.get())))
+                val = debounce_values[idx]
+                if val <= 150:
+                    profile = "Very Fast"
+                elif val <= 500:
+                    profile = "Fast"
+                elif val <= 1000:
+                    profile = "Balanced"
+                elif val <= 2000:
+                    profile = "Stable"
+                else:
+                    profile = "Very Stable"
+                debounce_display_var.set(f"{val} ms")
+                debounce_profile_var.set(profile)
+                debounce_idx_var.set(idx)
+
+            def change_debounce(delta):
+                debounce_idx_var.set(int(debounce_idx_var.get()) + delta)
+                set_debounce_label()
+
+            debounce_row = tk.Frame(speed_frame)
+            debounce_row.pack(fill=tk.X)
+            tk.Label(debounce_row, text="Retile Debounce", width=18, anchor="w").pack(side=tk.LEFT, padx=2)
+            tk.Button(debounce_row, text="-", width=2, command=lambda: change_debounce(-1)).pack(side=tk.LEFT, padx=(2, 1))
+            tk.Label(debounce_row, textvariable=debounce_display_var, width=9, anchor="center").pack(side=tk.LEFT, padx=2)
+            tk.Button(debounce_row, text="+", width=2, command=lambda: change_debounce(1)).pack(side=tk.LEFT, padx=(1, 6))
+            tk.Label(debounce_row, textvariable=debounce_profile_var, width=12, anchor="w", fg="#555555").pack(side=tk.LEFT, padx=(2, 0))
+            set_debounce_label()
+            tk.Label(
+                speed_frame,
+                text="Lower = faster retile after events, Higher = fewer retiles.",
+                font=("Arial", 8),
+                fg="gray",
+                anchor="w",
+            ).pack(fill=tk.X, padx=2, pady=(2, 6))
+
+            timeout_options = ["1.0s", "1.5s", "2.0s", "2.5s", "3.0s", "3.5s"]
+            timeout_values = [1.0, 1.5, 2.0, 2.5, 3.0, 3.5]
+            current_timeout_idx = min(
+                range(len(timeout_values)),
+                key=lambda i: abs(timeout_values[i] - float(self.window_mgr.tile_timeout))
+            )
+            timeout_var = tk.StringVar(value=timeout_options[current_timeout_idx])
+            speed_row2 = tk.Frame(speed_frame)
+            speed_row2.pack(fill=tk.X)
+            tk.Label(speed_row2, text="Timeout", width=10, anchor="w").pack(side=tk.LEFT, padx=(2, 2))
+            ttk.Combobox(
+                speed_row2, textvariable=timeout_var, values=timeout_options,
+                state="readonly", width=8
+            ).pack(side=tk.LEFT, padx=4)
+
+            retries_options = ["5", "8", "10", "12", "15", "20"]
+            retries_values = [5, 8, 10, 12, 15, 20]
+            current_retries_idx = min(
+                range(len(retries_values)),
+                key=lambda i: abs(retries_values[i] - int(self.window_mgr.max_tile_retries))
+            )
+            retries_var = tk.StringVar(value=retries_options[current_retries_idx])
+            tk.Label(speed_row2, text="Retries", width=8, anchor="w").pack(side=tk.LEFT, padx=(16, 2))
+            ttk.Combobox(
+                speed_row2, textvariable=retries_var, values=retries_options,
+                state="readonly", width=6
+            ).pack(side=tk.LEFT, padx=4)
+
+            # Retile effect / animation
+            anim_frame = tk.LabelFrame(dialog, text="Retile Effect", padx=10, pady=10)
+            anim_frame.pack(fill=tk.X, padx=15, pady=5)
+
+            anim_enabled_var = tk.BooleanVar(value=bool(self.window_mgr.animation_enabled))
+            tk.Checkbutton(
+                anim_frame,
+                text="Enable animated retile",
+                variable=anim_enabled_var,
+            ).pack(anchor="w", pady=(0, 5))
+
+            anim_opts_frame = tk.Frame(anim_frame)
+            anim_opts_frame.pack(fill=tk.X)
+
+            effect_frame = tk.Frame(anim_opts_frame)
+            effect_frame.pack(fill=tk.X)
+            effect_map = {
+                "Critically Damped": "crit_damped",
+                "Spring": "spring_out",
+                "Wave (Arc)": "arc_wave",
+            }
+            reverse_effect_map = {v: k for k, v in effect_map.items()}
+            current_effect_label = reverse_effect_map.get(
+                getattr(self.window_mgr, "animation_effect", "crit_damped"),
+                "Critically Damped",
+            )
+            effect_var = tk.StringVar(value=current_effect_label)
+            tk.Label(effect_frame, text="Effect", width=12, anchor="w").pack(side=tk.LEFT, padx=2)
+            ttk.Combobox(
+                effect_frame,
+                textvariable=effect_var,
+                values=list(effect_map.keys()),
+                state="readonly",
+                width=18,
+            ).pack(side=tk.LEFT, padx=4)
+
+            duration_values_ms = [80, 120, 160, 200, 250, 300, 400, 500, 700]
+            current_duration_ms = int(round(float(self.window_mgr.animation_duration) * 1000.0))
+            current_duration_idx = min(
+                range(len(duration_values_ms)),
+                key=lambda i: abs(duration_values_ms[i] - current_duration_ms)
+            )
+            duration_idx_var = tk.IntVar(value=current_duration_idx)
+            duration_display_var = tk.StringVar()
+            duration_profile_var = tk.StringVar()
+
+            def set_duration_label():
+                idx = max(0, min(len(duration_values_ms) - 1, int(duration_idx_var.get())))
+                val = duration_values_ms[idx]
+                if val <= 120:
+                    profile = "Very Fast"
+                elif val <= 200:
+                    profile = "Fast"
+                elif val <= 300:
+                    profile = "Balanced"
+                elif val <= 500:
+                    profile = "Smooth"
+                else:
+                    profile = "Cinematic"
+                duration_display_var.set(f"{val} ms")
+                duration_profile_var.set(profile)
+                duration_idx_var.set(idx)
+
+            def change_duration(delta):
+                duration_idx_var.set(int(duration_idx_var.get()) + delta)
+                set_duration_label()
+
+            duration_frame = tk.Frame(anim_opts_frame)
+            duration_frame.pack(fill=tk.X, pady=(4, 0))
+            tk.Label(duration_frame, text="Duration", width=12, anchor="w").pack(side=tk.LEFT, padx=2)
+            tk.Button(duration_frame, text="-", width=2, command=lambda: change_duration(-1)).pack(side=tk.LEFT, padx=(2, 1))
+            tk.Label(duration_frame, textvariable=duration_display_var, width=9, anchor="center").pack(side=tk.LEFT, padx=2)
+            tk.Button(duration_frame, text="+", width=2, command=lambda: change_duration(1)).pack(side=tk.LEFT, padx=(1, 6))
+            tk.Label(duration_frame, textvariable=duration_profile_var, width=10, anchor="w", fg="#555555").pack(side=tk.LEFT, padx=(2, 0))
+            set_duration_label()
+
+            fps_values = [24, 30, 45, 60, 75, 90, 120, 144]
+            current_fps = max(1, int(self.window_mgr.animation_fps))
+            current_fps_idx = min(
+                range(len(fps_values)),
+                key=lambda i: abs(fps_values[i] - current_fps)
+            )
+            fps_idx_var = tk.IntVar(value=current_fps_idx)
+            fps_display_var = tk.StringVar()
+            fps_profile_var = tk.StringVar()
+
+            def set_fps_label():
+                idx = max(0, min(len(fps_values) - 1, int(fps_idx_var.get())))
+                val = fps_values[idx]
+                if val <= 30:
+                    profile = "Battery"
+                elif val <= 60:
+                    profile = "Balanced"
+                elif val <= 90:
+                    profile = "Smooth"
+                elif val <= 120:
+                    profile = "High"
+                else:
+                    profile = "Ultra"
+                fps_display_var.set(str(val))
+                fps_profile_var.set(profile)
+                fps_idx_var.set(idx)
+
+            def change_fps(delta):
+                fps_idx_var.set(int(fps_idx_var.get()) + delta)
+                set_fps_label()
+
+            fps_frame = tk.Frame(anim_opts_frame)
+            fps_frame.pack(fill=tk.X, pady=(4, 0))
+            tk.Label(fps_frame, text="FPS", width=12, anchor="w").pack(side=tk.LEFT, padx=2)
+            tk.Button(fps_frame, text="-", width=2, command=lambda: change_fps(-1)).pack(side=tk.LEFT, padx=(2, 1))
+            tk.Label(fps_frame, textvariable=fps_display_var, width=5, anchor="center").pack(side=tk.LEFT, padx=2)
+            tk.Button(fps_frame, text="+", width=2, command=lambda: change_fps(1)).pack(side=tk.LEFT, padx=(1, 6))
+            tk.Label(fps_frame, textvariable=fps_profile_var, width=10, anchor="w", fg="#555555").pack(side=tk.LEFT, padx=(2, 0))
+            set_fps_label()
+
+            def sync_anim_controls(*_):
+                if anim_enabled_var.get():
+                    if not anim_opts_frame.winfo_manager():
+                        anim_opts_frame.pack(fill=tk.X)
+                else:
+                    if anim_opts_frame.winfo_manager():
+                        anim_opts_frame.pack_forget()
+
+            anim_enabled_var.trace_add("write", sync_anim_controls)
+            sync_anim_controls()
+
+            # Auto-compact options moved from tray into settings.
+            compact_frame = tk.LabelFrame(dialog, text="Auto-Compact", padx=10, pady=10)
+            compact_frame.pack(fill=tk.X, padx=15, pady=5)
+            compact_min_var = tk.BooleanVar(value=bool(self.compact_on_minimize))
+            compact_close_var = tk.BooleanVar(value=bool(self.compact_on_close))
+            tk.Checkbutton(
+                compact_frame,
+                text="Auto-compact on minimize",
+                variable=compact_min_var,
+            ).pack(anchor="w")
+            tk.Checkbutton(
+                compact_frame,
+                text="Auto-compact on close",
+                variable=compact_close_var,
+            ).pack(anchor="w")
             
             # Buttons
             button_frame = tk.Frame(dialog)
@@ -3391,6 +3711,12 @@ class SmartGrid:
             def apply_and_close():
                 gap_str = gap_var.get().replace("px", "")
                 padding_str = padding_var.get().replace("px", "")
+                debounce_s = debounce_values[int(debounce_idx_var.get())] / 1000.0
+                timeout_s = float(timeout_var.get().replace("s", ""))
+                retries_n = int(retries_var.get())
+                anim_duration_s = duration_values_ms[int(duration_idx_var.get())] / 1000.0
+                anim_fps_n = fps_values[int(fps_idx_var.get())]
+                anim_effect_key = effect_map.get(effect_var.get(), "crit_damped")
                 
                 # Close BEFORE modifying
                 dialog.destroy()
@@ -3404,8 +3730,27 @@ class SmartGrid:
                 self.edge_padding = int(padding_str)
                 self.window_mgr.gap = self.gap
                 self.window_mgr.edge_padding = self.edge_padding
+                self.retile_debounce = debounce_s
+                self.window_mgr.tile_timeout = timeout_s
+                self.window_mgr.max_tile_retries = retries_n
+                self.window_mgr.animation_enabled = bool(anim_enabled_var.get())
+                self.window_mgr.animation_duration = anim_duration_s
+                self.window_mgr.animation_fps = anim_fps_n
+                self.window_mgr.animation_effect = anim_effect_key
+                self.compact_on_minimize = bool(compact_min_var.get())
+                self.compact_on_close = bool(compact_close_var.get())
                 
-                log(f"[SETTINGS] GAP={self.gap}px, EDGE_PADDING={self.edge_padding}px")
+                log(
+                    f"[SETTINGS] GAP={self.gap}px EDGE_PADDING={self.edge_padding}px "
+                    f"RETILE_DEBOUNCE={self.retile_debounce:.2f}s TILE_TIMEOUT={self.window_mgr.tile_timeout:.1f}s "
+                    f"RETRIES={self.window_mgr.max_tile_retries} "
+                    f"ANIM={'ON' if self.window_mgr.animation_enabled else 'OFF'} "
+                    f"EFFECT={self.window_mgr.animation_effect} "
+                    f"DUR={self.window_mgr.animation_duration:.2f}s FPS={self.window_mgr.animation_fps} "
+                    f"COMPACT_MIN={'ON' if self.compact_on_minimize else 'OFF'} "
+                    f"COMPACT_CLOSE={'ON' if self.compact_on_close else 'OFF'}"
+                )
+                self.update_tray_menu()
                 
                 # Apply
                 self.apply_new_settings()
@@ -3417,6 +3762,25 @@ class SmartGrid:
             def reset_defaults():
                 gap_var.set(gap_options[3])
                 padding_var.set(padding_options[2])
+                debounce_idx_var.set(
+                    min(range(len(debounce_values)), key=lambda i: abs(debounce_values[i] - 50))
+                )
+                set_debounce_label()
+                timeout_var.set("2.0s")
+                retries_var.set("10")
+                anim_enabled_var.set(True)
+                effect_var.set("Critically Damped")
+                duration_idx_var.set(
+                    min(range(len(duration_values_ms)), key=lambda i: abs(duration_values_ms[i] - 80))
+                )
+                set_duration_label()
+                fps_idx_var.set(
+                    min(range(len(fps_values)), key=lambda i: abs(fps_values[i] - 60))
+                )
+                set_fps_label()
+                compact_min_var.set(True)
+                compact_close_var.set(True)
+                sync_anim_controls()
             
             tk.Button(button_frame, text="Apply", command=apply_and_close, width=12,
                     bg="#4CAF50", fg="white").pack(side=tk.LEFT, padx=5)
@@ -3426,6 +3790,17 @@ class SmartGrid:
             info = tk.Label(dialog, text="Changes apply immediately on next retile cycle",
                             font=("Arial", 8), fg="gray")
             info.pack(pady=5)
+
+            # Fit dialog to full content so footer buttons are never clipped.
+            dialog.update_idletasks()
+            req_w = dialog.winfo_reqwidth() + 20
+            req_h = dialog.winfo_reqheight() + 20
+            screen_w = dialog.winfo_screenwidth()
+            screen_h = dialog.winfo_screenheight()
+            target_w = max(500, min(screen_w - 60, req_w))
+            target_h = max(680, min(screen_h - 80, req_h))
+            self._center_tk_window(dialog, target_w, target_h, monitor_idx=self.current_monitor_index)
+            dialog.minsize(500, 680)
             
             def on_close():
                 self.ignore_retile_until = old_ignore
@@ -3444,7 +3819,7 @@ class SmartGrid:
             self.ignore_retile_until = old_ignore
     
     def apply_new_settings(self):
-        """Apply new GAP/EDGE_PADDING settings."""
+        """Apply updated settings and force one clean retile."""
         # Wait for all Tkinter windows to close
         time.sleep(0.5)
         
@@ -3570,17 +3945,6 @@ class SmartGrid:
             MenuItem('Layout Manager (Ctrl+Alt+P)',
                      lambda: user32.PostThreadMessageW(self.main_thread_id, CUSTOM_OPEN_LAYOUT_PICKER, 0, 0)),
             Menu.SEPARATOR,
-            MenuItem(
-                f"Auto-Compact on Minimize: {'ON' if self.compact_on_minimize else 'OFF'}",
-                lambda: self.toggle_compact_on_minimize(),
-                checked=lambda item: self.compact_on_minimize
-            ),
-            MenuItem(
-                f"Auto-Compact on Close: {'ON' if self.compact_on_close else 'OFF'}",
-                lambda: self.toggle_compact_on_close(),
-                checked=lambda item: self.compact_on_close
-            ),
-            Menu.SEPARATOR,
             MenuItem('Workspaces', Menu(
                 MenuItem('Switch to Workspace 1 (Ctrl+Alt+1)',
                          lambda: threading.Thread(target=self.ws_switch, args=(0,), daemon=True).start()),
@@ -3590,12 +3954,25 @@ class SmartGrid:
                          lambda: threading.Thread(target=self.ws_switch, args=(2,), daemon=True).start()),
             )),
             Menu.SEPARATOR,
-            MenuItem('Settings (Gap & Padding)',
+            MenuItem('Settings',
                      lambda: user32.PostThreadMessageW(self.main_thread_id, CUSTOM_OPEN_SETTINGS, 0, 0)),
+            MenuItem('Open Recycle Bin',
+                     lambda: threading.Thread(target=self.open_recycle_bin, daemon=True).start()),
             MenuItem('Hotkeys Cheatsheet', lambda: threading.Thread(target=show_hotkeys_tooltip, daemon=True).start()),
             MenuItem('Quit SmartGrid (Ctrl+Alt+Q)', self.on_quit_from_tray)
         )
     
+    def open_recycle_bin(self):
+        """Open Windows Recycle Bin from systray menu."""
+        try:
+            os.startfile("shell:RecycleBinFolder")
+        except Exception as e:
+            log(f"[ERROR] open_recycle_bin: {e}")
+            try:
+                winsound.MessageBeep(0xFFFFFFFF)
+            except Exception:
+                pass
+
     def update_tray_menu(self):
         """Refresh systray menu."""
         if self.tray_icon:
@@ -4595,7 +4972,7 @@ class SmartGrid:
                         elif layout_change:
                             should_retile = True
 
-                        if should_retile and now - self.last_retile_time >= RETILE_DEBOUNCE:
+                        if should_retile and now - self.last_retile_time >= self.retile_debounce:
                             if self.compact_on_close and closed_windows and not new_windows:
                                 log(f"[AUTO-RETILE] close compaction {self.last_visible_count} → {current_count} windows")
                                 self._compact_grid_after_close()
@@ -4703,27 +5080,153 @@ class SmartGrid:
 def show_hotkeys_tooltip():
     """Show hotkeys notification."""
     try:
-        ctypes.windll.user32.MessageBoxW(
-            0,
-            "---------- MAIN HOTKEYS\n\n"
-            "Ctrl+Alt+T       →  Toggle tiling on/off\n"
-            "Ctrl+Alt+R       →  Force re-tile all windows now\n"
-            "Ctrl+Alt+S       →  Enter Swap Mode (red border + arrows)\n"
-            "Ctrl+Alt+M      →  Move workspace to next monitor\n"
-            "Ctrl+Alt+F       →  Toggle Floating Selected Window\n\n"
-            "Ctrl+Alt+P       →  Layout Manager\n\n"
-            "---------- OPTIONS\n\n"
-            "Auto-Compact on Minimize → Fills empty slot\n"
-            "Auto-Compact on Close    → Fills empty slot\n\n"
-            "---------- WORKSPACES\n\n"
-            "Ctrl+Alt+1/2/3   →  Switch workspace\n\n"
-            "---------- EXIT\n\n"
-            "Ctrl+Alt+Q       →  Quit",
-            "SmartGrid Hotkeys",
-            0x40
+        import tkinter as tk
+        import tkinter.font as tkfont
+
+        left_col_width = 32
+
+        sections = [
+            (
+                "MAIN HOTKEYS",
+                [
+                    ("Ctrl+Alt+T", "Toggle tiling on/off"),
+                    ("Ctrl+Alt+R", "Force re-tile all windows now"),
+                    ("Ctrl+Alt+S", "Enter Swap Mode (red border + arrows)"),
+                    ("Ctrl+Alt+M", "Move workspace to next monitor"),
+                    ("Ctrl+Alt+F", "Toggle Floating Selected Window"),
+                    ("Ctrl+Alt+P", "Layout Manager"),
+                ],
+                "title_main",
+            ),
+            (
+                "SETTINGS",
+                [
+                    ("Gap / Edge Padding", "Window spacing and margins"),
+                    ("Retile Debounce", "Auto-retile responsiveness"),
+                    ("Timeout / Retries", "Robustness for stubborn windows"),
+                    ("Animated Retile", "Enable/disable animation"),
+                    ("Effect", "Critically Damped / Spring / Wave (Arc)"),
+                    ("Duration / FPS", "Animation feel and smoothness"),
+                    ("Auto-Compact on Minimize", "Fills empty slot"),
+                    ("Auto-Compact on Close", "Fills empty slot"),
+                ],
+                "title_settings",
+            ),
+            (
+                "WORKSPACES",
+                [
+                    ("Ctrl+Alt+1/2/3", "Switch workspace"),
+                ],
+                "title_workspaces",
+            ),
+            (
+                "EXIT",
+                [
+                    ("Ctrl+Alt+Q", "Quit"),
+                ],
+                "title_exit",
+            ),
+        ]
+
+        # Exact content line count: section title + rows, plus one blank line between sections.
+        content_lines = sum(1 + len(rows) for _title, rows, _tag in sections) + (len(sections) - 1)
+        text_height = max(16, min(42, content_lines + 1))
+
+        def format_row(left, right):
+            return f"{left:<{left_col_width}} -> {right}\n"
+
+        preview_lines = []
+        for idx, (title, rows, _title_tag) in enumerate(sections):
+            preview_lines.append(title)
+            for left, right in rows:
+                preview_lines.append(format_row(left, right).rstrip("\n"))
+            if idx < len(sections) - 1:
+                preview_lines.append("")
+        max_line_chars = max((len(line) for line in preview_lines), default=80)
+        text_width = max(78, max_line_chars + 2)
+
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+
+        dialog = tk.Toplevel(root)
+        dialog.title("SmartGrid Hotkeys")
+        dialog.attributes("-topmost", True)
+        dialog.resizable(False, False)
+
+        text = tk.Text(
+            dialog,
+            width=text_width,
+            height=text_height,
+            wrap="none",
+            font=("Consolas", 10),
+            padx=10,
+            pady=10,
+            bd=1,
+            relief="solid",
         )
+        text.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 8))
+
+        body_font = tkfont.Font(family="Consolas", size=10)
+        title_font = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        text.tag_configure("body", font=body_font, foreground="#1F1F1F")
+        text.tag_configure("title_main", font=title_font, foreground="#0D47A1")
+        text.tag_configure("title_settings", font=title_font, foreground="#1B5E20")
+        text.tag_configure("title_workspaces", font=title_font, foreground="#E65100")
+        text.tag_configure("title_exit", font=title_font, foreground="#B71C1C")
+
+        for idx, (title, rows, title_tag) in enumerate(sections):
+            text.insert("end", f"{title}\n", title_tag)
+            for left, right in rows:
+                text.insert("end", format_row(left, right), "body")
+            if idx < len(sections) - 1:
+                text.insert("end", "\n", "body")
+
+        text.configure(state="disabled")
+
+        button_row = tk.Frame(dialog)
+        button_row.pack(fill=tk.X, padx=10, pady=(0, 10))
+
+        def close_dialog(_event=None):
+            try:
+                dialog.destroy()
+            except Exception:
+                pass
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            return "break"
+
+        close_btn = tk.Button(button_row, text="Close", width=12, command=close_dialog)
+        close_btn.pack()
+
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        dialog.bind("<Escape>", close_dialog)
+
+        dialog.update_idletasks()
+        w = dialog.winfo_width()
+        h = dialog.winfo_height()
+        sw = dialog.winfo_screenwidth()
+        sh = dialog.winfo_screenheight()
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+        dialog.geometry(f"{w}x{h}+{x}+{y}")
+
+        dialog.focus_force()
+        close_btn.focus_set()
+        root.mainloop()
     except Exception as e:
         log(f"[ERROR] show_hotkeys_tooltip: {e}")
+        try:
+            ctypes.windll.user32.MessageBoxW(
+                0,
+                "SmartGrid Hotkeys\n\nFailed to open advanced cheatsheet popup.",
+                "SmartGrid Hotkeys",
+                0x30,
+            )
+        except Exception:
+            pass
 
 # ==============================================================================
 # MAIN ENTRY POINT
