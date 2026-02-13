@@ -849,6 +849,14 @@ class SmartGrid:
         self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
         # hwnd -> minimize snapshot (for exact full-grid restore when context matches)
         self.minimize_restore_snapshots = {}
+        # Guard against apps that self-resize after being tiled (e.g. hover/titlebar effects).
+        self.slot_guard_enabled = True
+        self.slot_guard_tolerance_pos = 8
+        self.slot_guard_tolerance_size = 8
+        self.slot_guard_cooldown = 0.22
+        self.slot_guard_scan_interval = 0.20
+        self._slot_guard_last_scan = 0.0
+        self._slot_guard_last_fix = {}
         
         # Multi-monitor & workspaces
         self.monitors_cache = []
@@ -1631,6 +1639,150 @@ class SmartGrid:
     def _backfill_window_state_ws(self):
         with self.lock:
             self._backfill_window_state_ws_locked()
+
+    def _get_inner_window_rect(self, hwnd):
+        """Return client-like rect (x, y, w, h) corrected from frame borders."""
+        rect = wintypes.RECT()
+        if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+        lb, tb, rb, bb = get_frame_borders(hwnd)
+        return (
+            rect.left + lb,
+            rect.top + tb,
+            rect.right - rect.left - lb - rb,
+            rect.bottom - rect.top - tb - bb,
+        )
+
+    def _is_slot_drifted(self, hwnd, target_x, target_y, target_w, target_h):
+        cur = self._get_inner_window_rect(hwnd)
+        if not cur:
+            return False
+        cur_x, cur_y, cur_w, cur_h = cur
+        return (
+            abs(cur_x - target_x) > self.slot_guard_tolerance_pos
+            or abs(cur_y - target_y) > self.slot_guard_tolerance_pos
+            or abs(cur_w - target_w) > self.slot_guard_tolerance_size
+            or abs(cur_h - target_h) > self.slot_guard_tolerance_size
+        )
+
+    def _enforce_tiled_slot_bounds(self):
+        """
+        Re-clamp tiled windows that drift from their assigned slot geometry.
+        This is a targeted guard: no slot reassignment, no global reshuffle.
+        """
+        if not self.slot_guard_enabled:
+            return 0
+
+        now = time.time()
+        if now - self._slot_guard_last_scan < self.slot_guard_scan_interval:
+            return 0
+        self._slot_guard_last_scan = now
+
+        with self._tiling_lock:
+            with self.lock:
+                grid_snapshot = dict(self.window_mgr.grid_state)
+                layout_sig_snapshot = dict(self.layout_signature)
+                layout_capacity_snapshot = dict(self.layout_capacity)
+
+            windows_by_monitor = {}
+            for hwnd, (mon_idx, col, row) in grid_snapshot.items():
+                windows_by_monitor.setdefault(mon_idx, []).append((hwnd, col, row))
+
+            corrections_plan = []
+
+            for mon_idx, entries in windows_by_monitor.items():
+                if mon_idx < 0 or mon_idx >= len(self.monitors_cache):
+                    continue
+
+                live = []
+                max_col = 0
+                max_row = 0
+                for hwnd, col, row in entries:
+                    if not user32.IsWindow(hwnd):
+                        continue
+                    if get_window_state(hwnd) != "normal":
+                        continue
+                    if not user32.IsWindowVisible(hwnd):
+                        continue
+                    live.append((hwnd, col, row))
+                    max_col = max(max_col, int(col))
+                    max_row = max(max_row, int(row))
+
+                if not live:
+                    continue
+
+                sig = layout_sig_snapshot.get(mon_idx)
+                if sig is None:
+                    sig = self.layout_engine.choose_layout(len(live))
+                layout, info = sig
+
+                capacity = layout_capacity_snapshot.get(mon_idx, 0)
+                if capacity <= 0:
+                    capacity = self._layout_capacity(layout, info)
+                # Ensure we can represent existing coordinates even if caches are stale.
+                capacity = max(capacity, len(live), (max_col + 1) * (max_row + 1))
+
+                positions, grid_coords = self.layout_engine.calculate_positions(
+                    self.monitors_cache[mon_idx],
+                    capacity,
+                    self.gap,
+                    self.edge_padding,
+                    layout,
+                    info,
+                )
+                pos_map = dict(zip(grid_coords, positions))
+
+                if not pos_map:
+                    continue
+
+                # If signature/capacity is stale, fallback to count-based layout once.
+                if any((col, row) not in pos_map for _h, col, row in live):
+                    fallback_count = max(len(live), (max_col + 1) * (max_row + 1))
+                    fb_layout, fb_info = self.layout_engine.choose_layout(fallback_count)
+                    fb_cap = self._layout_capacity(fb_layout, fb_info)
+                    positions, grid_coords = self.layout_engine.calculate_positions(
+                        self.monitors_cache[mon_idx],
+                        fb_cap,
+                        self.gap,
+                        self.edge_padding,
+                        fb_layout,
+                        fb_info,
+                    )
+                    pos_map = dict(zip(grid_coords, positions))
+
+                for hwnd, col, row in live:
+                    target = (col, row)
+                    if target not in pos_map:
+                        continue
+                    if now - self._slot_guard_last_fix.get(hwnd, 0.0) < self.slot_guard_cooldown:
+                        continue
+                    x, y, w, h = pos_map[target]
+                    if not self._is_slot_drifted(hwnd, x, y, w, h):
+                        continue
+                    corrections_plan.append((hwnd, col, row, x, y, w, h))
+
+            corrections = 0
+            for hwnd, col, row, x, y, w, h in corrections_plan:
+                if not user32.IsWindow(hwnd):
+                    continue
+                if get_window_state(hwnd) != "normal":
+                    continue
+                self.window_mgr.force_tile_resizable(hwnd, x, y, w, h, animate=False)
+                self._slot_guard_last_fix[hwnd] = time.time()
+                corrections += 1
+                try:
+                    title = win32gui.GetWindowText(hwnd)[:45]
+                except Exception:
+                    title = ""
+                log(f"[SLOT-GUARD] Re-clamp ({col},{row}) -> {title}")
+                time.sleep(0.004)
+
+            if corrections:
+                for hwnd in list(self._slot_guard_last_fix.keys()):
+                    if not user32.IsWindow(hwnd):
+                        self._slot_guard_last_fix.pop(hwnd, None)
+
+            return corrections
 
     def _restore_windows_to_slots(self, restored):
         """Place restored windows back into their saved slots."""
@@ -5005,6 +5157,8 @@ class SmartGrid:
                         self.last_known_count = len(known_hwnds)
                         time.sleep(0.06)
                         continue
+
+                    self._enforce_tiled_slot_bounds()
 
                     if self._run_deferred_compactions():
                         time.sleep(0.08)
