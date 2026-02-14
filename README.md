@@ -18,7 +18,7 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, a **Layout 
 - **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
 - **Layout Manager (`Ctrl+Alt+P`):** choose a target layout and assign windows/apps to slots visually
 - **Auto-Compact on minimize/close:** hybrid compaction (fills empty slots, retile only when layout must change)
-- **System tray menu:** toggle tiling, retile, swap mode, move workspace, compact options, settings (gap/padding), hotkeys, quit
+- **System tray menu:** toggle tiling, retile, swap mode, compact options, settings (gap/padding), hotkeys, quit
 - **Active border:** green border follows the active tiled window
 
 ## Hotkeys
@@ -28,7 +28,6 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, a **Layout 
 | `Ctrl + Alt + T`     | Toggle tiling (on/off)                                                      |
 | `Ctrl + Alt + R`     | Force re-tile all windows now                                               |
 | `Ctrl + Alt + S`     | Enter Swap Mode (red border + arrows)                                       |
-| `Ctrl + Alt + M`     | Move current workspace to next monitor                                      |
 | `Ctrl + Alt + F`     | Toggle Floating Selected Window                                             |
 | `Ctrl + Alt + P`     | Open Layout Manager (manual layout assignment)                              |
 | `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
@@ -114,15 +113,15 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 
 ## Multi-Monitor Workflow
 
-**Move current workspace to another screen:**
-1. Tile your windows on monitor 1, workspace 1
-2. Press `Ctrl + Alt + M` → workspace 1 jumps to monitor 2, perfectly resized
-3. Press again → continues cycling (monitor 3, back to 1...)
+**Move windows across screens (recommended):**
+1. Drag a tiled window by its title bar
+2. Drop it on the target monitor (preview shows the target slot)
+3. SmartGrid re-tiles it into the target monitor layout automatically
 
-**Important:** Only the **current workspace** moves. Other workspaces stay on their monitors.
-
-**What happens if target workspace has windows?**  
-→ They **merge** and re-tile together (like i3/Sway behavior)
+For manual re-organization at scale, use **Layout Manager** (`Ctrl+Alt+P`) and pick:
+- Target Monitor
+- Target Workspace
+- Target Layout
 
 ## Notes / Troubleshooting
 
