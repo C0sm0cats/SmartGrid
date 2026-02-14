@@ -4966,15 +4966,41 @@ class SmartGrid:
                     for hwnd, (m, _c, _r) in self.window_mgr.maximized_windows.items():
                         if user32.IsWindow(hwnd):
                             _add_hit(m, self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0)))
-                    # Include window ownership from all workspace maps (WS1/WS2/WS3) so
-                    # this indicator reflects multi-monitor presence across workspaces.
+                    # Include saved ownership across all workspace maps (WS1/WS2/WS3),
+                    # but honor reset blocks to avoid false positives in the indicator.
+                    profile_live_by_ws = {}
+                    for (p_mon, p_ws, p_layout, p_info), profile_map in self.workspace_layout_profiles.items():
+                        ws_key = (int(p_mon), int(p_ws))
+                        if ws_key[0] < 0 or ws_key[0] >= len(self.monitors_cache):
+                            continue
+                        if ws_key[1] not in (0, 1, 2):
+                            continue
+                        if ws_key in profile_live_by_ws:
+                            continue
+                        if (p_mon, p_ws, p_layout, p_info) in self._manual_layout_profile_reset_block:
+                            continue
+                        if not isinstance(profile_map, dict):
+                            continue
+                        if any(user32.IsWindow(hwnd) for hwnd in profile_map.keys()):
+                            profile_live_by_ws[ws_key] = True
+
                     for m_idx, ws_list in self.workspaces.items():
                         if not isinstance(ws_list, list):
                             continue
                         for ws_idx, ws_map in enumerate(ws_list):
                             if not isinstance(ws_map, dict):
                                 continue
-                            if any(user32.IsWindow(hwnd) for hwnd in ws_map.keys()):
+                            ws_live = any(user32.IsWindow(hwnd) for hwnd in ws_map.keys())
+                            profile_live = bool(profile_live_by_ws.get((m_idx, ws_idx), False))
+                            reset_blocked = (m_idx, ws_idx) in self._manual_layout_reset_block
+
+                            # After a workspace reset, ws_map can still contain legacy residue
+                            # that is intentionally ignored by prefill logic. Only count real
+                            # non-reset profile hits for the indicator in that state.
+                            if reset_blocked:
+                                if profile_live:
+                                    _add_hit(m_idx, ws_idx)
+                            elif ws_live or profile_live:
                                 _add_hit(m_idx, ws_idx)
 
                 detected_monitors = sorted(
