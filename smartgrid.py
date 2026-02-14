@@ -1251,13 +1251,14 @@ class SmartGrid:
         if target_ws not in (0, 1, 2):
             return False
 
-        selected_sig = None
-        selected_profile_key = None
-        if layout is not None:
-            selected_sig = self._normalize_layout_signature(layout, info)
-            selected_profile_key = self._layout_profile_key(
-                mon_idx, target_ws, selected_sig[0], selected_sig[1]
-            )
+        # Global reset path intentionally removed: callers must provide an explicit layout.
+        if layout is None:
+            return False
+
+        selected_sig = self._normalize_layout_signature(layout, info)
+        selected_profile_key = self._layout_profile_key(
+            mon_idx, target_ws, selected_sig[0], selected_sig[1]
+        )
 
         windows_to_minimize = []
         with self._tiling_lock:
@@ -1276,28 +1277,26 @@ class SmartGrid:
                         current_sig[0], current_sig[1]
                     )
 
-                if selected_profile_key is not None:
-                    self.workspace_layout_profiles.pop(selected_profile_key, None)
-                    self._manual_layout_profile_reset_block.add(selected_profile_key)
+                self.workspace_layout_profiles.pop(selected_profile_key, None)
+                self._manual_layout_profile_reset_block.add(selected_profile_key)
 
                 # Layout-specific reset:
                 # - non-current selected layout: clear only its saved profile
                 # - current selected layout: clear active workspace map and visual state
-                should_clear_workspace = layout is None
-                if selected_sig is not None:
-                    if current_sig is not None:
-                        should_clear_workspace = current_sig == selected_sig
-                    else:
-                        # Legacy fallback for old states missing an explicit signature.
-                        live_count = sum(1 for hwnd in ws_snapshot.keys() if user32.IsWindow(hwnd))
-                        if live_count <= 0:
-                            live_count = len(ws_snapshot)
-                        inferred_sig = None
-                        if live_count > 0:
-                            inferred_sig = self._normalize_layout_signature(
-                                *self.layout_engine.choose_layout(live_count)
-                            )
-                        should_clear_workspace = inferred_sig == selected_sig
+                should_clear_workspace = False
+                if current_sig is not None:
+                    should_clear_workspace = current_sig == selected_sig
+                else:
+                    # Legacy fallback for old states missing an explicit signature.
+                    live_count = sum(1 for hwnd in ws_snapshot.keys() if user32.IsWindow(hwnd))
+                    if live_count <= 0:
+                        live_count = len(ws_snapshot)
+                    inferred_sig = None
+                    if live_count > 0:
+                        inferred_sig = self._normalize_layout_signature(
+                            *self.layout_engine.choose_layout(live_count)
+                        )
+                    should_clear_workspace = inferred_sig == selected_sig
 
                 if not should_clear_workspace:
                     return True
@@ -1342,20 +1341,7 @@ class SmartGrid:
                     self.layout_capacity.pop(mon_idx, None)
                     self.ignore_retile_until = max(self.ignore_retile_until, time.time() + 0.45)
 
-                # Legacy full reset (without explicit layout) clears every saved profile
-                # for this workspace. Layout-specific reset keeps the other profile variants.
-                if layout is None:
-                    for key in [
-                        key for key in self.workspace_layout_profiles.keys()
-                        if key[0] == mon_idx and key[1] == target_ws
-                    ]:
-                        self.workspace_layout_profiles.pop(key, None)
-                    for key in [
-                        key for key in self._manual_layout_profile_reset_block
-                        if key[0] == mon_idx and key[1] == target_ws
-                    ]:
-                        self._manual_layout_profile_reset_block.discard(key)
-                elif current_sig is not None and selected_sig is not None and current_sig == selected_sig:
+                if current_sig is not None and current_sig == selected_sig:
                     current_profile_key = self._layout_profile_key(
                         mon_idx, target_ws, current_sig[0], current_sig[1]
                     )
