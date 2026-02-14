@@ -4943,6 +4943,7 @@ class SmartGrid:
                     ws_num = self.current_workspace.get(mon_idx, 0) + 1
                     active_monitors = set()
                     monitor_ws_hits = {}
+                    profile_live_by_ws = {}
 
                     def _add_hit(m_idx, ws_idx=None):
                         if m_idx is None or not (0 <= int(m_idx) < len(self.monitors_cache)):
@@ -4957,18 +4958,6 @@ class SmartGrid:
                             return
                         monitor_ws_hits.setdefault(m_idx, set()).add(ws_idx)
 
-                    for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items():
-                        if user32.IsWindow(hwnd):
-                            _add_hit(m, self.current_workspace.get(m, 0))
-                    for hwnd, (m, _c, _r) in self.window_mgr.minimized_windows.items():
-                        if user32.IsWindow(hwnd):
-                            _add_hit(m, self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0)))
-                    for hwnd, (m, _c, _r) in self.window_mgr.maximized_windows.items():
-                        if user32.IsWindow(hwnd):
-                            _add_hit(m, self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0)))
-                    # Include saved ownership across all workspace maps (WS1/WS2/WS3),
-                    # but honor reset blocks to avoid false positives in the indicator.
-                    profile_live_by_ws = {}
                     for (p_mon, p_ws, p_layout, p_info), profile_map in self.workspace_layout_profiles.items():
                         ws_key = (int(p_mon), int(p_ws))
                         if ws_key[0] < 0 or ws_key[0] >= len(self.monitors_cache):
@@ -4983,6 +4972,33 @@ class SmartGrid:
                             continue
                         if any(user32.IsWindow(hwnd) for hwnd in profile_map.keys()):
                             profile_live_by_ws[ws_key] = True
+
+                    def _is_ws_hidden_by_reset(m_idx, ws_idx):
+                        return (
+                            (m_idx, ws_idx) in self._manual_layout_reset_block
+                            and not bool(profile_live_by_ws.get((m_idx, ws_idx), False))
+                        )
+
+                    for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items():
+                        if user32.IsWindow(hwnd):
+                            ws_idx = self.current_workspace.get(m, 0)
+                            if _is_ws_hidden_by_reset(m, ws_idx):
+                                continue
+                            _add_hit(m, ws_idx)
+                    for hwnd, (m, _c, _r) in self.window_mgr.minimized_windows.items():
+                        if user32.IsWindow(hwnd):
+                            ws_idx = self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0))
+                            if _is_ws_hidden_by_reset(m, ws_idx):
+                                continue
+                            _add_hit(m, ws_idx)
+                    for hwnd, (m, _c, _r) in self.window_mgr.maximized_windows.items():
+                        if user32.IsWindow(hwnd):
+                            ws_idx = self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0))
+                            if _is_ws_hidden_by_reset(m, ws_idx):
+                                continue
+                            _add_hit(m, ws_idx)
+                    # Include saved ownership across all workspace maps (WS1/WS2/WS3),
+                    # but honor reset blocks to avoid false positives in the indicator.
 
                     for m_idx, ws_list in self.workspaces.items():
                         if not isinstance(ws_list, list):
