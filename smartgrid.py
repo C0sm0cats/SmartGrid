@@ -55,6 +55,15 @@ DWMWA_BORDER_COLOR = 34
 DWMWA_COLOR_NONE = 0xFFFFFFFF
 DWMWA_EXTENDED_FRAME_BOUNDS = 9
 
+# Border colors (COLORREF: 0x00BBGGRR)
+BORDER_COLOR_ACTIVE = 0x0000FF00  # Bright green
+BORDER_COLOR_SWAP = 0x00705AE4  # Softer red (#E45A70)
+
+# Layout picker button colors
+RESET_BTN_BG = "#C45564"
+RESET_BTN_HOVER = "#D06473"
+RESET_BTN_ACTIVE = "#A94452"
+
 # Window styles
 GWL_STYLE = -16
 WS_THICKFRAME = 0x00040000
@@ -715,9 +724,9 @@ class WindowManager:
         
         set_window_border(hwnd, color)
         
-        if color == 0x0000FF00:  # Green = active
+        if color == BORDER_COLOR_ACTIVE:  # Green = active
             self.current_hwnd = hwnd
-        elif color == 0x000000FF:  # Red = swap mode
+        elif color == BORDER_COLOR_SWAP:  # Red = swap mode
             self.selected_hwnd = hwnd
     
     def force_tile_resizable(self, hwnd, x, y, w, h, animate=True):
@@ -839,6 +848,14 @@ class SmartGrid:
         self.layout_signature = {}
         self.layout_capacity = {}
         self.workspace_layout_signature = {}  # (monitor_idx, ws_idx) -> (layout, info)
+        # (monitor_idx, ws_idx, layout, info) -> workspace map
+        self.workspace_layout_profiles = {}
+        # (monitor_idx, ws_idx) with manual layout lock (preserve chosen layout/holes).
+        self._workspace_manual_layout_lock = set()
+        # (monitor_idx, ws_idx) where manual picker prefill must stay empty after reset.
+        self._manual_layout_reset_block = set()
+        # (monitor_idx, ws_idx, layout, info) reset markers for layout-specific reset.
+        self._manual_layout_profile_reset_block = set()
         self._maximize_freeze_active = False
         self.compact_on_minimize = True
         self.compact_on_close = True
@@ -907,6 +924,10 @@ class SmartGrid:
             old_layout_signature = dict(self.layout_signature)
             old_layout_capacity = dict(self.layout_capacity)
             old_workspace_layout_signature = dict(self.workspace_layout_signature)
+            old_workspace_layout_profiles = dict(self.workspace_layout_profiles)
+            old_workspace_manual_layout_lock = set(self._workspace_manual_layout_lock)
+            old_manual_layout_reset_block = set(self._manual_layout_reset_block)
+            old_manual_layout_profile_reset_block = set(self._manual_layout_profile_reset_block)
 
             for i in range(new_count):
                 ws_maps = old_workspaces.get(i)
@@ -941,6 +962,28 @@ class SmartGrid:
                 for (mon, ws), sig in old_workspace_layout_signature.items()
                 if mon < new_count and ws in (0, 1, 2)
             }
+            self.workspace_layout_profiles = {
+                (mon, ws, layout, info): (
+                    dict(ws_map) if isinstance(ws_map, dict) else {}
+                )
+                for (mon, ws, layout, info), ws_map in old_workspace_layout_profiles.items()
+                if mon < new_count and ws in (0, 1, 2)
+            }
+            self._workspace_manual_layout_lock = {
+                (mon, ws)
+                for (mon, ws) in old_workspace_manual_layout_lock
+                if mon < new_count and ws in (0, 1, 2)
+            }
+            self._manual_layout_reset_block = {
+                (mon, ws)
+                for (mon, ws) in old_manual_layout_reset_block
+                if mon < new_count and ws in (0, 1, 2)
+            }
+            self._manual_layout_profile_reset_block = {
+                (mon, ws, layout, info)
+                for (mon, ws, layout, info) in old_manual_layout_profile_reset_block
+                if mon < new_count and ws in (0, 1, 2)
+            }
 
     # ==========================================================================
     # LAYOUT HELPERS (Manual layout picker)
@@ -969,6 +1012,23 @@ class SmartGrid:
             ("Grid 4x3", ("grid", (4, 3))),
             ("Grid 5x3", ("grid", (5, 3))),
         ]
+
+    def _normalize_layout_signature(self, layout, info):
+        """Return canonical (layout, info) signature used by caches and profile keys."""
+        if layout == "grid":
+            if isinstance(info, (list, tuple)) and len(info) == 2:
+                try:
+                    return "grid", (int(info[0]), int(info[1]))
+                except Exception:
+                    pass
+            return "grid", (2, 2)
+        if layout in ("full", "side_by_side", "master_stack"):
+            return layout, None
+        return layout, info
+
+    def _layout_profile_key(self, mon_idx, ws_idx, layout, info):
+        layout, info = self._normalize_layout_signature(layout, info)
+        return int(mon_idx), int(ws_idx), layout, info
 
     def _get_monitor_index_for_rect(self, rect):
         w_center_x = (rect.left + rect.right) // 2
@@ -1071,6 +1131,7 @@ class SmartGrid:
 
     def _apply_manual_layout(self, mon_idx, layout, info, assignments, target_ws=None, activate_target=True):
         """Apply manual layout with explicit slot assignments."""
+        layout, info = self._normalize_layout_signature(layout, info)
         capacity = self._layout_capacity(layout, info)
         if not assignments or len(assignments) > capacity:
             return False
@@ -1080,8 +1141,18 @@ class SmartGrid:
             active_ws = self.current_workspace.get(mon_idx, 0)
         if target_ws is None or target_ws not in (0, 1, 2):
             target_ws = active_ws
+
+        profile_key = self._layout_profile_key(mon_idx, target_ws, layout, info)
+
         with self.lock:
             self.workspace_layout_signature[(mon_idx, target_ws)] = (layout, info)
+            self.workspace_layout_profiles[profile_key] = {
+                hwnd: {"pos": (0, 0, 800, 600), "grid": (int(col), int(row)), "state": "normal"}
+                for (col, row), hwnd in assignments.items()
+            }
+            self._workspace_manual_layout_lock.add((mon_idx, target_ws))
+            self._manual_layout_reset_block.discard((mon_idx, target_ws))
+            self._manual_layout_profile_reset_block.discard(profile_key)
 
         workspace_layout = {
             hwnd: {"pos": (0, 0, 800, 600), "grid": (int(col), int(row)), "state": "normal"}
@@ -1093,7 +1164,7 @@ class SmartGrid:
             with self.lock:
                 ws_list = self.workspaces.get(mon_idx, [])
                 if 0 <= target_ws < len(ws_list):
-                    ws_list[target_ws] = workspace_layout
+                    ws_list[target_ws] = dict(workspace_layout)
             return True
 
         monitor_rect = self.monitors_cache[mon_idx]
@@ -1160,7 +1231,7 @@ class SmartGrid:
                     self.window_mgr.maximized_windows.pop(hwnd, None)
                 ws_list = self.workspaces.get(mon_idx, [])
                 if 0 <= target_ws < len(ws_list):
-                    ws_list[target_ws] = workspace_layout
+                    ws_list[target_ws] = dict(workspace_layout)
 
             for (col, row), hwnd in assignments.items():
                 if (col, row) in pos_map:
@@ -1171,6 +1242,141 @@ class SmartGrid:
         self.layout_signature[mon_idx] = (layout, info)
         self.layout_capacity[mon_idx] = capacity
         self.ignore_retile_until = time.time() + 0.3
+        return True
+
+    def _reset_manual_layout(self, mon_idx, target_ws, layout=None, info=None):
+        """Clear saved slot assignments for a target monitor/workspace/layout."""
+        if mon_idx < 0 or mon_idx >= len(self.monitors_cache):
+            return False
+        if target_ws not in (0, 1, 2):
+            return False
+
+        selected_sig = None
+        selected_profile_key = None
+        if layout is not None:
+            selected_sig = self._normalize_layout_signature(layout, info)
+            selected_profile_key = self._layout_profile_key(
+                mon_idx, target_ws, selected_sig[0], selected_sig[1]
+            )
+
+        windows_to_minimize = []
+        with self._tiling_lock:
+            with self.lock:
+                ws_list = self.workspaces.get(mon_idx)
+                if not isinstance(ws_list, list) or not (0 <= target_ws < len(ws_list)):
+                    return False
+
+                ws_map = ws_list[target_ws] if isinstance(ws_list[target_ws], dict) else {}
+                ws_snapshot = dict(ws_map)
+                active_ws = self.current_workspace.get(mon_idx, 0)
+                is_active_target = active_ws == target_ws
+                current_sig = self.workspace_layout_signature.get((mon_idx, target_ws))
+                if current_sig is not None:
+                    current_sig = self._normalize_layout_signature(
+                        current_sig[0], current_sig[1]
+                    )
+
+                if selected_profile_key is not None:
+                    self.workspace_layout_profiles.pop(selected_profile_key, None)
+                    self._manual_layout_profile_reset_block.add(selected_profile_key)
+
+                # Layout-specific reset:
+                # - non-current selected layout: clear only its saved profile
+                # - current selected layout: clear active workspace map and visual state
+                should_clear_workspace = layout is None
+                if selected_sig is not None:
+                    if current_sig is not None:
+                        should_clear_workspace = current_sig == selected_sig
+                    else:
+                        # Legacy fallback for old states missing an explicit signature.
+                        live_count = sum(1 for hwnd in ws_snapshot.keys() if user32.IsWindow(hwnd))
+                        if live_count <= 0:
+                            live_count = len(ws_snapshot)
+                        inferred_sig = None
+                        if live_count > 0:
+                            inferred_sig = self._normalize_layout_signature(
+                                *self.layout_engine.choose_layout(live_count)
+                            )
+                        should_clear_workspace = inferred_sig == selected_sig
+
+                if not should_clear_workspace:
+                    return True
+
+                # Active workspace reset: minimize windows previously assigned to its slots
+                # so the workspace appears visually empty immediately.
+                if is_active_target:
+                    for hwnd, data in ws_snapshot.items():
+                        if not user32.IsWindow(hwnd):
+                            continue
+
+                        slot_mon = mon_idx
+                        slot_col = 0
+                        slot_row = 0
+                        if isinstance(data, dict):
+                            grid = data.get("grid")
+                            if isinstance(grid, (list, tuple)) and len(grid) == 2:
+                                try:
+                                    slot_col = int(grid[0])
+                                    slot_row = int(grid[1])
+                                except Exception:
+                                    slot_col, slot_row = 0, 0
+
+                        tracked = self.window_mgr.grid_state.pop(hwnd, None)
+                        if tracked is None:
+                            tracked = self.window_mgr.maximized_windows.pop(hwnd, None)
+                        if tracked is None:
+                            tracked = self.window_mgr.minimized_windows.get(hwnd)
+                        if tracked is not None:
+                            t_mon, t_col, t_row = tracked
+                            if 0 <= int(t_mon) < len(self.monitors_cache):
+                                slot_mon = int(t_mon)
+                            slot_col = int(t_col)
+                            slot_row = int(t_row)
+
+                        self.window_mgr.maximized_windows.pop(hwnd, None)
+                        self.window_mgr.minimized_windows[hwnd] = (slot_mon, slot_col, slot_row)
+                        self.window_state_ws[hwnd] = target_ws
+                        windows_to_minimize.append(hwnd)
+
+                    self.layout_signature.pop(mon_idx, None)
+                    self.layout_capacity.pop(mon_idx, None)
+                    self.ignore_retile_until = max(self.ignore_retile_until, time.time() + 0.45)
+
+                # Legacy full reset (without explicit layout) clears every saved profile
+                # for this workspace. Layout-specific reset keeps the other profile variants.
+                if layout is None:
+                    for key in [
+                        key for key in self.workspace_layout_profiles.keys()
+                        if key[0] == mon_idx and key[1] == target_ws
+                    ]:
+                        self.workspace_layout_profiles.pop(key, None)
+                    for key in [
+                        key for key in self._manual_layout_profile_reset_block
+                        if key[0] == mon_idx and key[1] == target_ws
+                    ]:
+                        self._manual_layout_profile_reset_block.discard(key)
+                elif current_sig is not None and selected_sig is not None and current_sig == selected_sig:
+                    current_profile_key = self._layout_profile_key(
+                        mon_idx, target_ws, current_sig[0], current_sig[1]
+                    )
+                    self.workspace_layout_profiles.pop(current_profile_key, None)
+
+                ws_list[target_ws] = {}
+                self.workspace_layout_signature.pop((mon_idx, target_ws), None)
+                self._workspace_manual_layout_lock.discard((mon_idx, target_ws))
+                self._manual_layout_reset_block.add((mon_idx, target_ws))
+
+        for hwnd in windows_to_minimize:
+            if not user32.IsWindow(hwnd):
+                continue
+            state = get_window_state(hwnd)
+            if state not in ("normal", "maximized"):
+                continue
+            try:
+                user32.ShowWindowAsync(hwnd, win32con.SW_MINIMIZE)
+            except Exception:
+                pass
+
         return True
     
     # ==========================================================================
@@ -1251,14 +1457,26 @@ class SmartGrid:
                     if prev_capacity:
                         effective_count = max(effective_count, prev_capacity)
 
+                with self.lock:
+                    active_ws = self.current_workspace.get(mon_idx, 0)
+                    ws_key = (mon_idx, active_ws)
+                    manual_locked = ws_key in self._workspace_manual_layout_lock
+                    forced_sig = self.workspace_layout_signature.get(ws_key) if manual_locked else None
+
                 prev_sig = self.layout_signature.get(mon_idx)
-                layout, info = self.layout_engine.choose_layout(effective_count)
-                capacity = self._layout_capacity(layout, info)
-                layout_changed = prev_sig is not None and prev_sig != (layout, info)
+                use_manual_layout = bool(manual_locked and forced_sig)
+                if use_manual_layout:
+                    layout, info = forced_sig
+                    capacity = self._layout_capacity(layout, info)
+                    layout_changed = False
+                else:
+                    layout, info = self.layout_engine.choose_layout(effective_count)
+                    capacity = self._layout_capacity(layout, info)
+                    layout_changed = prev_sig is not None and prev_sig != (layout, info)
                 self.layout_signature[mon_idx] = (layout, info)
                 self.layout_capacity[mon_idx] = capacity
-                active_ws = self.current_workspace.get(mon_idx, 0)
-                self.workspace_layout_signature[(mon_idx, active_ws)] = (layout, info)
+                if not use_manual_layout:
+                    self.workspace_layout_signature[(mon_idx, active_ws)] = (layout, info)
                 self._tile_monitor(
                     mon_idx,
                     windows,
@@ -1267,7 +1485,7 @@ class SmartGrid:
                     info,
                     capacity,
                     reserved_slots=reserved_slots,
-                    compact_after_restore=layout_changed,
+                    compact_after_restore=(layout_changed and not use_manual_layout),
                 )
             
             # Update grid_state with lock - ONLY ONCE
@@ -2457,7 +2675,7 @@ class SmartGrid:
         # Swap mode: red border
         if self.swap_mode_lock and self.window_mgr.selected_hwnd:
             if user32.IsWindow(self.window_mgr.selected_hwnd):
-                set_window_border(self.window_mgr.selected_hwnd, 0x000000FF)
+                set_window_border(self.window_mgr.selected_hwnd, BORDER_COLOR_SWAP)
             return
         
         active = user32.GetForegroundWindow()
@@ -2474,10 +2692,10 @@ class SmartGrid:
                 if self.window_mgr.current_hwnd and user32.IsWindow(self.window_mgr.current_hwnd):
                     set_window_border(self.window_mgr.current_hwnd, None)
                 
-                self.window_mgr.apply_border(active, 0x0000FF00)
+                self.window_mgr.apply_border(active, BORDER_COLOR_ACTIVE)
                 self.window_mgr.current_hwnd = active
             else:
-                set_window_border(self.window_mgr.current_hwnd, 0x0000FF00)
+                set_window_border(self.window_mgr.current_hwnd, BORDER_COLOR_ACTIVE)
             
             return
         
@@ -2489,7 +2707,7 @@ class SmartGrid:
                     last_still_tiled = self.window_mgr.last_active_hwnd in self.window_mgr.grid_state
                 
                 if last_still_tiled:
-                    set_window_border(self.window_mgr.last_active_hwnd, 0x0000FF00)
+                    set_window_border(self.window_mgr.last_active_hwnd, BORDER_COLOR_ACTIVE)
                     self.window_mgr.current_hwnd = self.window_mgr.last_active_hwnd
     
     # ==========================================================================
@@ -2567,7 +2785,7 @@ class SmartGrid:
         
         self.window_mgr.selected_hwnd = candidate
         time.sleep(0.05)
-        set_window_border(self.window_mgr.selected_hwnd, 0x000000FF)
+        set_window_border(self.window_mgr.selected_hwnd, BORDER_COLOR_SWAP)
         
         title = win32gui.GetWindowText(self.window_mgr.selected_hwnd)[:50]
         log(f"\n[SWAP] ✓ Activated - Selected: '{title}'")
@@ -2595,7 +2813,7 @@ class SmartGrid:
                 time.sleep(0.04)
                 set_window_border(self.window_mgr.selected_hwnd, None)
                 time.sleep(0.04)
-                set_window_border(self.window_mgr.selected_hwnd, 0x000000FF)
+                set_window_border(self.window_mgr.selected_hwnd, BORDER_COLOR_SWAP)
                 
                 title = win32gui.GetWindowText(self.window_mgr.selected_hwnd)[:50]
                 log(f"[SWAP] ✓ '{title}' swapped {direction}")
@@ -2758,7 +2976,7 @@ class SmartGrid:
                     active in self.window_mgr.grid_state)
         
         if is_tiled:
-            self.window_mgr.apply_border(active, 0x0000FF00)
+            self.window_mgr.apply_border(active, BORDER_COLOR_ACTIVE)
             log(f"[SWAP] Green border restored")
         
         self.swap_mode_lock = False
@@ -3368,7 +3586,19 @@ class SmartGrid:
         with self.lock:
             current_sig = self.layout_signature.get(monitor_idx)
             if current_sig is not None:
+                current_sig = self._normalize_layout_signature(current_sig[0], current_sig[1])
                 self.workspace_layout_signature[(monitor_idx, ws)] = current_sig
+                profile_key = self._layout_profile_key(
+                    monitor_idx, ws, current_sig[0], current_sig[1]
+                )
+                # Respect layout-specific reset markers: do not auto-recreate a reset profile
+                # during workspace autosave; only explicit Apply should restore it.
+                if profile_key in self._manual_layout_profile_reset_block:
+                    self.workspace_layout_profiles.pop(profile_key, None)
+                else:
+                    self.workspace_layout_profiles[profile_key] = dict(
+                        self.workspaces[monitor_idx][ws]
+                    )
         
         log(f"[WS] ✓ Workspace {ws+1} saved ({len(self.workspaces[monitor_idx][ws])} windows)")
     
@@ -4339,6 +4569,8 @@ class SmartGrid:
                 default = layout_labels[0]
                 mon_idx = get_target_monitor_index() if mon_idx is None else mon_idx
                 with self.lock:
+                    if (mon_idx, ws_idx) in self._manual_layout_reset_block:
+                        return default
                     active_ws = self.current_workspace.get(mon_idx, 0)
                     remembered = self.workspace_layout_signature.get((mon_idx, ws_idx))
                     ws_list = self.workspaces.get(mon_idx, [])
@@ -4813,13 +5045,42 @@ class SmartGrid:
                 """Return {(col,row): label} for the target workspace."""
                 mon_idx = get_target_monitor_index()
                 target_ws = get_target_ws_index()
+                selected_sig = self._normalize_layout_signature(layout, info)
                 with self.lock:
                     ws_list = self.workspaces.get(mon_idx, [])
                     ws_map = {}
                     if 0 <= target_ws < len(ws_list) and isinstance(ws_list[target_ws], dict):
                         ws_map = dict(ws_list[target_ws])
+                    profile_key = self._layout_profile_key(
+                        mon_idx, target_ws, selected_sig[0], selected_sig[1]
+                    )
+                    profile_map_raw = self.workspace_layout_profiles.get(profile_key, {})
+                    profile_map = (
+                        dict(profile_map_raw) if isinstance(profile_map_raw, dict) else {}
+                    )
+                    profile_reset_blocked = (
+                        profile_key in self._manual_layout_profile_reset_block
+                    )
                     active_ws = self.current_workspace.get(mon_idx, 0)
-                    sig = self.layout_signature.get(mon_idx)
+                    runtime_sig = self.layout_signature.get(mon_idx)
+                    if runtime_sig is not None:
+                        runtime_sig = self._normalize_layout_signature(
+                            runtime_sig[0], runtime_sig[1]
+                        )
+                    ws_sig = self.workspace_layout_signature.get((mon_idx, target_ws))
+                    if ws_sig is not None:
+                        ws_sig = self._normalize_layout_signature(ws_sig[0], ws_sig[1])
+                    elif ws_map:
+                        # Legacy fallback for older states where the workspace signature
+                        # was not yet persisted.
+                        saved_count = sum(1 for hwnd in ws_map.keys() if user32.IsWindow(hwnd))
+                        if saved_count <= 0:
+                            saved_count = len(ws_map)
+                        if saved_count > 0:
+                            ws_sig = self._normalize_layout_signature(
+                                *self.layout_engine.choose_layout(saved_count)
+                            )
+                    reset_blocked = (mon_idx, target_ws) in self._manual_layout_reset_block
                     grid_items = [
                         (hwnd, c, r)
                         for hwnd, (m, c, r) in self.window_mgr.grid_state.items()
@@ -4829,15 +5090,30 @@ class SmartGrid:
                 valid_coords = set(grid_coords)
                 prefill = {}
 
+                # Layout-specific reset: keep this target layout empty until the user
+                # explicitly applies a new manual assignment for it.
+                if profile_reset_blocked:
+                    return prefill
+
+                # After a manual reset, keep picker slots empty for this monitor/workspace
+                # only when there is no saved variant for the selected layout.
+                if reset_blocked and not profile_map:
+                    return prefill
+
                 # For the active workspace, prefer current runtime grid when layout matches.
                 if target_ws == active_ws:
                     filtered = [(hwnd, c, r) for hwnd, c, r in grid_items if user32.IsWindow(hwnd)]
-                    if sig is not None:
-                        current_layout = sig
+                    if runtime_sig is not None:
+                        current_layout = runtime_sig
                     else:
-                        current_layout = self.layout_engine.choose_layout(len(filtered)) if filtered else None
+                        current_layout = (
+                            self._normalize_layout_signature(
+                                *self.layout_engine.choose_layout(len(filtered))
+                            )
+                            if filtered else None
+                        )
 
-                    if current_layout == (layout, info):
+                    if current_layout == selected_sig:
                         for hwnd, c, r in filtered:
                             coord = (c, r)
                             if coord not in valid_coords:
@@ -4848,7 +5124,30 @@ class SmartGrid:
                         if prefill:
                             return prefill
 
-                # Fallback: use stored workspace map.
+                # Then try saved profile for this exact target layout.
+                for hwnd, data in profile_map.items():
+                    if not user32.IsWindow(hwnd) or not isinstance(data, dict):
+                        continue
+                    grid = data.get("grid")
+                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                        continue
+                    try:
+                        c = int(grid[0])
+                        r = int(grid[1])
+                    except Exception:
+                        continue
+                    coord = (c, r)
+                    if coord not in valid_coords:
+                        continue
+                    label = hwnd_to_label.get(hwnd)
+                    if label:
+                        prefill[coord] = label
+                if prefill:
+                    return prefill
+
+                # Fallback to workspace map only when this is the workspace's current layout.
+                if ws_sig != selected_sig:
+                    return prefill
                 for hwnd, data in ws_map.items():
                     if not user32.IsWindow(hwnd) or not isinstance(data, dict):
                         continue
@@ -5055,6 +5354,41 @@ class SmartGrid:
                 if not apply_now:
                     threading.Thread(target=self.ws_switch, args=(target_ws, mon_idx), daemon=True).start()
 
+            def reset_layout():
+                mon_idx = get_target_monitor_index()
+                target_ws = get_target_ws_index()
+                sel_label = layout_var.get()
+                layout, info = dict(layout_presets).get(sel_label, (None, None))
+                if layout is None:
+                    sel_idx = layout_combo.current()
+                    if sel_idx is not None and 0 <= sel_idx < len(layout_presets):
+                        layout, info = layout_presets[sel_idx][1]
+                    else:
+                        layout, info = ("full", None)
+                pretty = self._layout_label(layout, info)
+                should_reset = messagebox.askyesno(
+                    "SmartGrid",
+                    (
+                        f"Clear slot assignments for {pretty} on "
+                        f"Monitor {mon_idx + 1}, Workspace {target_ws + 1}?"
+                    ),
+                )
+                if not should_reset:
+                    return
+
+                if not self._reset_manual_layout(mon_idx, target_ws, layout=layout, info=info):
+                    messagebox.showwarning("SmartGrid", "Failed to reset layout.")
+                    return
+
+                # Clear visible selections immediately in the picker.
+                for _coord, var in slot_vars:
+                    var.set("")
+
+                refresh_window_choices()
+                rebuild_slots()
+                update_current_badge()
+                update_apply_state()
+
             apply_btn = tk.Button(
                 action_frame,
                 text="Apply Layout",
@@ -5067,6 +5401,19 @@ class SmartGrid:
             )
             apply_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
             add_hover(apply_btn, accent, accent_hover)
+
+            reset_btn = tk.Button(
+                action_frame,
+                text="Reset Layout",
+                command=reset_layout,
+                width=16,
+                bg=RESET_BTN_BG,
+                fg="white",
+                activebackground=RESET_BTN_ACTIVE,
+                activeforeground="white",
+            )
+            reset_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
+            add_hover(reset_btn, RESET_BTN_BG, RESET_BTN_HOVER)
 
             layout_combo.bind("<<ComboboxSelected>>", rebuild_slots)
             layout_var.trace_add("write", lambda *_: rebuild_slots())
@@ -5103,8 +5450,8 @@ class SmartGrid:
 
             btn_frame = tk.Frame(dialog)
             btn_frame.pack(pady=8)
-            tk.Button(btn_frame, text="Cancel", command=close_picker, width=10).pack(side=tk.LEFT, padx=6)
-            # Recompute final size after footer buttons are created, so Cancel is never clipped.
+            tk.Button(btn_frame, text="Quit", command=close_picker, width=10).pack(side=tk.LEFT, padx=6)
+            # Recompute final size after footer buttons are created, so Quit is never clipped.
             resize_dialog_to_content()
 
             dialog.protocol("WM_DELETE_WINDOW", close_picker)
@@ -5332,14 +5679,25 @@ class SmartGrid:
                         # Use the last known layout capacity to avoid "retile storms" when
                         # windows are temporarily minimized/maximized (visible_count changes,
                         # but the intended grid layout should remain stable).
-                        prev_sig = self.layout_signature.get(mon_idx)
+                        with self.lock:
+                            prev_sig = self.layout_signature.get(mon_idx)
+                            active_ws = self.current_workspace.get(mon_idx, 0)
+                            ws_key = (mon_idx, active_ws)
+                            manual_locked = ws_key in self._workspace_manual_layout_lock
+                            forced_sig = (
+                                self.workspace_layout_signature.get(ws_key)
+                                if manual_locked else None
+                            )
                         if prev_sig is None:
                             continue
-                        expected_count = self._get_layout_count_for_monitor(mon_idx)
-                        if expected_count <= 0:
-                            expected_count = visible_count
-                        layout, info = self.layout_engine.choose_layout(expected_count)
-                        sig = (layout, info)
+                        if manual_locked and forced_sig:
+                            sig = forced_sig
+                        else:
+                            expected_count = self._get_layout_count_for_monitor(mon_idx)
+                            if expected_count <= 0:
+                                expected_count = visible_count
+                            layout, info = self.layout_engine.choose_layout(expected_count)
+                            sig = (layout, info)
                         if prev_sig != sig:
                             layout_change = True
                             break
