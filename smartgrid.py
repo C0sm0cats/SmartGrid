@@ -63,6 +63,11 @@ BORDER_COLOR_SWAP = 0x00705AE4  # Softer red (#E45A70)
 RESET_BTN_BG = "#C45564"
 RESET_BTN_HOVER = "#D06473"
 RESET_BTN_ACTIVE = "#A94452"
+CLEAR_SLOT_BTN_BG = "#F2F4F7"
+CLEAR_SLOT_BTN_FG = "#4A5568"
+CLEAR_SLOT_BTN_BORDER = "#CBD5E0"
+CLEAR_SLOT_BTN_HOVER_BG = "#FFECEC"
+CLEAR_SLOT_BTN_HOVER_FG = "#B42318"
 
 # Window styles
 GWL_STYLE = -16
@@ -862,6 +867,10 @@ class SmartGrid:
         self._pending_compact_minimize = False
         self._pending_compact_close = False
         self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
+        # (monitor_idx, ws_idx) -> set(hwnd) that were parked during workspace switch.
+        # Used as a safety net to avoid losing windows when a workspace map is stale.
+        self._workspace_hidden_windows = {}
+        self._ws_switch_mutex = threading.Lock()
         # hwnd -> minimize snapshot (for exact full-grid restore when context matches)
         self.minimize_restore_snapshots = {}
         # Guard against apps that self-resize after being tiled (e.g. hover/titlebar effects).
@@ -928,6 +937,11 @@ class SmartGrid:
             old_workspace_manual_layout_lock = set(self._workspace_manual_layout_lock)
             old_manual_layout_reset_block = set(self._manual_layout_reset_block)
             old_manual_layout_profile_reset_block = set(self._manual_layout_profile_reset_block)
+            old_workspace_hidden_windows = {
+                key: set(value)
+                for key, value in self._workspace_hidden_windows.items()
+                if isinstance(key, tuple) and isinstance(value, (set, list, tuple))
+            }
 
             for i in range(new_count):
                 ws_maps = old_workspaces.get(i)
@@ -982,6 +996,13 @@ class SmartGrid:
             self._manual_layout_profile_reset_block = {
                 (mon, ws, layout, info)
                 for (mon, ws, layout, info) in old_manual_layout_profile_reset_block
+                if mon < new_count and ws in (0, 1, 2)
+            }
+            self._workspace_hidden_windows = {
+                (mon, ws): {
+                    hwnd for hwnd in hidden_set if user32.IsWindow(hwnd)
+                }
+                for (mon, ws), hidden_set in old_workspace_hidden_windows.items()
                 if mon < new_count and ws in (0, 1, 2)
             }
 
@@ -1137,6 +1158,7 @@ class SmartGrid:
             return False
 
         selected_hwnds = set(assignments.values())
+        selected_sig = (layout, info)
         with self.lock:
             active_ws = self.current_workspace.get(mon_idx, 0)
         if target_ws is None or target_ws not in (0, 1, 2):
@@ -1145,7 +1167,115 @@ class SmartGrid:
         profile_key = self._layout_profile_key(mon_idx, target_ws, layout, info)
 
         with self.lock:
-            self.workspace_layout_signature[(mon_idx, target_ws)] = (layout, info)
+            ws_list_snapshot = self.workspaces.get(mon_idx, [])
+            target_ws_map_snapshot = {}
+            if 0 <= target_ws < len(ws_list_snapshot) and isinstance(ws_list_snapshot[target_ws], dict):
+                target_ws_map_snapshot = dict(ws_list_snapshot[target_ws])
+
+            outgoing_sig = self.workspace_layout_signature.get((mon_idx, target_ws))
+            if outgoing_sig is not None:
+                outgoing_sig = self._normalize_layout_signature(outgoing_sig[0], outgoing_sig[1])
+            elif target_ws == active_ws:
+                runtime_sig = self.layout_signature.get(mon_idx)
+                if runtime_sig is not None:
+                    outgoing_sig = self._normalize_layout_signature(runtime_sig[0], runtime_sig[1])
+
+            if target_ws == active_ws:
+                grid_snapshot = dict(self.window_mgr.grid_state)
+                minimized_snapshot = dict(self.window_mgr.minimized_windows)
+                maximized_snapshot = dict(self.window_mgr.maximized_windows)
+                state_ws_snapshot = dict(self.window_state_ws)
+            else:
+                grid_snapshot = {}
+                minimized_snapshot = {}
+                maximized_snapshot = {}
+                state_ws_snapshot = {}
+
+        def _normalize_saved_entry(data):
+            if not isinstance(data, dict):
+                return None
+            grid = data.get("grid")
+            if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                return None
+            try:
+                col = int(grid[0])
+                row = int(grid[1])
+            except Exception:
+                return None
+            pos = data.get("pos", (0, 0, 800, 600))
+            if not isinstance(pos, (list, tuple)) or len(pos) != 4:
+                pos = (0, 0, 800, 600)
+            else:
+                try:
+                    pos = (int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3]))
+                except Exception:
+                    pos = (0, 0, 800, 600)
+            state = str(data.get("state", "normal")).lower()
+            if state not in ("normal", "minimized", "maximized"):
+                state = "normal"
+            return {"pos": pos, "grid": (col, row), "state": state}
+
+        def _runtime_entry(hwnd, col, row, state):
+            pos = (0, 0, 800, 600)
+            if state == "normal":
+                try:
+                    rect = wintypes.RECT()
+                    if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                        lb, tb, rb, bb = get_frame_borders(hwnd)
+                        pos = (
+                            rect.left + lb,
+                            rect.top + tb,
+                            rect.right - rect.left - lb - rb,
+                            rect.bottom - rect.top - tb - bb,
+                        )
+                except Exception:
+                    pass
+            return {
+                "pos": pos,
+                "grid": (int(col), int(row)),
+                "state": state,
+            }
+
+        outgoing_profile_map = {}
+        for hwnd, data in target_ws_map_snapshot.items():
+            if not user32.IsWindow(hwnd):
+                continue
+            entry = _normalize_saved_entry(data)
+            if entry is not None:
+                outgoing_profile_map[hwnd] = entry
+
+        if target_ws == active_ws:
+            for hwnd, (m, c, r) in grid_snapshot.items():
+                if m != mon_idx or not user32.IsWindow(hwnd):
+                    continue
+                outgoing_profile_map[hwnd] = _runtime_entry(hwnd, c, r, "normal")
+
+            for runtime_map, runtime_state in (
+                (minimized_snapshot, "minimized"),
+                (maximized_snapshot, "maximized"),
+            ):
+                for hwnd, (m, c, r) in runtime_map.items():
+                    if m != mon_idx or not user32.IsWindow(hwnd):
+                        continue
+                    origin_ws = state_ws_snapshot.get(hwnd)
+                    if origin_ws is not None and origin_ws != target_ws:
+                        continue
+                    if origin_ws is None:
+                        owner_ws = self._find_workspace_owner(mon_idx, hwnd, prefer_ws=target_ws)
+                        if owner_ws is not None and owner_ws != target_ws:
+                            continue
+                    outgoing_profile_map[hwnd] = _runtime_entry(hwnd, c, r, runtime_state)
+
+        with self.lock:
+            if outgoing_sig is not None and outgoing_sig != selected_sig and outgoing_profile_map:
+                outgoing_key = self._layout_profile_key(
+                    mon_idx, target_ws, outgoing_sig[0], outgoing_sig[1]
+                )
+                self.workspace_layout_profiles[outgoing_key] = dict(outgoing_profile_map)
+                self._manual_layout_profile_reset_block.discard(outgoing_key)
+                self._manual_layout_reset_block.discard((mon_idx, target_ws))
+
+            self.workspace_layout_signature[(mon_idx, target_ws)] = selected_sig
             self.workspace_layout_profiles[profile_key] = {
                 hwnd: {"pos": (0, 0, 800, 600), "grid": (int(col), int(row)), "state": "normal"}
                 for (col, row), hwnd in assignments.items()
@@ -3496,34 +3626,58 @@ class SmartGrid:
         """Save current workspace state."""
         if monitor_idx not in self.workspaces:
             return
-        
-        ws = self.current_workspace[monitor_idx]
-        self.workspaces[monitor_idx][ws] = {}
-        
-        # Atomic copy of grid_state
+
+        ws = self.current_workspace.get(monitor_idx, 0)
+        if ws not in (0, 1, 2):
+            ws = 0
+
+        # Atomic snapshots used to build a new map without clobbering cached data first.
         with self.lock:
+            ws_list = self.workspaces.get(monitor_idx)
+            if not isinstance(ws_list, list) or not (0 <= ws < len(ws_list)):
+                return
+            previous_ws_map = (
+                dict(ws_list[ws]) if isinstance(ws_list[ws], dict) else {}
+            )
+            other_ws_hwnds = set()
+            for other_ws_idx, other_map in enumerate(ws_list):
+                if other_ws_idx == ws or not isinstance(other_map, dict):
+                    continue
+                other_ws_hwnds.update(other_map.keys())
             grid_snapshot = dict(self.window_mgr.grid_state)
             minimized_snapshot = dict(self.window_mgr.minimized_windows)
             maximized_snapshot = dict(self.window_mgr.maximized_windows)
             state_ws_snapshot = dict(self.window_state_ws)
-        
+            hidden_bucket_snapshot = set(
+                self._workspace_hidden_windows.get((monitor_idx, ws), set())
+            )
+
+        saved_ws_map = {}
+        runtime_monitor_by_hwnd = {}
+        for hwnd, (mon, _c, _r) in grid_snapshot.items():
+            runtime_monitor_by_hwnd[hwnd] = mon
+        for hwnd, (mon, _c, _r) in minimized_snapshot.items():
+            runtime_monitor_by_hwnd.setdefault(hwnd, mon)
+        for hwnd, (mon, _c, _r) in maximized_snapshot.items():
+            runtime_monitor_by_hwnd.setdefault(hwnd, mon)
+
         # Save normal windows
         for hwnd, (mon, col, row) in grid_snapshot.items():
             if mon != monitor_idx or not user32.IsWindow(hwnd):
                 continue
-            
+
             try:
                 rect = wintypes.RECT()
                 if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     continue
-                
+
                 lb, tb, rb, bb = get_frame_borders(hwnd)
                 x = rect.left + lb
                 y = rect.top + tb
                 w = rect.right - rect.left - lb - rb
                 h = rect.bottom - rect.top - tb - bb
-                
-                self.workspaces[monitor_idx][ws][hwnd] = {
+
+                saved_ws_map[hwnd] = {
                     'pos': (x, y, w, h),
                     'grid': (col, row),
                     'state': 'normal'
@@ -3542,14 +3696,14 @@ class SmartGrid:
                 owner_ws = self._find_workspace_owner(monitor_idx, hwnd, prefer_ws=ws)
                 if owner_ws is not None and owner_ws != ws:
                     continue
-            if hwnd in self.workspaces[monitor_idx][ws]:
+            if hwnd in saved_ws_map:
                 continue
-            self.workspaces[monitor_idx][ws][hwnd] = {
+            saved_ws_map[hwnd] = {
                 'pos': (0, 0, 800, 600),
                 'grid': (col, row),
                 'state': 'minimized'
             }
-        
+
         # Save maximized windows
         for hwnd, (mon, col, row) in maximized_snapshot.items():
             if mon != monitor_idx or not user32.IsWindow(hwnd):
@@ -3561,15 +3715,114 @@ class SmartGrid:
                 owner_ws = self._find_workspace_owner(monitor_idx, hwnd, prefer_ws=ws)
                 if owner_ws is not None and owner_ws != ws:
                     continue
-            if hwnd in self.workspaces[monitor_idx][ws]:
+            if hwnd in saved_ws_map:
                 continue
-            self.workspaces[monitor_idx][ws][hwnd] = {
+            saved_ws_map[hwnd] = {
                 'pos': (0, 0, 800, 600),
                 'grid': (col, row),
                 'state': 'maximized'
             }
 
+        # Fallback: keep previous live entries missing from runtime snapshots.
+        # This avoids destructive data loss when some windows temporarily disappear
+        # from grid/min/max tracking during workspace transitions.
+        preserved_count = 0
+        for hwnd, data in previous_ws_map.items():
+            if hwnd in saved_ws_map or not user32.IsWindow(hwnd):
+                continue
+            if hwnd in other_ws_hwnds:
+                continue
+            runtime_ws = state_ws_snapshot.get(hwnd)
+            if runtime_ws is not None and runtime_ws != ws:
+                continue
+            runtime_mon = runtime_monitor_by_hwnd.get(hwnd)
+            if runtime_mon is not None and runtime_mon != monitor_idx:
+                continue
+            if runtime_mon is None and user32.IsWindowVisible(hwnd):
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    if self._get_monitor_index_for_rect(rect) != monitor_idx:
+                        continue
+            if not isinstance(data, dict):
+                continue
+
+            grid = data.get('grid')
+            if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                continue
+            try:
+                col = int(grid[0])
+                row = int(grid[1])
+            except Exception:
+                continue
+
+            pos = data.get('pos', (0, 0, 800, 600))
+            if not isinstance(pos, (list, tuple)) or len(pos) != 4:
+                pos = (0, 0, 800, 600)
+            else:
+                try:
+                    pos = (int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3]))
+                except Exception:
+                    pos = (0, 0, 800, 600)
+
+            state = str(data.get('state', 'normal')).lower()
+            if state not in ('normal', 'minimized', 'maximized'):
+                state = 'normal'
+
+            saved_ws_map[hwnd] = {
+                'pos': pos,
+                'grid': (col, row),
+                'state': state,
+            }
+            preserved_count += 1
+
+        # Keep parked windows in the workspace map even if runtime maps are temporarily stale.
+        for hwnd in hidden_bucket_snapshot:
+            if hwnd in saved_ws_map or not user32.IsWindow(hwnd):
+                continue
+            if hwnd in other_ws_hwnds:
+                continue
+            data = previous_ws_map.get(hwnd)
+            if not isinstance(data, dict):
+                continue
+            grid = data.get('grid')
+            if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                continue
+            try:
+                col = int(grid[0])
+                row = int(grid[1])
+            except Exception:
+                continue
+            pos = data.get('pos', (0, 0, 800, 600))
+            if not isinstance(pos, (list, tuple)) or len(pos) != 4:
+                pos = (0, 0, 800, 600)
+            else:
+                try:
+                    pos = (int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3]))
+                except Exception:
+                    pos = (0, 0, 800, 600)
+            state = str(data.get('state', 'normal')).lower()
+            if state not in ('normal', 'minimized', 'maximized'):
+                state = 'normal'
+            saved_ws_map[hwnd] = {
+                'pos': pos,
+                'grid': (col, row),
+                'state': state,
+            }
+            preserved_count += 1
+
         with self.lock:
+            ws_list = self.workspaces.get(monitor_idx)
+            if not isinstance(ws_list, list) or not (0 <= ws < len(ws_list)):
+                return
+            ws_list[ws] = dict(saved_ws_map)
+            hidden_bucket = self._workspace_hidden_windows.get((monitor_idx, ws))
+            if hidden_bucket:
+                for hwnd in list(hidden_bucket):
+                    if not user32.IsWindow(hwnd) or hwnd in saved_ws_map:
+                        hidden_bucket.discard(hwnd)
+                if not hidden_bucket:
+                    self._workspace_hidden_windows.pop((monitor_idx, ws), None)
+
             current_sig = self.layout_signature.get(monitor_idx)
             if current_sig is not None:
                 current_sig = self._normalize_layout_signature(current_sig[0], current_sig[1])
@@ -3577,28 +3830,269 @@ class SmartGrid:
                 profile_key = self._layout_profile_key(
                     monitor_idx, ws, current_sig[0], current_sig[1]
                 )
+                manual_locked = (monitor_idx, ws) in self._workspace_manual_layout_lock
+                existing_profile_raw = self.workspace_layout_profiles.get(profile_key, {})
+                existing_profile = (
+                    dict(existing_profile_raw) if isinstance(existing_profile_raw, dict) else {}
+                )
+
+                def _normalize_profile_entry(data):
+                    if not isinstance(data, dict):
+                        return None
+                    grid = data.get('grid')
+                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                        return None
+                    try:
+                        col = int(grid[0])
+                        row = int(grid[1])
+                    except Exception:
+                        return None
+                    pos = data.get('pos', (0, 0, 800, 600))
+                    if not isinstance(pos, (list, tuple)) or len(pos) != 4:
+                        pos = (0, 0, 800, 600)
+                    else:
+                        try:
+                            pos = (int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3]))
+                        except Exception:
+                            pos = (0, 0, 800, 600)
+                    state = str(data.get('state', 'normal')).lower()
+                    if state not in ('normal', 'minimized', 'maximized'):
+                        state = 'normal'
+                    return {'pos': pos, 'grid': (col, row), 'state': state}
+
                 # Respect layout-specific reset markers: do not auto-recreate a reset profile
                 # during workspace autosave; only explicit Apply should restore it.
                 if profile_key in self._manual_layout_profile_reset_block:
-                    self.workspace_layout_profiles.pop(profile_key, None)
+                    if saved_ws_map and (not manual_locked):
+                        # Auto-heal only for non-manual profiles.
+                        self._manual_layout_profile_reset_block.discard(profile_key)
+                        self._manual_layout_reset_block.discard((monitor_idx, ws))
+                        self.workspace_layout_profiles[profile_key] = dict(saved_ws_map)
+                    elif saved_ws_map and manual_locked and existing_profile:
+                        # For manual layouts, never recreate profile from whole workspace map:
+                        # keep only previously assigned manual windows.
+                        reconciled = {}
+                        for hwnd, pdata in existing_profile.items():
+                            if not user32.IsWindow(hwnd):
+                                continue
+                            source = saved_ws_map.get(hwnd, pdata)
+                            entry = _normalize_profile_entry(source)
+                            if entry is not None:
+                                reconciled[hwnd] = entry
+                        if reconciled:
+                            self._manual_layout_profile_reset_block.discard(profile_key)
+                            self._manual_layout_reset_block.discard((monitor_idx, ws))
+                            self.workspace_layout_profiles[profile_key] = reconciled
+                    else:
+                        self.workspace_layout_profiles.pop(profile_key, None)
                 else:
-                    self.workspace_layout_profiles[profile_key] = dict(
-                        self.workspaces[monitor_idx][ws]
-                    )
-        
-        log(f"[WS] ✓ Workspace {ws+1} saved ({len(self.workspaces[monitor_idx][ws])} windows)")
+                    if manual_locked:
+                        # Keep manual profile stable across autosaves. Using the full workspace
+                        # map here would auto-fill partial layouts (notably Master Stack).
+                        if existing_profile:
+                            reconciled = {}
+                            for hwnd, pdata in existing_profile.items():
+                                if not user32.IsWindow(hwnd):
+                                    continue
+                                source = saved_ws_map.get(hwnd, pdata)
+                                entry = _normalize_profile_entry(source)
+                                if entry is not None:
+                                    reconciled[hwnd] = entry
+                            if reconciled:
+                                self.workspace_layout_profiles[profile_key] = reconciled
+                            else:
+                                self.workspace_layout_profiles[profile_key] = dict(existing_profile)
+                    else:
+                        self.workspace_layout_profiles[profile_key] = dict(saved_ws_map)
+
+        if preserved_count > 0:
+            log(
+                f"[WS] ✓ Workspace {ws+1} saved ({len(saved_ws_map)} windows, kept {preserved_count} cached)"
+            )
+        else:
+            log(f"[WS] ✓ Workspace {ws+1} saved ({len(saved_ws_map)} windows)")
     
     def load_workspace(self, monitor_idx, ws_idx):
         """Load workspace and restore positions."""
         if monitor_idx not in self.workspaces or ws_idx >= len(self.workspaces[monitor_idx]):
             return
-        
+
         layout = self.workspaces[monitor_idx][ws_idx]
-        
+        if not isinstance(layout, dict):
+            layout = {}
+
+        manual_locked = False
+        ws_sig_for_restore = None
+        manual_profile_key = None
+        manual_profile_map = {}
+        manual_profile_reset_blocked = False
+
+        def _clean_layout_map(raw_map):
+            cleaned = {}
+            if not isinstance(raw_map, dict):
+                return cleaned
+            for hwnd, data in raw_map.items():
+                if not user32.IsWindow(hwnd) or not isinstance(data, dict):
+                    continue
+                grid = data.get('grid')
+                if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                    continue
+                try:
+                    col = int(grid[0])
+                    row = int(grid[1])
+                except Exception:
+                    continue
+                pos = data.get('pos', (0, 0, 800, 600))
+                if not isinstance(pos, (list, tuple)) or len(pos) != 4:
+                    pos = (0, 0, 800, 600)
+                else:
+                    try:
+                        pos = (int(pos[0]), int(pos[1]), int(pos[2]), int(pos[3]))
+                    except Exception:
+                        pos = (0, 0, 800, 600)
+                state = str(data.get('state', 'normal')).lower()
+                if state not in ('normal', 'minimized', 'maximized'):
+                    state = 'normal'
+                cleaned[hwnd] = {'pos': pos, 'grid': (col, row), 'state': state}
+            return cleaned
+
+        cleaned_layout = _clean_layout_map(layout)
+        layout = cleaned_layout
+        with self.lock:
+            ws_list = self.workspaces.get(monitor_idx)
+            if isinstance(ws_list, list) and 0 <= ws_idx < len(ws_list):
+                ws_list[ws_idx] = dict(layout)
+            manual_locked = (monitor_idx, ws_idx) in self._workspace_manual_layout_lock
+            ws_sig = self.workspace_layout_signature.get((monitor_idx, ws_idx))
+            if ws_sig is not None:
+                ws_sig = self._normalize_layout_signature(ws_sig[0], ws_sig[1])
+                ws_sig_for_restore = ws_sig
+                manual_profile_key = self._layout_profile_key(
+                    monitor_idx, ws_idx, ws_sig[0], ws_sig[1]
+                )
+                manual_profile_map = _clean_layout_map(
+                    self.workspace_layout_profiles.get(manual_profile_key, {})
+                )
+                manual_profile_reset_blocked = (
+                    manual_profile_key in self._manual_layout_profile_reset_block
+                )
+
+        if not layout:
+            recovered_layout = {}
+            recovered_sig = None
+            with self.lock:
+                ws_sig = self.workspace_layout_signature.get((monitor_idx, ws_idx))
+                if ws_sig is not None:
+                    ws_sig = self._normalize_layout_signature(ws_sig[0], ws_sig[1])
+                    profile_key = self._layout_profile_key(
+                        monitor_idx, ws_idx, ws_sig[0], ws_sig[1]
+                    )
+                    recovered_layout = _clean_layout_map(
+                        self.workspace_layout_profiles.get(profile_key, {})
+                    )
+                    if recovered_layout:
+                        recovered_sig = ws_sig
+
+                if not recovered_layout:
+                    best_count = 0
+                    best_layout = {}
+                    best_sig = None
+                    for (m_idx, w_idx, layout_name, layout_info), profile_map in self.workspace_layout_profiles.items():
+                        if m_idx != monitor_idx or w_idx != ws_idx:
+                            continue
+                        candidate = _clean_layout_map(profile_map)
+                        if len(candidate) <= best_count:
+                            continue
+                        best_count = len(candidate)
+                        best_layout = candidate
+                        best_sig = self._normalize_layout_signature(layout_name, layout_info)
+                    recovered_layout = best_layout
+                    recovered_sig = best_sig
+
+                if recovered_layout:
+                    ws_list = self.workspaces.get(monitor_idx)
+                    if (
+                        isinstance(ws_list, list)
+                        and 0 <= ws_idx < len(ws_list)
+                    ):
+                        ws_list[ws_idx] = dict(recovered_layout)
+                    if recovered_sig is not None:
+                        self.workspace_layout_signature[(monitor_idx, ws_idx)] = recovered_sig
+                    layout = recovered_layout
+
+        # If we have a sparse workspace map but stronger profile data, merge missing entries.
+        with self.lock:
+            ws_sig = self.workspace_layout_signature.get((monitor_idx, ws_idx))
+            profile_candidate = {}
+            if ws_sig is not None:
+                ws_sig = self._normalize_layout_signature(ws_sig[0], ws_sig[1])
+                profile_key = self._layout_profile_key(
+                    monitor_idx, ws_idx, ws_sig[0], ws_sig[1]
+                )
+                profile_candidate = _clean_layout_map(
+                    self.workspace_layout_profiles.get(profile_key, {})
+                )
+            if not profile_candidate:
+                best_count = 0
+                best_layout = {}
+                for (m_idx, w_idx, _layout_name, _layout_info), profile_map in self.workspace_layout_profiles.items():
+                    if m_idx != monitor_idx or w_idx != ws_idx:
+                        continue
+                    candidate = _clean_layout_map(profile_map)
+                    if len(candidate) <= best_count:
+                        continue
+                    best_count = len(candidate)
+                    best_layout = candidate
+                profile_candidate = best_layout
+
+        if profile_candidate and len(layout) < len(profile_candidate):
+            for hwnd, data in profile_candidate.items():
+                if hwnd not in layout:
+                    layout[hwnd] = dict(data)
+
+        # Safety net: include parked windows that were minimized/hidden during switch.
+        # For manual-locked workspaces, this would wrongly re-introduce cleared slots.
+        parked_restored = 0
+        if not manual_locked:
+            with self.lock:
+                parked = set(self._workspace_hidden_windows.get((monitor_idx, ws_idx), set()))
+            for hwnd in parked:
+                if not user32.IsWindow(hwnd):
+                    continue
+                if hwnd in layout:
+                    continue
+                slot = self._get_workspace_slot(monitor_idx, ws_idx, hwnd)
+                if slot is None:
+                    slot = (0, 0)
+                layout[hwnd] = {
+                    'pos': (0, 0, 800, 600),
+                    'grid': (int(slot[0]), int(slot[1])),
+                    'state': 'normal',
+                }
+                parked_restored += 1
+
+            if parked_restored > 0:
+                log(f"[WS] Recovered {parked_restored} parked window(s) for workspace {ws_idx+1}")
+
+        with self.lock:
+            ws_list = self.workspaces.get(monitor_idx)
+            if isinstance(ws_list, list) and 0 <= ws_idx < len(ws_list):
+                ws_list[ws_idx] = dict(layout)
+
+        # Manual-locked workspaces must restore strictly from their selected layout profile.
+        # Otherwise, old windows from ws_map/parked cache can silently re-fill cleared slots.
+        if manual_locked and ws_sig_for_restore is not None:
+            if manual_profile_reset_blocked:
+                layout = {}
+            elif manual_profile_map:
+                layout = dict(manual_profile_map)
+            else:
+                layout = {}
+
         if not layout:
             log(f"[WS] Workspace {ws_idx+1} is empty")
             return
-        
+
         log(f"[WS] Loading workspace {ws_idx+1}...")
         # Short guard while toggling window visibility during workspace load.
         self.ignore_retile_until = time.time() + 0.35
@@ -3653,6 +4147,14 @@ class SmartGrid:
                 self.window_state_ws.pop(hwnd, None)
                 self.window_mgr.minimized_windows.pop(hwnd, None)
                 self.window_mgr.maximized_windows.pop(hwnd, None)
+
+            hidden_bucket = self._workspace_hidden_windows.get((monitor_idx, ws_idx))
+            if hidden_bucket:
+                for hwnd in list(hidden_bucket):
+                    if not user32.IsWindow(hwnd) or hwnd in layout:
+                        hidden_bucket.discard(hwnd)
+                if not hidden_bucket:
+                    self._workspace_hidden_windows.pop((monitor_idx, ws_idx), None)
         
         time.sleep(0.15)
         # Force one immediate retile for the target workspace now that grid_state is ready.
@@ -3664,6 +4166,9 @@ class SmartGrid:
     
     def ws_switch(self, ws_idx, monitor_idx=None):
         """Switch to specified workspace on the requested monitor."""
+        if not self._ws_switch_mutex.acquire(blocking=False):
+            log("[WS] Switch ignored (already in progress)")
+            return
         self.workspace_switching_lock = True
         time.sleep(0.25)
         was_active = self.is_active
@@ -3694,21 +4199,36 @@ class SmartGrid:
             # Save current
             self.save_workspace(mon)
             
-            # Hide and clear all runtime states from current workspace on this monitor.
-            hidden = 0
+            # Park and clear all runtime states from current workspace on this monitor.
+            parked = 0
             with self.lock:
                 source_ws = self.current_workspace.get(mon, 0)
                 source_map = dict(self.workspaces.get(mon, [{}, {}, {}])[source_ws])
+                hidden_bucket = self._workspace_hidden_windows.setdefault((mon, source_ws), set())
                 for hwnd in list(source_map.keys()):
-                    if user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd):
-                        user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
-                        hidden += 1
+                    if user32.IsWindow(hwnd):
+                        # Use minimize instead of hide to avoid some apps destroying their
+                        # top-level window on SW_HIDE (which looked like "closed/lost").
+                        try:
+                            state = get_window_state(hwnd)
+                        except Exception:
+                            state = "unknown"
+                        try:
+                            if state != "minimized":
+                                user32.ShowWindowAsync(hwnd, win32con.SW_MINIMIZE)
+                                parked += 1
+                        except Exception:
+                            try:
+                                user32.ShowWindowAsync(hwnd, win32con.SW_HIDE)
+                            except Exception:
+                                pass
+                        hidden_bucket.add(hwnd)
                     self.window_mgr.grid_state.pop(hwnd, None)
                     self.window_mgr.minimized_windows.pop(hwnd, None)
                     self.window_mgr.maximized_windows.pop(hwnd, None)
                     self.window_state_ws.pop(hwnd, None)
             
-            log(f"[WS] Hidden {hidden} windows from workspace {self.current_workspace.get(mon, 0)+1}")
+            log(f"[WS] Parked {parked} windows from workspace {self.current_workspace.get(mon, 0)+1}")
             
             # Switch
             self.current_workspace[mon] = ws_idx
@@ -3740,6 +4260,10 @@ class SmartGrid:
         finally:
             self.is_active = was_active
             self.workspace_switching_lock = False
+            try:
+                self._ws_switch_mutex.release()
+            except Exception:
+                pass
     
     # ==========================================================================
     # FLOATING WINDOW TOGGLE
@@ -3806,12 +4330,22 @@ class SmartGrid:
                 monitors = self.monitors_cache or get_monitors()
                 if 0 <= monitor_idx < len(monitors):
                     mx, my, mw, mh = monitors[monitor_idx]
+                    # Keep geometry fully inside target monitor bounds.
+                    # This avoids right/left truncation on mixed-resolution setups.
+                    max_w = max(320, int(mw) - 16)
+                    max_h = max(240, int(mh) - 16)
+                    w = min(max_w, max(320, w))
+                    h = min(max_h, max(240, h))
                     x = int(mx + (mw - w) // 2)
                     y = int(my + (mh - h) // 2)
+                    x = max(int(mx) + 8, min(x, int(mx + mw - w - 8)))
+                    y = max(int(my) + 8, min(y, int(my + mh - h - 8)))
 
             if x is None or y is None:
                 screen_w = window.winfo_screenwidth()
                 screen_h = window.winfo_screenheight()
+                w = min(max(320, w), max(320, int(screen_w) - 16))
+                h = min(max(240, h), max(240, int(screen_h) - 16))
                 x = max(0, (screen_w - w) // 2)
                 y = max(0, (screen_h - h) // 2)
 
@@ -4488,9 +5022,10 @@ class SmartGrid:
 
             dialog = tk.Toplevel(root)
             dialog.title("SmartGrid Layout Manager")
-            dialog.geometry("660x620")
+            dialog.geometry("980x620")
             dialog.attributes("-topmost", True)
             dialog.resizable(False, False)
+            dialog_size = {"width": 980}
             with self._layout_picker_lock:
                 self._layout_picker_hwnd = int(dialog.winfo_id())
 
@@ -4508,15 +5043,18 @@ class SmartGrid:
             )
             header.pack(fill=tk.X, pady=(8, 6))
 
+            top_row = tk.Frame(dialog, bg=dialog.cget("bg"))
+            top_row.pack(fill=tk.X, padx=12, pady=6)
+
             layout_frame = tk.LabelFrame(
-                dialog,
-                text="🧩 Choose Layout to Customize",
+                top_row,
+                text="🧩 Choose Targets to Customize",
                 padx=10,
                 pady=10,
                 font=("Arial", 9, "bold"),
                 bg=section_bg,
             )
-            layout_frame.pack(fill=tk.X, padx=12, pady=6)
+            layout_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
 
             layout_presets = self._get_layout_presets()
             layout_labels = [label for label, _ in layout_presets]
@@ -4605,59 +5143,56 @@ class SmartGrid:
 
             controls_frame = tk.Frame(layout_frame, bg=section_bg)
             controls_frame.pack(fill=tk.X, padx=4, pady=(0, 6))
-            tk.Label(
-                controls_frame,
-                text="Target Monitor:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(0, 3))
+            controls_frame.grid_columnconfigure(0, weight=0)
+            controls_frame.grid_columnconfigure(1, weight=1)
+            control_combo_width = max(18, layout_combo_width)
+
             target_monitor_combo = ttk.Combobox(
                 controls_frame,
                 textvariable=target_monitor_var,
                 values=monitor_labels,
                 state="readonly",
-                width=10,
+                width=control_combo_width,
             )
-            target_monitor_combo.pack(side=tk.LEFT)
-            tk.Label(
-                controls_frame,
-                text="Target Workspace:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(8, 3))
             target_ws_combo = ttk.Combobox(
                 controls_frame,
                 textvariable=target_ws_var,
                 values=ws_labels,
                 state="readonly",
-                width=11,
+                width=control_combo_width,
             )
-            target_ws_combo.pack(side=tk.LEFT)
-            tk.Label(
-                controls_frame,
-                text="Target Layout:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(8, 3))
 
             layout_combo = ttk.Combobox(
                 controls_frame,
                 textvariable=layout_var,
                 values=layout_labels,
                 state="readonly",
-                width=layout_combo_width,
+                width=control_combo_width,
             )
-            layout_combo.pack(side=tk.LEFT)
+            control_rows = [
+                ("Target Monitor:", target_monitor_combo),
+                ("Target Workspace:", target_ws_combo),
+                ("Target Layout:", layout_combo),
+            ]
+            for row_idx, (label_text, combo_widget) in enumerate(control_rows):
+                row_pad = (0, 4) if row_idx < (len(control_rows) - 1) else (0, 0)
+                tk.Label(
+                    controls_frame,
+                    text=label_text,
+                    font=("Arial", 8, "bold"),
+                    fg="#555555",
+                    bg=section_bg,
+                    width=16,
+                    anchor="w",
+                ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=row_pad)
+                combo_widget.grid(row=row_idx, column=1, sticky="w", pady=row_pad)
 
             status_frame = tk.Frame(layout_frame, bg=section_bg)
             status_frame.pack(fill=tk.X, padx=4, pady=(0, 6), before=controls_frame)
             tk.Label(
                 status_frame,
                 text="Current monitor:",
-                font=("Arial", 8),
+                font=("Arial", 8, "bold"),
                 fg="#555555",
                 bg=section_bg,
             ).pack(side=tk.LEFT, padx=(0, 6))
@@ -4672,7 +5207,7 @@ class SmartGrid:
             tk.Label(
                 status_frame,
                 text="Current workspace:",
-                font=("Arial", 8),
+                font=("Arial", 8, "bold"),
                 fg="#555555",
                 bg=section_bg,
             ).pack(side=tk.LEFT, padx=(0, 6))
@@ -4687,7 +5222,7 @@ class SmartGrid:
             tk.Label(
                 status_frame,
                 text="Current layout:",
-                font=("Arial", 8),
+                font=("Arial", 8, "bold"),
                 fg="#555555",
                 bg=section_bg,
             ).pack(side=tk.LEFT, padx=(0, 6))
@@ -4699,20 +5234,252 @@ class SmartGrid:
                 fg=accent_dark,
             )
             status_layout_value.pack(side=tk.LEFT, padx=(0, 6))
-            multi_monitor_label = tk.Label(
-                status_frame,
+
+            coverage_frame = tk.LabelFrame(
+                top_row,
+                text="📊 Workspace Layout Coverage",
+                padx=10,
+                pady=10,
+                font=("Arial", 9, "bold"),
+                bg=section_bg,
+            )
+            coverage_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            coverage_frame.pack_propagate(False)
+
+            coverage_detect_row = tk.Frame(coverage_frame, bg=section_bg)
+            coverage_detect_row.pack(fill=tk.X, anchor="w", pady=(0, 6))
+            coverage_detect_label = tk.Label(
+                coverage_detect_row,
                 text="Windows/apps detected on:",
                 font=("Arial", 8),
                 fg="#555555",
                 bg=section_bg,
+                anchor="w",
             )
-            multi_monitor_value = tk.Label(
-                status_frame,
-                text="",
+            coverage_detect_label.pack(side=tk.LEFT, padx=(0, 6))
+
+            coverage_detect_value = tk.Label(
+                coverage_detect_row,
+                text="None",
                 font=("Arial", 8, "bold"),
-                bg=section_bg,
                 fg=accent_dark,
+                bg=section_bg,
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=280,
             )
+            coverage_detect_value.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            coverage_scroll_frame = tk.Frame(coverage_frame, bg=section_bg)
+            coverage_scroll_frame.pack(fill=tk.BOTH, expand=True)
+            coverage_canvas = tk.Canvas(
+                coverage_scroll_frame,
+                bg=section_bg,
+                highlightthickness=0,
+                borderwidth=0,
+                height=168,
+            )
+            coverage_scrollbar = ttk.Scrollbar(
+                coverage_scroll_frame,
+                orient="vertical",
+                command=coverage_canvas.yview,
+            )
+            coverage_inner = tk.Frame(coverage_canvas, bg=section_bg)
+            coverage_inner_id = coverage_canvas.create_window((0, 0), window=coverage_inner, anchor="nw")
+            coverage_canvas.configure(yscrollcommand=coverage_scrollbar.set)
+            coverage_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            coverage_scrollbar.pack_forget()
+
+            def update_coverage_scrollbar_visibility():
+                try:
+                    bbox = coverage_canvas.bbox("all")
+                    if not bbox:
+                        needs_scroll = False
+                    else:
+                        content_h = max(0, int(bbox[3] - bbox[1]))
+                        viewport_h = coverage_canvas.winfo_height()
+                        if viewport_h <= 1:
+                            viewport_h = int(float(coverage_canvas.cget("height")))
+                        needs_scroll = content_h > (viewport_h + 2)
+
+                    if needs_scroll and (not coverage_scrollbar.winfo_ismapped()):
+                        coverage_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                    elif (not needs_scroll) and coverage_scrollbar.winfo_ismapped():
+                        coverage_scrollbar.pack_forget()
+                        coverage_canvas.yview_moveto(0.0)
+                except Exception:
+                    pass
+
+            def on_coverage_inner_configure(_event=None):
+                try:
+                    coverage_canvas.configure(scrollregion=coverage_canvas.bbox("all"))
+                except Exception:
+                    pass
+                update_coverage_scrollbar_visibility()
+
+            def on_coverage_canvas_configure(event):
+                try:
+                    coverage_canvas.itemconfigure(coverage_inner_id, width=event.width)
+                except Exception:
+                    pass
+                update_coverage_scrollbar_visibility()
+
+            coverage_inner.bind("<Configure>", on_coverage_inner_configure)
+            coverage_canvas.bind("<Configure>", on_coverage_canvas_configure)
+
+            coverage_legend_row = tk.Frame(coverage_frame, bg=section_bg)
+            coverage_legend_row.pack(fill=tk.X, anchor="w", pady=(4, 0))
+            legend_chips = [
+                ("C Complete", "#E8F6EE", "#1D7047"),
+                ("P Partial", "#FFF4E5", "#8B5A14"),
+                ("E Empty", "#F1F3F6", "#556070"),
+            ]
+            for text, bg_color, fg_color in legend_chips:
+                tk.Label(
+                    coverage_legend_row,
+                    text=text,
+                    font=("Arial", 7, "bold"),
+                    fg=fg_color,
+                    bg=bg_color,
+                    padx=5,
+                    pady=1,
+                    relief="solid",
+                    bd=1,
+                ).pack(side=tk.LEFT, padx=(0, 4))
+
+            coverage_legend = tk.Label(
+                coverage_frame,
+                text="C/P/E markers also appear on dots and detail rows.",
+                font=("Arial", 8),
+                fg="gray",
+                bg=section_bg,
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=280,
+            )
+            coverage_legend.pack(fill=tk.X, anchor="w", pady=(2, 0))
+
+            badge_font = tkfont.Font(family="Arial", size=7, weight="bold")
+            ws_header_font = tkfont.Font(family="Arial", size=8, weight="bold")
+            badge_samples = ("Complete 99", "Partial 99", "Empty 99")
+            badge_chip_inner_pad = 8  # label padx=4 on both sides
+            badge_chip_border = 2
+            badge_gap = 3
+            ws_badges_required_w = (
+                sum(badge_font.measure(text) + badge_chip_inner_pad + badge_chip_border for text in badge_samples)
+                + ((len(badge_samples) - 1) * badge_gap)
+            )
+            coverage_ws_col_min_width = max(
+                170,
+                ws_header_font.measure("WS3") + 8 + ws_badges_required_w + 10,
+            )
+            coverage_mon_col_width = 56
+            coverage_table_min_width = (
+                coverage_mon_col_width
+                + (coverage_ws_col_min_width * 3)
+                + (2 * 2)  # column gaps
+            )
+            coverage_min_width = max(430, coverage_table_min_width + 18)
+            coverage_max_width = max(760, coverage_min_width + 60)
+            top_row_gap = 8
+            top_row_side_padding = 24  # top_row uses padx=12 on both sides
+
+            def _get_target_monitor_size():
+                try:
+                    mon_idx = get_target_monitor_index()
+                except Exception:
+                    mon_idx = default_mon_idx
+                monitors = self.monitors_cache or get_monitors()
+                if 0 <= mon_idx < len(monitors):
+                    _mx, _my, mw, mh = monitors[mon_idx]
+                    return int(mw), int(mh)
+                return int(dialog.winfo_screenwidth()), int(dialog.winfo_screenheight())
+
+            def _compute_min_dialog_width():
+                try:
+                    choose_w = max(
+                        layout_frame.winfo_width(),
+                        layout_frame.winfo_reqwidth(),
+                        420,
+                    )
+                    monitor_w, _monitor_h = _get_target_monitor_size()
+                    screen_limit = max(520, monitor_w - 24)
+                    max_coverage_on_screen = max(
+                        220,
+                        screen_limit - top_row_side_padding - choose_w - top_row_gap,
+                    )
+                    effective_coverage_min = min(coverage_min_width, max_coverage_on_screen)
+                    min_dialog_w = int(top_row_side_padding + choose_w + top_row_gap + effective_coverage_min)
+                    return max(760, min_dialog_w)
+                except Exception:
+                    return 760
+
+            def _ensure_dialog_min_width():
+                try:
+                    min_dialog_w = _compute_min_dialog_width()
+                    monitor_w, _monitor_h = _get_target_monitor_size()
+                    screen_limit = max(520, monitor_w - 24)
+                    target_w = min(screen_limit, min_dialog_w)
+                    current_w = max(
+                        dialog.winfo_width(),
+                        dialog.winfo_reqwidth(),
+                        dialog_size.get("width", 980),
+                    )
+                    if target_w <= (current_w + 2):
+                        return
+                    current_h = max(620, dialog.winfo_height(), dialog.winfo_reqheight())
+                    dialog_size["width"] = target_w
+                    self._center_tk_window(
+                        dialog,
+                        target_w,
+                        current_h,
+                        monitor_idx=get_target_monitor_index(),
+                    )
+                except Exception:
+                    pass
+
+            def sync_coverage_panel_size():
+                try:
+                    top_w = top_row.winfo_width() or top_row.winfo_reqwidth() or (dialog_size["width"] - top_row_side_padding)
+                    choose_w = max(
+                        layout_frame.winfo_width(),
+                        layout_frame.winfo_reqwidth(),
+                        420,
+                    )
+                    monitor_w, _monitor_h = _get_target_monitor_size()
+                    screen_limit = max(520, monitor_w - 24)
+                    max_coverage_on_screen = max(
+                        220,
+                        screen_limit - top_row_side_padding - choose_w - top_row_gap,
+                    )
+                    effective_coverage_min = min(coverage_min_width, max_coverage_on_screen)
+                    required_top_w = choose_w + top_row_gap + effective_coverage_min
+
+                    if top_w < required_top_w:
+                        _ensure_dialog_min_width()
+                        top_w = max(top_w, required_top_w)
+
+                    available_w = max(220, top_w - choose_w - top_row_gap)
+                    coverage_w = max(effective_coverage_min, min(coverage_max_width, available_w))
+                    coverage_frame.config(width=coverage_w)
+
+                    detect_label_w = coverage_detect_label.winfo_reqwidth() or 150
+                    detect_wrap_w = max(120, coverage_w - detect_label_w - 26)
+                    legend_wrap_w = max(180, coverage_w - 24)
+                    coverage_detect_value.config(wraplength=detect_wrap_w)
+                    coverage_legend.config(wraplength=legend_wrap_w)
+
+                    monitor_rows = max(1, len(self.monitors_cache))
+                    target_canvas_h = 44 + ((monitor_rows + 1) * 52)
+                    target_canvas_h = max(150, min(360, target_canvas_h))
+                    coverage_canvas.config(height=target_canvas_h)
+                    dialog.after_idle(update_coverage_scrollbar_visibility)
+                except Exception:
+                    pass
+
+            top_row.bind("<Configure>", lambda _e: sync_coverage_panel_size())
+            layout_frame.bind("<Configure>", lambda _e: sync_coverage_panel_size())
+            dialog.after(0, sync_coverage_panel_size)
 
             preview_row = tk.Frame(layout_frame, bg=section_bg)
             preview_row.pack(anchor="w", padx=4, pady=(6, 2))
@@ -4762,7 +5529,6 @@ class SmartGrid:
             hwnd_to_label = {}
             combo_width = 30
             proc_col_width = 12
-            dialog_size = {"width": 620}
 
             def sync_preview_canvas_size(mon_idx=None, positions=None):
                 if mon_idx is None:
@@ -4824,12 +5590,16 @@ class SmartGrid:
             poll_shutdown_job = None
             preview_job = None
             picker_closing = False
+            coverage_details_popup = {"win": None}
 
             def resize_dialog_to_content():
                 dialog.update_idletasks()
                 req_w = dialog.winfo_reqwidth()
                 req_h = dialog.winfo_reqheight()
-                target_width = min(screen_w - 80, req_w + 2)
+                min_dialog_w = _compute_min_dialog_width()
+                monitor_w, _monitor_h = _get_target_monitor_size()
+                screen_limit = max(520, monitor_w - 24)
+                target_width = min(screen_limit, max(min_dialog_w, req_w + 2))
                 target_height = max(340, req_h + 10)
                 dialog_size["width"] = target_width
                 self._center_tk_window(
@@ -4889,6 +5659,13 @@ class SmartGrid:
                 except Exception:
                     pass
                 try:
+                    detail_win = coverage_details_popup.get("win")
+                    if detail_win is not None and detail_win.winfo_exists():
+                        detail_win.destroy()
+                except Exception:
+                    pass
+                coverage_details_popup["win"] = None
+                try:
                     if dialog.winfo_exists():
                         dialog.destroy()
                 except Exception:
@@ -4931,119 +5708,725 @@ class SmartGrid:
                 button.bind("<Enter>", _enter)
                 button.bind("<Leave>", _leave)
 
-            def update_current_badge():
-                mon_idx = get_target_monitor_index()
-                with self.lock:
-                    grid_count = sum(
-                        1
-                        for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items()
-                        if m == mon_idx and user32.IsWindow(hwnd)
+            preset_meta = []
+            for preset_label, (preset_layout, preset_info) in layout_presets:
+                norm_layout, norm_info = self._normalize_layout_signature(preset_layout, preset_info)
+                preset_meta.append(
+                    (
+                        preset_label,
+                        norm_layout,
+                        norm_info,
+                        self._layout_capacity(norm_layout, norm_info),
                     )
-                    sig = self.layout_signature.get(mon_idx)
-                    ws_num = self.current_workspace.get(mon_idx, 0) + 1
-                    active_monitors = set()
-                    monitor_ws_hits = {}
-                    profile_live_by_ws = {}
+                )
+            preset_total = len(preset_meta)
 
-                    def _add_hit(m_idx, ws_idx=None):
-                        if m_idx is None or not (0 <= int(m_idx) < len(self.monitors_cache)):
+            def _count_live_layout_assignments(layout_map):
+                if not isinstance(layout_map, dict):
+                    return 0
+                count = 0
+                for hwnd, data in layout_map.items():
+                    if not user32.IsWindow(hwnd):
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    grid = data.get("grid")
+                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                        continue
+                    try:
+                        int(grid[0])
+                        int(grid[1])
+                    except Exception:
+                        continue
+                    count += 1
+                return count
+
+            def show_workspace_coverage_details(mon_idx, ws_idx, layout_states):
+                existing_detail = coverage_details_popup.get("win")
+                if existing_detail is not None:
+                    try:
+                        if existing_detail.winfo_exists():
+                            existing_detail.lift()
+                            existing_detail.focus_force()
                             return
-                        m_idx = int(m_idx)
-                        active_monitors.add(m_idx)
-                        try:
-                            ws_idx = int(ws_idx) if ws_idx is not None else None
-                        except Exception:
-                            ws_idx = None
-                        if ws_idx not in (0, 1, 2):
-                            return
-                        monitor_ws_hits.setdefault(m_idx, set()).add(ws_idx)
+                    except Exception:
+                        pass
+                coverage_details_popup["win"] = None
 
-                    for (p_mon, p_ws, p_layout, p_info), profile_map in self.workspace_layout_profiles.items():
-                        ws_key = (int(p_mon), int(p_ws))
-                        if ws_key[0] < 0 or ws_key[0] >= len(self.monitors_cache):
-                            continue
-                        if ws_key[1] not in (0, 1, 2):
-                            continue
-                        if ws_key in profile_live_by_ws:
-                            continue
-                        if (p_mon, p_ws, p_layout, p_info) in self._manual_layout_profile_reset_block:
-                            continue
-                        if not isinstance(profile_map, dict):
-                            continue
-                        if any(user32.IsWindow(hwnd) for hwnd in profile_map.keys()):
-                            profile_live_by_ws[ws_key] = True
+                layout_states = list(layout_states) if layout_states else []
+                if not layout_states:
+                    messagebox.showinfo(
+                        "Workspace Coverage",
+                        f"Monitor {mon_idx + 1}, Workspace {ws_idx + 1}\nNo layout data available.",
+                    )
+                    return
 
-                    def _is_ws_hidden_by_reset(m_idx, ws_idx):
-                        return (
-                            (m_idx, ws_idx) in self._manual_layout_reset_block
-                            and not bool(profile_live_by_ws.get((m_idx, ws_idx), False))
+                state_order = {"partial": 0, "complete": 1, "empty": 2}
+                layout_states = sorted(
+                    layout_states,
+                    key=lambda item: (
+                        state_order.get(item.get("state"), 3),
+                        str(item.get("label", "")),
+                    ),
+                )
+
+                state_theme = {
+                    "complete": ("C Complete", "#2FA66A", "#E8F6EE", "#1D7047"),
+                    "partial": ("P Partial", "#E39A2C", "#FFF4E5", "#8B5A14"),
+                    "empty": ("E Empty", "#C8CDD5", "#F1F3F6", "#667185"),
+                }
+
+                filled_count = sum(1 for item in layout_states if item.get("state") != "empty")
+
+                detail = tk.Toplevel(dialog)
+                coverage_details_popup["win"] = detail
+                detail.title("Workspace Layout Details")
+                detail.attributes("-topmost", True)
+                detail.transient(dialog)
+                detail.resizable(False, False)
+                detail.configure(bg=section_bg)
+
+                def _on_detail_destroy(_event=None):
+                    if coverage_details_popup.get("win") is detail:
+                        coverage_details_popup["win"] = None
+
+                detail.bind("<Destroy>", _on_detail_destroy)
+
+                panel = tk.Frame(detail, bg=section_bg, padx=12, pady=10)
+                panel.pack(fill=tk.BOTH, expand=True)
+
+                tk.Label(
+                    panel,
+                    text=f"Monitor {mon_idx + 1} · Workspace {ws_idx + 1}",
+                    font=("Arial", 10, "bold"),
+                    fg="#22324A",
+                    bg=section_bg,
+                    anchor="w",
+                ).pack(fill=tk.X)
+                tk.Label(
+                    panel,
+                    text=f"Prefilled layouts: {filled_count}/{preset_total}",
+                    font=("Arial", 8),
+                    fg="#5D6778",
+                    bg=section_bg,
+                    anchor="w",
+                ).pack(fill=tk.X, pady=(2, 8))
+
+                header = tk.Frame(panel, bg="#E8EDF5", relief="solid", bd=1)
+                header.pack(fill=tk.X)
+                tk.Label(
+                    header,
+                    text="Layout",
+                    font=("Arial", 8, "bold"),
+                    fg="#3f4a5a",
+                    bg="#E8EDF5",
+                    anchor="w",
+                    width=18,
+                ).grid(row=0, column=0, padx=(6, 4), pady=4, sticky="w")
+                tk.Label(
+                    header,
+                    text="State",
+                    font=("Arial", 8, "bold"),
+                    fg="#3f4a5a",
+                    bg="#E8EDF5",
+                    anchor="w",
+                    width=10,
+                ).grid(row=0, column=1, padx=(0, 4), pady=4, sticky="w")
+                tk.Label(
+                    header,
+                    text="Usage",
+                    font=("Arial", 8, "bold"),
+                    fg="#3f4a5a",
+                    bg="#E8EDF5",
+                    anchor="w",
+                    width=6,
+                ).grid(row=0, column=2, padx=(0, 4), pady=4, sticky="w")
+                tk.Label(
+                    header,
+                    text="Fill",
+                    font=("Arial", 8, "bold"),
+                    fg="#3f4a5a",
+                    bg="#E8EDF5",
+                    anchor="w",
+                    width=14,
+                ).grid(row=0, column=3, padx=(0, 6), pady=4, sticky="w")
+
+                rows_holder = tk.Frame(panel, bg=section_bg)
+                rows_holder.pack(fill=tk.X)
+
+                for item in layout_states:
+                    state_key = item.get("state", "empty")
+                    state_name, accent_color, badge_bg, badge_fg = state_theme.get(
+                        state_key,
+                        ("Empty", "#C8CDD5", "#F1F3F6", "#667185"),
+                    )
+                    filled = int(item.get("filled", 0))
+                    capacity = max(1, int(item.get("capacity", 1)))
+                    ratio = max(0.0, min(1.0, float(filled) / float(capacity)))
+
+                    row = tk.Frame(rows_holder, bg="#FFFFFF", relief="solid", bd=1)
+                    row.pack(fill=tk.X, pady=(2, 0))
+                    tk.Label(
+                        row,
+                        text=item.get("label", "Layout"),
+                        font=("Arial", 8),
+                        fg="#253247",
+                        bg="#FFFFFF",
+                        anchor="w",
+                        width=18,
+                    ).grid(row=0, column=0, padx=(6, 4), pady=4, sticky="w")
+                    tk.Label(
+                        row,
+                        text=state_name,
+                        font=("Arial", 8, "bold"),
+                        fg=badge_fg,
+                        bg=badge_bg,
+                        anchor="w",
+                        width=10,
+                        padx=4,
+                    ).grid(row=0, column=1, padx=(0, 4), pady=4, sticky="w")
+                    tk.Label(
+                        row,
+                        text=f"{filled}/{capacity}",
+                        font=("Arial", 8),
+                        fg="#354156",
+                        bg="#FFFFFF",
+                        anchor="w",
+                        width=6,
+                    ).grid(row=0, column=2, padx=(0, 4), pady=4, sticky="w")
+
+                    bar_canvas = tk.Canvas(
+                        row,
+                        width=118,
+                        height=10,
+                        bg="#FFFFFF",
+                        highlightthickness=0,
+                        borderwidth=0,
+                    )
+                    bar_canvas.grid(row=0, column=3, padx=(0, 8), pady=4, sticky="w")
+                    bar_canvas.create_rectangle(0, 1, 116, 9, fill="#E5EAF2", outline="#E5EAF2")
+                    if ratio > 0.0:
+                        bar_canvas.create_rectangle(
+                            0,
+                            1,
+                            int(116 * ratio),
+                            9,
+                            fill=accent_color,
+                            outline=accent_color,
                         )
 
-                    for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items():
-                        if user32.IsWindow(hwnd):
-                            ws_idx = self.current_workspace.get(m, 0)
-                            if _is_ws_hidden_by_reset(m, ws_idx):
-                                continue
-                            _add_hit(m, ws_idx)
-                    for hwnd, (m, _c, _r) in self.window_mgr.minimized_windows.items():
-                        if user32.IsWindow(hwnd):
-                            ws_idx = self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0))
-                            if _is_ws_hidden_by_reset(m, ws_idx):
-                                continue
-                            _add_hit(m, ws_idx)
-                    for hwnd, (m, _c, _r) in self.window_mgr.maximized_windows.items():
-                        if user32.IsWindow(hwnd):
-                            ws_idx = self.window_state_ws.get(hwnd, self.current_workspace.get(m, 0))
-                            if _is_ws_hidden_by_reset(m, ws_idx):
-                                continue
-                            _add_hit(m, ws_idx)
-                    # Include saved ownership across all workspace maps (WS1/WS2/WS3),
-                    # but honor reset blocks to avoid false positives in the indicator.
+                button_row = tk.Frame(panel, bg=section_bg)
+                button_row.pack(fill=tk.X, pady=(10, 0))
+                tk.Button(button_row, text="Close", width=10, command=detail.destroy).pack()
 
+                detail.update_idletasks()
+                req_w = max(460, detail.winfo_reqwidth() + 4)
+                req_h = max(280, detail.winfo_reqheight() + 6)
+                screen_h = detail.winfo_screenheight()
+                req_h = min(req_h, max(280, screen_h - 90))
+                self._center_tk_window(detail, req_w, req_h, monitor_idx=mon_idx)
+
+            coverage_dot_tooltip = {"win": None, "label": None}
+
+            def hide_coverage_dot_tooltip(_event=None):
+                tip = coverage_dot_tooltip.get("win")
+                if tip is not None:
+                    try:
+                        if tip.winfo_exists():
+                            tip.destroy()
+                    except Exception:
+                        pass
+                coverage_dot_tooltip["win"] = None
+                coverage_dot_tooltip["label"] = None
+
+            def show_coverage_dot_tooltip(text, x_root, y_root):
+                tip = coverage_dot_tooltip.get("win")
+                tip_label = coverage_dot_tooltip.get("label")
+                if tip is None or tip_label is None or (not tip.winfo_exists()):
+                    tip = tk.Toplevel(dialog)
+                    tip.overrideredirect(True)
+                    tip.attributes("-topmost", True)
+                    tip.configure(bg="#FFFFFF")
+                    tip_label = tk.Label(
+                        tip,
+                        text=text,
+                        font=("Arial", 8),
+                        fg="#253247",
+                        bg="#FFFFFF",
+                        relief="solid",
+                        bd=1,
+                        padx=6,
+                        pady=3,
+                        justify=tk.LEFT,
+                        anchor="w",
+                    )
+                    tip_label.pack()
+                    coverage_dot_tooltip["win"] = tip
+                    coverage_dot_tooltip["label"] = tip_label
+                else:
+                    tip_label.config(text=text)
+
+                try:
+                    tip.geometry(f"+{int(x_root) + 12}+{int(y_root) + 10}")
+                except Exception:
+                    pass
+
+            def draw_layout_state_dots(canvas, layout_states, bg_color):
+                canvas.delete("all")
+                canvas.configure(bg=bg_color)
+                states = list(layout_states) if layout_states else []
+                if not states:
+                    return
+
+                state_styles = {
+                    "complete": {
+                        "fill": "#2FA66A",
+                        "outline": "#2FA66A",
+                        "symbol": "C",
+                        "symbol_color": "#FFFFFF",
+                    },
+                    "partial": {
+                        "fill": "#E39A2C",
+                        "outline": "#E39A2C",
+                        "symbol": "P",
+                        "symbol_color": "#FFFFFF",
+                    },
+                    "empty": {
+                        "fill": "#D5DCE6",
+                        "outline": "#9AA5B5",
+                        "symbol": "E",
+                        "symbol_color": "#334257",
+                    },
+                }
+                state_labels = {
+                    "complete": "Complete",
+                    "partial": "Partial",
+                    "empty": "Empty",
+                }
+
+                width = max(50, canvas.winfo_width())
+                height = max(14, canvas.winfo_height())
+                count = len(states)
+                pad_x = 8
+                y = height / 2.0
+                if count <= 1:
+                    xs = [width / 2.0]
+                    spacing = float(width - (2 * pad_x))
+                else:
+                    span = max(1.0, float(width - (2 * pad_x)))
+                    step = span / float(count - 1)
+                    spacing = step
+                    xs = [pad_x + (idx * step) for idx in range(count)]
+                half_side = max(4.3, min(8.2, spacing * 0.36))
+                symbol_size = max(8, min(12, int(round(half_side + 3.2))))
+
+                for idx, state_entry in enumerate(states):
+                    state_key = state_entry.get("state", "empty")
+                    style = state_styles.get(state_key, state_styles["empty"])
+                    label = state_entry.get("label", "Layout")
+                    filled = int(state_entry.get("filled", 0))
+                    capacity = int(state_entry.get("capacity", 0))
+                    state_txt = state_labels.get(state_key, "Empty")
+                    tooltip_text = f"{label}: {state_txt} ({filled}/{capacity})"
+                    x = xs[idx]
+                    tag = f"dot_{idx}"
+                    canvas.create_rectangle(
+                        x - half_side,
+                        y - half_side,
+                        x + half_side,
+                        y + half_side,
+                        fill=style["fill"],
+                        outline=style["outline"],
+                        width=2 if state_key == "empty" else 1,
+                        tags=(tag,),
+                    )
+                    canvas.create_text(
+                        x,
+                        y,
+                        text=style["symbol"],
+                        fill=style["symbol_color"],
+                        font=("Arial", symbol_size, "bold"),
+                        tags=(tag,),
+                    )
+                    canvas.tag_bind(
+                        tag,
+                        "<Enter>",
+                        lambda e, txt=tooltip_text: show_coverage_dot_tooltip(txt, e.x_root, e.y_root),
+                    )
+                    canvas.tag_bind(
+                        tag,
+                        "<Motion>",
+                        lambda e, txt=tooltip_text: show_coverage_dot_tooltip(txt, e.x_root, e.y_root),
+                    )
+                    canvas.tag_bind(tag, "<Leave>", hide_coverage_dot_tooltip)
+
+            def render_workspace_coverage(rows, target_mon_idx, target_ws_idx, active_ws_snapshot):
+                hide_coverage_dot_tooltip()
+                for child in coverage_inner.winfo_children():
+                    child.destroy()
+
+                ws_totals = [
+                    {"complete": 0, "partial": 0, "empty": 0}
+                    for _ in range(3)
+                ]
+                for row in rows:
+                    row_cells = row.get("cells", [])
+                    for ws_idx, cell in enumerate(row_cells[:3]):
+                        ws_totals[ws_idx]["complete"] += int(cell.get("complete", 0))
+                        ws_totals[ws_idx]["partial"] += int(cell.get("partial", 0))
+                        ws_totals[ws_idx]["empty"] += int(cell.get("empty", 0))
+
+                header_bg = "#E8EDF5"
+                tk.Label(
+                    coverage_inner,
+                    text="Mon",
+                    font=("Arial", 8, "bold"),
+                    fg="#3f4a5a",
+                    bg=header_bg,
+                    anchor="center",
+                    padx=6,
+                    pady=4,
+                ).grid(row=0, column=0, sticky="nsew", padx=(0, 2), pady=(0, 2))
+                for ws_idx in range(3):
+                    header_cell = tk.Frame(
+                        coverage_inner,
+                        bg=header_bg,
+                        relief="solid",
+                        bd=1,
+                        padx=3,
+                        pady=2,
+                    )
+                    header_cell.grid(row=0, column=ws_idx + 1, sticky="nsew", padx=(0, 2), pady=(0, 2))
+                    header_top = tk.Frame(header_cell, bg=header_bg)
+                    header_top.pack(fill=tk.X)
+                    header_top.grid_columnconfigure(0, weight=1)
+                    header_top.grid_columnconfigure(1, weight=0)
+                    header_top.grid_columnconfigure(2, weight=0)
+                    header_top.grid_columnconfigure(3, weight=1)
+                    tk.Label(
+                        header_top,
+                        text=f"WS{ws_idx + 1}",
+                        font=("Arial", 8, "bold"),
+                        fg="#3f4a5a",
+                        bg=header_bg,
+                        anchor="center",
+                    ).grid(row=0, column=1, sticky="n")
+                    ws_badges = tk.Frame(header_top, bg=header_bg)
+                    ws_badges.grid(row=0, column=2, sticky="w", padx=(6, 0))
+                    badge_specs = [
+                        ("Complete", ws_totals[ws_idx]["complete"], "#E8F6EE", "#1D7047"),
+                        ("Partial", ws_totals[ws_idx]["partial"], "#FFF4E5", "#8B5A14"),
+                        ("Empty", ws_totals[ws_idx]["empty"], "#F1F3F6", "#556070"),
+                    ]
+                    for label, value, bg_color, fg_color in badge_specs:
+                        tk.Label(
+                            ws_badges,
+                            text=f"{label} {value}",
+                            font=("Arial", 7, "bold"),
+                            fg=fg_color,
+                            bg=bg_color,
+                            padx=4,
+                            pady=1,
+                            relief="solid",
+                            bd=1,
+                            anchor="w",
+                        ).pack(side=tk.LEFT, padx=(0, 3))
+
+                for row_idx, row in enumerate(rows, start=1):
+                    mon_idx = row["monitor"]
+                    active_ws = active_ws_snapshot.get(mon_idx, 0)
+                    row_widgets = []
+                    mon_label = tk.Label(
+                        coverage_inner,
+                        text=f"M{mon_idx + 1}",
+                        font=("Arial", 8, "bold"),
+                        fg="#22324A",
+                        bg="#DDE3ED",
+                        anchor="center",
+                        width=5,
+                        padx=2,
+                        pady=5,
+                        relief="solid",
+                        bd=1,
+                    )
+                    mon_label.grid(row=row_idx, column=0, sticky="nsew", padx=(0, 2), pady=1)
+                    row_widgets.append(mon_label)
+
+                    for ws_idx, cell in enumerate(row["cells"]):
+                        is_active = active_ws == ws_idx
+                        is_target = mon_idx == target_mon_idx and ws_idx == target_ws_idx
+                        base_bg = "#FFFFFF"
+                        if is_active:
+                            base_bg = "#F3F4F7"
+                        if is_target:
+                            base_bg = "#DDEBFF"
+                        border_color = "#2E64AE" if is_target else "#C4CCD8"
+
+                        cell_box = tk.Frame(
+                            coverage_inner,
+                            bg=base_bg,
+                            relief="flat",
+                            bd=0,
+                            highlightthickness=2 if is_target else 1,
+                            highlightbackground=border_color,
+                            highlightcolor=border_color,
+                            cursor="hand2",
+                            padx=6,
+                            pady=4,
+                        )
+                        cell_box.grid(
+                            row=row_idx,
+                            column=ws_idx + 1,
+                            sticky="nsew",
+                            padx=(0, 2),
+                            pady=1,
+                        )
+                        row_widgets.append(cell_box)
+
+                        title_fg = "#1f2a3a" if cell["filled"] > 0 else "#8A8F98"
+                        title_row = tk.Frame(cell_box, bg=base_bg)
+                        title_row.pack(fill=tk.X)
+                        tk.Label(
+                            title_row,
+                            text=f"{cell['filled']}/{preset_total} prefilled layouts",
+                            font=("Arial", 8, "bold" if is_target else "normal"),
+                            fg=title_fg,
+                            bg=base_bg,
+                            anchor="center",
+                            justify=tk.CENTER,
+                        ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+                        dots_canvas = tk.Canvas(
+                            cell_box,
+                            height=16,
+                            bg=base_bg,
+                            highlightthickness=0,
+                            borderwidth=0,
+                            cursor="hand2",
+                        )
+                        dots_canvas.pack(fill=tk.X, anchor="center", pady=(4, 3))
+                        states_tuple = tuple(cell["layout_states"])
+                        dots_canvas.bind(
+                            "<Configure>",
+                            lambda _e, c=dots_canvas, states=states_tuple, bg=base_bg: (
+                                draw_layout_state_dots(c, states, bg)
+                            ),
+                        )
+                        draw_layout_state_dots(dots_canvas, states_tuple, base_bg)
+
+                        click_cb = lambda _e, m=mon_idx, w=ws_idx, d=tuple(cell["layout_states"]): (
+                            hide_coverage_dot_tooltip(),
+                            show_workspace_coverage_details(m, w, d),
+                        )
+                        for widget in (cell_box, title_row, dots_canvas):
+                            widget.bind("<Button-1>", click_cb)
+                            widget.bind("<Leave>", hide_coverage_dot_tooltip)
+                        for widget in cell_box.winfo_children():
+                            widget.bind("<Button-1>", click_cb)
+                            widget.bind("<Leave>", hide_coverage_dot_tooltip)
+                            if isinstance(widget, tk.Frame):
+                                for child in widget.winfo_children():
+                                    child.bind("<Button-1>", click_cb)
+                                    child.bind("<Leave>", hide_coverage_dot_tooltip)
+
+                    try:
+                        coverage_inner.update_idletasks()
+                        target_row_h = max(
+                            (w.winfo_reqheight() for w in row_widgets if w.winfo_exists()),
+                            default=0,
+                        ) + 2
+                        if target_row_h > 0:
+                            coverage_inner.grid_rowconfigure(row_idx, minsize=target_row_h)
+                    except Exception:
+                        pass
+
+                coverage_inner.grid_columnconfigure(0, weight=0, minsize=56)
+                for col in range(1, 4):
+                    coverage_inner.grid_columnconfigure(col, weight=1, minsize=coverage_ws_col_min_width)
+                dialog.after_idle(update_coverage_scrollbar_visibility)
+
+            def update_current_badge():
+                mon_idx = get_target_monitor_index()
+                target_ws_idx = get_target_ws_index()
+                sync_coverage_panel_size()
+
+                with self.lock:
+                    grid_snapshot = dict(self.window_mgr.grid_state)
+                    layout_signature_snapshot = dict(self.layout_signature)
+                    current_ws_snapshot = dict(self.current_workspace)
+                    ws_layout_signature_snapshot = {
+                        (int(m), int(w)): self._normalize_layout_signature(sig[0], sig[1])
+                        for (m, w), sig in self.workspace_layout_signature.items()
+                        if isinstance(sig, tuple) and len(sig) == 2
+                    }
+                    workspace_profiles_snapshot = {}
+                    for (m, w, layout_name, layout_info), profile_map in self.workspace_layout_profiles.items():
+                        norm_layout, norm_info = self._normalize_layout_signature(layout_name, layout_info)
+                        workspace_profiles_snapshot[(int(m), int(w), norm_layout, norm_info)] = (
+                            dict(profile_map) if isinstance(profile_map, dict) else {}
+                        )
+                    profile_reset_block = {
+                        self._layout_profile_key(m, w, layout_name, layout_info)
+                        for (m, w, layout_name, layout_info) in self._manual_layout_profile_reset_block
+                    }
+                    ws_reset_block = {(int(m), int(w)) for (m, w) in self._manual_layout_reset_block}
+                    workspaces_snapshot = {}
                     for m_idx, ws_list in self.workspaces.items():
                         if not isinstance(ws_list, list):
                             continue
-                        for ws_idx, ws_map in enumerate(ws_list):
-                            if not isinstance(ws_map, dict):
-                                continue
-                            ws_live = any(user32.IsWindow(hwnd) for hwnd in ws_map.keys())
-                            profile_live = bool(profile_live_by_ws.get((m_idx, ws_idx), False))
-                            reset_blocked = (m_idx, ws_idx) in self._manual_layout_reset_block
+                        rebuilt = []
+                        for ws_map in ws_list[:3]:
+                            rebuilt.append(dict(ws_map) if isinstance(ws_map, dict) else {})
+                        while len(rebuilt) < 3:
+                            rebuilt.append({})
+                        workspaces_snapshot[int(m_idx)] = rebuilt
 
-                            # After a workspace reset, ws_map can still contain legacy residue
-                            # that is intentionally ignored by prefill logic. Only count real
-                            # non-reset profile hits for the indicator in that state.
-                            if reset_blocked:
-                                if profile_live:
-                                    _add_hit(m_idx, ws_idx)
-                            elif ws_live or profile_live:
-                                _add_hit(m_idx, ws_idx)
+                sig = layout_signature_snapshot.get(mon_idx)
+                ws_num = current_ws_snapshot.get(mon_idx, 0) + 1
+
+                runtime_sig_by_monitor = {}
+                for m_idx, runtime_sig in layout_signature_snapshot.items():
+                    if runtime_sig is None:
+                        continue
+                    try:
+                        runtime_sig_by_monitor[int(m_idx)] = self._normalize_layout_signature(
+                            runtime_sig[0], runtime_sig[1]
+                        )
+                    except Exception:
+                        continue
+
+                runtime_count_by_monitor = {}
+                for hwnd, (m_idx, _c, _r) in grid_snapshot.items():
+                    if user32.IsWindow(hwnd):
+                        runtime_count_by_monitor[m_idx] = runtime_count_by_monitor.get(m_idx, 0) + 1
+
+                rows = []
+                monitor_ws_hits = {}
+                monitor_count = len(self.monitors_cache)
+
+                for m_idx in range(monitor_count):
+                    active_ws = current_ws_snapshot.get(m_idx, 0)
+                    if active_ws not in (0, 1, 2):
+                        active_ws = 0
+                    runtime_sig = runtime_sig_by_monitor.get(m_idx)
+                    runtime_count = runtime_count_by_monitor.get(m_idx, 0)
+                    ws_list = workspaces_snapshot.get(m_idx, [{}, {}, {}])
+                    row_cells = []
+
+                    for ws_idx in range(3):
+                        ws_map = ws_list[ws_idx] if ws_idx < len(ws_list) else {}
+                        ws_map_count = _count_live_layout_assignments(ws_map)
+                        ws_sig = ws_layout_signature_snapshot.get((m_idx, ws_idx))
+                        if ws_sig is None and ws_map_count > 0:
+                            ws_sig = self._normalize_layout_signature(
+                                *self.layout_engine.choose_layout(ws_map_count)
+                            )
+                        ws_reset_blocked = (m_idx, ws_idx) in ws_reset_block
+
+                        layout_states = []
+                        complete_count = 0
+                        partial_count = 0
+
+                        for preset_label, preset_layout, preset_info, preset_capacity in preset_meta:
+                            profile_key = (m_idx, ws_idx, preset_layout, preset_info)
+                            profile_reset_blocked = profile_key in profile_reset_block
+                            profile_count = 0
+                            if not profile_reset_blocked:
+                                profile_count = _count_live_layout_assignments(
+                                    workspace_profiles_snapshot.get(profile_key, {})
+                                )
+
+                            filled_slots = min(preset_capacity, profile_count)
+
+                            if (
+                                ws_idx == active_ws
+                                and runtime_sig == (preset_layout, preset_info)
+                                and ((not ws_reset_blocked) or profile_count > 0)
+                                and (not profile_reset_blocked)
+                            ):
+                                filled_slots = max(
+                                    filled_slots,
+                                    min(preset_capacity, runtime_count),
+                                )
+
+                            if (
+                                filled_slots <= 0
+                                and ws_sig == (preset_layout, preset_info)
+                                and ((not ws_reset_blocked) or profile_count > 0)
+                                and (not profile_reset_blocked)
+                            ):
+                                filled_slots = min(preset_capacity, ws_map_count)
+
+                            state = "empty"
+                            if filled_slots > 0:
+                                if filled_slots >= preset_capacity:
+                                    complete_count += 1
+                                    state = "complete"
+                                else:
+                                    partial_count += 1
+                                    state = "partial"
+
+                            layout_states.append(
+                                {
+                                    "label": preset_label,
+                                    "filled": filled_slots,
+                                    "capacity": preset_capacity,
+                                    "state": state,
+                                    "complete": state == "complete",
+                                }
+                            )
+
+                        filled_count = complete_count + partial_count
+                        empty_count = max(0, preset_total - filled_count)
+                        if filled_count > 0:
+                            monitor_ws_hits.setdefault(m_idx, set()).add(ws_idx)
+
+                        row_cells.append(
+                            {
+                                "filled": filled_count,
+                                "complete": complete_count,
+                                "partial": partial_count,
+                                "empty": empty_count,
+                                "layout_states": layout_states,
+                            }
+                        )
+
+                    rows.append({"monitor": m_idx, "cells": row_cells})
 
                 detected_monitors = sorted(
-                    m for m in active_monitors if 0 <= m < len(self.monitors_cache)
+                    m for m in monitor_ws_hits.keys() if 0 <= m < len(self.monitors_cache)
                 )
                 if detected_monitors:
-                    def _format_monitor_ws(m_idx):
-                        ws_list = sorted(monitor_ws_hits.get(m_idx, set()))
-                        if not ws_list:
-                            return f"M{m_idx + 1}"
-                        ws_text = " & ".join(f"WS{ws + 1}" for ws in ws_list)
-                        return f"M{m_idx + 1} ({ws_text})"
-
-                    multi_monitor_label.config(text="Windows/apps detected on:")
-                    multi_monitor_value.config(
-                        text=", ".join(_format_monitor_ws(m) for m in detected_monitors)
-                    )
+                    detected_parts = []
+                    for m_idx in detected_monitors:
+                        ws_values = sorted(monitor_ws_hits.get(m_idx, set()))
+                        if not ws_values:
+                            detected_parts.append(f"M{m_idx + 1}")
+                            continue
+                        ws_text = " & ".join(f"WS{ws + 1}" for ws in ws_values)
+                        detected_parts.append(f"M{m_idx + 1} ({ws_text})")
+                    coverage_detect_value.config(text=", ".join(detected_parts))
                 else:
-                    multi_monitor_label.config(text="Windows/apps detected on:")
-                    multi_monitor_value.config(text="None")
-                if not multi_monitor_label.winfo_ismapped():
-                    multi_monitor_label.pack(side=tk.LEFT, padx=(8, 6))
-                if not multi_monitor_value.winfo_ismapped():
-                    multi_monitor_value.pack(side=tk.LEFT, padx=(0, 6))
+                    coverage_detect_value.config(text="None")
+
+                render_workspace_coverage(
+                    rows,
+                    target_mon_idx=mon_idx,
+                    target_ws_idx=target_ws_idx,
+                    active_ws_snapshot=current_ws_snapshot,
+                )
+
                 status_mon_value.config(text=f"M{mon_idx + 1}")
                 status_ws_value.config(text=f"WS{ws_num}")
-                cur_layout = self.layout_engine.choose_layout(grid_count) if grid_count > 0 else sig
+                cur_ws_idx = current_ws_snapshot.get(mon_idx, 0)
+                if cur_ws_idx not in (0, 1, 2):
+                    cur_ws_idx = 0
+                # Prefer the explicit runtime/workspace layout signature.
+                # Inferring from count (1->full, 2->side_by_side...) is misleading
+                # for manual layouts such as a partial Master Stack.
+                cur_layout = runtime_sig_by_monitor.get(mon_idx)
+                if cur_layout is None:
+                    cur_layout = ws_layout_signature_snapshot.get((mon_idx, cur_ws_idx))
                 if not cur_layout:
                     status_layout_value.config(text="—")
                     return
@@ -5090,6 +6473,7 @@ class SmartGrid:
                         profile_key in self._manual_layout_profile_reset_block
                     )
                     active_ws = self.current_workspace.get(mon_idx, 0)
+                    manual_locked = (mon_idx, target_ws) in self._workspace_manual_layout_lock
                     runtime_sig = self.layout_signature.get(mon_idx)
                     if runtime_sig is not None:
                         runtime_sig = self._normalize_layout_signature(
@@ -5173,6 +6557,11 @@ class SmartGrid:
                 if prefill:
                     return prefill
 
+                # For manual layouts, never infer slot assignments from ws_map fallback.
+                # A missing profile should remain empty instead of auto-filling slots.
+                if manual_locked and ws_sig == selected_sig and not profile_map:
+                    return prefill
+
                 # Fallback to workspace map only when this is the workspace's current layout.
                 if ws_sig != selected_sig:
                     return prefill
@@ -5203,6 +6592,7 @@ class SmartGrid:
                     w.destroy()
                 slot_vars.clear()
                 slot_widgets.clear()
+                clear_slot_buttons = []
                 no_windows_available = not display_labels
 
                 sel_label = layout_var.get()
@@ -5232,19 +6622,50 @@ class SmartGrid:
                         anchor="w",
                     ).pack(anchor="w", pady=(0, 4))
 
+                # Keep Clear buttons aligned without a large character-based width gap.
+                slot_label_font = tkfont.Font(family="Arial", size=8)
+                slot_label_min_px = 0
+                if grid_coords:
+                    slot_label_min_px = max(
+                        slot_label_font.measure(f"Slot {idx} ({c},{r})")
+                        for idx, (c, r) in enumerate(grid_coords, start=1)
+                    ) + 4
+
                 for i, (col, row) in enumerate(grid_coords, start=1):
                     row_frame = tk.Frame(slots_frame, bg=section_bg)
                     row_frame.pack(fill=tk.X, pady=2)
+                    # Keep process label close to the combobox instead of pushing it to the far right.
+                    row_frame.grid_columnconfigure(2, weight=0)
+                    if slot_label_min_px > 0:
+                        row_frame.grid_columnconfigure(0, minsize=slot_label_min_px)
 
                     tk.Label(
                         row_frame,
                         text=f"Slot {i} ({col},{row})",
-                        width=16,
-                        anchor="w",
+                        font=slot_label_font,
+                        anchor="e",
                         bg=section_bg,
-                    ).grid(row=0, column=0, sticky="w")
+                    ).grid(row=0, column=0, sticky="e")
 
                     var = tk.StringVar()
+                    clear_btn = tk.Button(
+                        row_frame,
+                        text="Clear",
+                        width=6,
+                        font=("Arial", 8),
+                        bg=CLEAR_SLOT_BTN_BG,
+                        fg=CLEAR_SLOT_BTN_FG,
+                        activebackground=CLEAR_SLOT_BTN_HOVER_BG,
+                        activeforeground=CLEAR_SLOT_BTN_HOVER_FG,
+                        relief="solid",
+                        bd=1,
+                        highlightthickness=1,
+                        highlightbackground=CLEAR_SLOT_BTN_BORDER,
+                        highlightcolor=CLEAR_SLOT_BTN_BORDER,
+                        padx=2,
+                        pady=0,
+                    )
+                    clear_btn.grid(row=0, column=1, sticky="w", padx=(0, 2))
                     combo = ttk.Combobox(
                         row_frame,
                         textvariable=var,
@@ -5254,7 +6675,7 @@ class SmartGrid:
                         width=combo_width,
                     )
                     # Keep a small right-side breathing space near the combobox arrow.
-                    combo.grid(row=0, column=1, sticky="w", padx=(5, 2))
+                    combo.grid(row=0, column=2, sticky="w", padx=(0, 2))
 
                     # Prevent accidental slot reassignment from mouse wheel over the field.
                     combo.bind("<MouseWheel>", lambda _e: "break")
@@ -5270,10 +6691,26 @@ class SmartGrid:
                         anchor="w",
                         width=proc_col_width,
                     )
-                    proc_label.grid(row=0, column=2, sticky="w", padx=(1, 1))
+                    proc_label.grid(row=0, column=3, sticky="w", padx=(1, 1))
+
+                    clear_btn.bind(
+                        "<Enter>",
+                        lambda _e, b=clear_btn: b.config(
+                            bg=CLEAR_SLOT_BTN_HOVER_BG,
+                            fg=CLEAR_SLOT_BTN_HOVER_FG,
+                        ),
+                    )
+                    clear_btn.bind(
+                        "<Leave>",
+                        lambda _e, b=clear_btn: b.config(
+                            bg=CLEAR_SLOT_BTN_BG,
+                            fg=CLEAR_SLOT_BTN_FG,
+                        ),
+                    )
 
                     slot_vars.append(((col, row), var))
                     slot_widgets.append((var, combo, proc_label))
+                    clear_slot_buttons.append((clear_btn, var, proc_label))
 
                 def update_proc_label(label_text, target_label):
                     if not label_text:
@@ -5310,6 +6747,18 @@ class SmartGrid:
 
                 for v, c, pl in slot_widgets:
                     c.bind("<<ComboboxSelected>>", lambda _e, var=v, pl=pl: on_combo_selected(var, pl))
+
+                def clear_slot_value(current_var, current_proc_label):
+                    if not current_var.get().strip():
+                        return
+                    current_var.set("")
+                    current_proc_label.config(text="")
+                    refresh_options()
+
+                for clear_btn, var, proc_label in clear_slot_buttons:
+                    clear_btn.config(
+                        command=lambda v=var, pl=proc_label: clear_slot_value(v, pl)
+                    )
 
                 # Auto-prefill from currently active tiled grid when selected layout matches it.
                 prefill_by_coord = get_current_grid_prefill(layout, info, grid_coords)
@@ -5416,6 +6865,11 @@ class SmartGrid:
                 rebuild_slots()
                 update_current_badge()
                 update_apply_state()
+                try:
+                    dialog.after(140, update_current_badge)
+                    dialog.after(320, update_current_badge)
+                except Exception:
+                    pass
 
             apply_btn = tk.Button(
                 action_frame,
@@ -5469,6 +6923,8 @@ class SmartGrid:
                     layout_var.set(target_label)
                 else:
                     rebuild_slots()
+                update_current_badge()
+                update_apply_state()
 
             target_monitor_combo.bind("<<ComboboxSelected>>", on_target_monitor_selected)
             target_ws_combo.bind("<<ComboboxSelected>>", on_target_ws_selected)
