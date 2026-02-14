@@ -3446,14 +3446,22 @@ class SmartGrid:
         # Keep a small debounce window only.
         self.ignore_retile_until = time.time() + 0.35
     
-    def ws_switch(self, ws_idx):
-        """Switch to specified workspace."""
+    def ws_switch(self, ws_idx, monitor_idx=None):
+        """Switch to specified workspace on the requested monitor."""
         self.workspace_switching_lock = True
         time.sleep(0.25)
         was_active = self.is_active
         
         try:
             mon = self.current_monitor_index
+            if monitor_idx is not None:
+                try:
+                    mon = int(monitor_idx)
+                except Exception:
+                    mon = self.current_monitor_index
+                if self.monitors_cache:
+                    mon = max(0, min(mon, len(self.monitors_cache) - 1))
+                self.current_monitor_index = mon
             
             if mon not in self.workspaces:
                 log(f"[WS] ✗ Monitor {mon} not initialized")
@@ -5045,7 +5053,7 @@ class SmartGrid:
                     return
                 close_picker()
                 if not apply_now:
-                    threading.Thread(target=self.ws_switch, args=(target_ws,), daemon=True).start()
+                    threading.Thread(target=self.ws_switch, args=(target_ws, mon_idx), daemon=True).start()
 
             apply_btn = tk.Button(
                 action_frame,
