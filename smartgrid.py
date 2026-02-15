@@ -2541,6 +2541,13 @@ class SmartGrid:
                 grid_snapshot = dict(self.window_mgr.grid_state)
                 layout_signature = dict(self.layout_signature)
                 layout_capacity = dict(self.layout_capacity)
+                current_ws_snapshot = dict(self.current_workspace)
+                manual_lock_snapshot = set(self._workspace_manual_layout_lock)
+                ws_layout_sig_snapshot = {
+                    (int(m), int(w)): self._normalize_layout_signature(sig[0], sig[1])
+                    for (m, w), sig in self.workspace_layout_signature.items()
+                    if isinstance(sig, tuple) and len(sig) == 2
+                }
 
             # Hybrid behavior: if the window count implies a different layout, retile fully.
             counts_by_monitor = {}
@@ -2552,6 +2559,20 @@ class SmartGrid:
                     continue
                 desired_layout, desired_info = self.layout_engine.choose_layout(count)
                 current_sig = layout_signature.get(mon_idx)
+                if isinstance(current_sig, tuple) and len(current_sig) == 2:
+                    current_sig = self._normalize_layout_signature(current_sig[0], current_sig[1])
+
+                active_ws = current_ws_snapshot.get(mon_idx, 0)
+                if active_ws not in (0, 1, 2):
+                    active_ws = 0
+                manual_locked = (mon_idx, active_ws) in manual_lock_snapshot
+                forced_sig = ws_layout_sig_snapshot.get((mon_idx, active_ws)) if manual_locked else None
+
+                # When the active workspace is manually locked, keep compaction within that
+                # pinned layout instead of forcing an auto-layout retile by visible count.
+                if manual_locked and forced_sig is not None and current_sig == forced_sig:
+                    continue
+
                 if current_sig is None or current_sig != (desired_layout, desired_info):
                     with self.lock:
                         self.ignore_retile_until = 0.0
@@ -3661,6 +3682,28 @@ class SmartGrid:
         for hwnd, (mon, _c, _r) in maximized_snapshot.items():
             runtime_monitor_by_hwnd.setdefault(hwnd, mon)
 
+        def _entry_with_identity(hwnd, pos, grid, state):
+            entry = {
+                'pos': pos,
+                'grid': (int(grid[0]), int(grid[1])),
+                'state': state,
+            }
+            try:
+                proc = get_process_name(hwnd)
+            except Exception:
+                proc = ""
+            proc = str(proc or "").strip().lower()
+            if proc:
+                entry['process'] = proc
+            try:
+                title = win32gui.GetWindowText(hwnd)
+            except Exception:
+                title = ""
+            title = str(title or "").strip()
+            if title:
+                entry['title'] = title
+            return entry
+
         # Save normal windows
         for hwnd, (mon, col, row) in grid_snapshot.items():
             if mon != monitor_idx or not user32.IsWindow(hwnd):
@@ -3677,11 +3720,9 @@ class SmartGrid:
                 w = rect.right - rect.left - lb - rb
                 h = rect.bottom - rect.top - tb - bb
 
-                saved_ws_map[hwnd] = {
-                    'pos': (x, y, w, h),
-                    'grid': (col, row),
-                    'state': 'normal'
-                }
+                saved_ws_map[hwnd] = _entry_with_identity(
+                    hwnd, (x, y, w, h), (col, row), 'normal'
+                )
             except Exception as e:
                 log(f"[ERROR] save_workspace (normal): {e}")
         
@@ -3698,11 +3739,9 @@ class SmartGrid:
                     continue
             if hwnd in saved_ws_map:
                 continue
-            saved_ws_map[hwnd] = {
-                'pos': (0, 0, 800, 600),
-                'grid': (col, row),
-                'state': 'minimized'
-            }
+            saved_ws_map[hwnd] = _entry_with_identity(
+                hwnd, (0, 0, 800, 600), (col, row), 'minimized'
+            )
 
         # Save maximized windows
         for hwnd, (mon, col, row) in maximized_snapshot.items():
@@ -3717,11 +3756,9 @@ class SmartGrid:
                     continue
             if hwnd in saved_ws_map:
                 continue
-            saved_ws_map[hwnd] = {
-                'pos': (0, 0, 800, 600),
-                'grid': (col, row),
-                'state': 'maximized'
-            }
+            saved_ws_map[hwnd] = _entry_with_identity(
+                hwnd, (0, 0, 800, 600), (col, row), 'maximized'
+            )
 
         # Fallback: keep previous live entries missing from runtime snapshots.
         # This avoids destructive data loss when some windows temporarily disappear
@@ -3768,11 +3805,9 @@ class SmartGrid:
             if state not in ('normal', 'minimized', 'maximized'):
                 state = 'normal'
 
-            saved_ws_map[hwnd] = {
-                'pos': pos,
-                'grid': (col, row),
-                'state': state,
-            }
+            saved_ws_map[hwnd] = _entry_with_identity(
+                hwnd, pos, (col, row), state
+            )
             preserved_count += 1
 
         # Keep parked windows in the workspace map even if runtime maps are temporarily stale.
@@ -3803,11 +3838,9 @@ class SmartGrid:
             state = str(data.get('state', 'normal')).lower()
             if state not in ('normal', 'minimized', 'maximized'):
                 state = 'normal'
-            saved_ws_map[hwnd] = {
-                'pos': pos,
-                'grid': (col, row),
-                'state': state,
-            }
+            saved_ws_map[hwnd] = _entry_with_identity(
+                hwnd, pos, (col, row), state
+            )
             preserved_count += 1
 
         with self.lock:
@@ -3823,20 +3856,25 @@ class SmartGrid:
                 if not hidden_bucket:
                     self._workspace_hidden_windows.pop((monitor_idx, ws), None)
 
+            manual_locked = (monitor_idx, ws) in self._workspace_manual_layout_lock
             current_sig = self.layout_signature.get(monitor_idx)
+            if current_sig is None:
+                # Runtime signature can be transiently missing (e.g. manager open/freeze).
+                # Fall back to the workspace-persisted signature to keep profile reconciliation active.
+                current_sig = self.workspace_layout_signature.get((monitor_idx, ws))
+
             if current_sig is not None:
                 current_sig = self._normalize_layout_signature(current_sig[0], current_sig[1])
                 self.workspace_layout_signature[(monitor_idx, ws)] = current_sig
                 profile_key = self._layout_profile_key(
                     monitor_idx, ws, current_sig[0], current_sig[1]
                 )
-                manual_locked = (monitor_idx, ws) in self._workspace_manual_layout_lock
                 existing_profile_raw = self.workspace_layout_profiles.get(profile_key, {})
                 existing_profile = (
                     dict(existing_profile_raw) if isinstance(existing_profile_raw, dict) else {}
                 )
 
-                def _normalize_profile_entry(data):
+                def _normalize_profile_entry(data, hwnd=None):
                     if not isinstance(data, dict):
                         return None
                     grid = data.get('grid')
@@ -3858,7 +3896,201 @@ class SmartGrid:
                     state = str(data.get('state', 'normal')).lower()
                     if state not in ('normal', 'minimized', 'maximized'):
                         state = 'normal'
-                    return {'pos': pos, 'grid': (col, row), 'state': state}
+                    entry = {'pos': pos, 'grid': (col, row), 'state': state}
+                    proc = str(data.get('process', '') or '').strip().lower()
+                    if (not proc) and hwnd is not None and user32.IsWindow(hwnd):
+                        try:
+                            proc = get_process_name(hwnd)
+                        except Exception:
+                            proc = ""
+                        proc = str(proc or "").strip().lower()
+                    if proc:
+                        entry['process'] = proc
+                    title = str(data.get('title', '') or '').strip()
+                    if (not title) and hwnd is not None and user32.IsWindow(hwnd):
+                        try:
+                            title = win32gui.GetWindowText(hwnd)
+                        except Exception:
+                            title = ""
+                        title = str(title or "").strip()
+                    if title:
+                        entry['title'] = title
+                    return entry
+
+                def _entry_process(hwnd, entry):
+                    if isinstance(entry, dict):
+                        p = str(entry.get('process', '') or '').strip().lower()
+                        if p:
+                            return p
+                    if hwnd is not None and user32.IsWindow(hwnd):
+                        try:
+                            return str(get_process_name(hwnd) or "").strip().lower()
+                        except Exception:
+                            return ""
+                    return ""
+
+                def _slot_distance(a, b):
+                    return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+                def _reconcile_manual_profile(saved_map, profile_map):
+                    """
+                    Keep manual slot intent stable across app restarts.
+                    If a profiled HWND died, try rebinding that same slot to a live HWND
+                    currently present in saved_map.
+                    """
+                    if not isinstance(profile_map, dict) or not profile_map:
+                        return {}
+
+                    slot_candidates = {}
+                    for cand_hwnd, cand_data in saved_map.items():
+                        if not user32.IsWindow(cand_hwnd):
+                            continue
+                        cand_entry = _normalize_profile_entry(cand_data, cand_hwnd)
+                        if cand_entry is None:
+                            continue
+                        slot = tuple(cand_entry['grid'])
+                        slot_candidates.setdefault(slot, []).append((cand_hwnd, cand_entry))
+
+                    reconciled = {}
+                    used_hwnds = set()
+                    unresolved = []
+
+                    for prof_hwnd, prof_data in profile_map.items():
+                        direct_entry = None
+                        if user32.IsWindow(prof_hwnd):
+                            source = saved_map.get(prof_hwnd, prof_data)
+                            direct_entry = _normalize_profile_entry(source, prof_hwnd)
+                        if direct_entry is not None:
+                            reconciled[prof_hwnd] = direct_entry
+                            used_hwnds.add(prof_hwnd)
+                            continue
+
+                        base_entry = _normalize_profile_entry(prof_data, prof_hwnd)
+                        if base_entry is None:
+                            continue
+
+                        slot = tuple(base_entry['grid'])
+                        rebound = None
+                        for cand_hwnd, cand_entry in slot_candidates.get(slot, []):
+                            if cand_hwnd in used_hwnds:
+                                continue
+                            rebound = (cand_hwnd, cand_entry)
+                            break
+
+                        if rebound is not None:
+                            cand_hwnd, cand_entry = rebound
+                            reconciled[cand_hwnd] = cand_entry
+                            used_hwnds.add(cand_hwnd)
+                        else:
+                            unresolved.append((prof_hwnd, base_entry))
+
+                    # Fallback: when exactly one stale slot remains and exactly one live
+                    # candidate is still unassigned, bind it to that stale slot.
+                    # This covers app close/reopen where hwnd changes and slot changed transiently.
+                    if unresolved:
+                        remaining_live = []
+                        for cand_hwnd, cand_data in saved_map.items():
+                            if cand_hwnd in used_hwnds or not user32.IsWindow(cand_hwnd):
+                                continue
+                            cand_entry = _normalize_profile_entry(cand_data, cand_hwnd)
+                            if cand_entry is None:
+                                continue
+                            remaining_live.append((cand_hwnd, cand_entry))
+
+                        if len(unresolved) == 1 and len(remaining_live) == 1:
+                            stale_hwnd, stale_entry = unresolved.pop(0)
+                            cand_hwnd, cand_entry = remaining_live[0]
+                            rebound_entry = dict(cand_entry)
+                            rebound_entry['grid'] = tuple(stale_entry['grid'])
+                            reconciled[cand_hwnd] = rebound_entry
+                            used_hwnds.add(cand_hwnd)
+
+                        # Broader fallback: resolve each remaining stale slot against the
+                        # closest unused live candidate, preferring process match.
+                        if unresolved and remaining_live:
+                            still_unresolved = []
+                            for stale_hwnd, stale_entry in unresolved:
+                                stale_slot = tuple(stale_entry.get('grid', (0, 0)))
+                                stale_proc = _entry_process(stale_hwnd, stale_entry)
+                                candidate_pool = []
+                                for cand_hwnd, cand_entry in remaining_live:
+                                    if cand_hwnd in used_hwnds:
+                                        continue
+                                    candidate_pool.append((cand_hwnd, cand_entry))
+                                if not candidate_pool:
+                                    still_unresolved.append((stale_hwnd, stale_entry))
+                                    continue
+
+                                if stale_proc:
+                                    proc_matched = []
+                                    for cand_hwnd, cand_entry in candidate_pool:
+                                        if _entry_process(cand_hwnd, cand_entry) == stale_proc:
+                                            proc_matched.append((cand_hwnd, cand_entry))
+                                    if proc_matched:
+                                        candidate_pool = proc_matched
+
+                                cand_hwnd, cand_entry = min(
+                                    candidate_pool,
+                                    key=lambda item: _slot_distance(item[1].get('grid', (0, 0)), stale_slot),
+                                )
+                                rebound_entry = dict(cand_entry)
+                                rebound_entry['grid'] = stale_slot
+                                reconciled[cand_hwnd] = rebound_entry
+                                used_hwnds.add(cand_hwnd)
+                            unresolved = still_unresolved
+
+                    for stale_hwnd, stale_entry in unresolved:
+                        # Keep stale profile entry so a future restart can still rebind this slot.
+                        reconciled[stale_hwnd] = stale_entry
+
+                    return reconciled
+
+                runtime_manual_profile = {}
+                if manual_locked:
+                    slot_rank = {}
+
+                    def _consider_runtime(hwnd, col, row, state, rank):
+                        if not user32.IsWindow(hwnd):
+                            return
+                        slot = (int(col), int(row))
+                        current = slot_rank.get(slot)
+                        if current is not None and current[0] <= rank:
+                            return
+                        source = saved_ws_map.get(hwnd, {
+                            'pos': (0, 0, 800, 600),
+                            'grid': slot,
+                            'state': state,
+                        })
+                        entry = _normalize_profile_entry(source, hwnd)
+                        if entry is None:
+                            entry = {'pos': (0, 0, 800, 600), 'grid': slot, 'state': state}
+                        else:
+                            entry['state'] = state
+                        slot_rank[slot] = (rank, hwnd, entry)
+
+                    for hwnd, (mon, col, row) in grid_snapshot.items():
+                        if mon != monitor_idx:
+                            continue
+                        _consider_runtime(hwnd, col, row, 'normal', 0)
+
+                    for snapshot_map, runtime_state, rank in (
+                        (maximized_snapshot, 'maximized', 1),
+                        (minimized_snapshot, 'minimized', 2),
+                    ):
+                        for hwnd, (mon, col, row) in snapshot_map.items():
+                            if mon != monitor_idx:
+                                continue
+                            origin_ws = state_ws_snapshot.get(hwnd)
+                            if origin_ws is not None and origin_ws != ws:
+                                continue
+                            if origin_ws is None:
+                                owner_ws = self._find_workspace_owner(monitor_idx, hwnd, prefer_ws=ws)
+                                if owner_ws is not None and owner_ws != ws:
+                                    continue
+                            _consider_runtime(hwnd, col, row, runtime_state, rank)
+
+                    for _slot, (_rank, slot_hwnd, slot_entry) in slot_rank.items():
+                        runtime_manual_profile[slot_hwnd] = slot_entry
 
                 # Respect layout-specific reset markers: do not auto-recreate a reset profile
                 # during workspace autosave; only explicit Apply should restore it.
@@ -3871,15 +4103,9 @@ class SmartGrid:
                     elif saved_ws_map and manual_locked and existing_profile:
                         # For manual layouts, never recreate profile from whole workspace map:
                         # keep only previously assigned manual windows.
-                        reconciled = {}
-                        for hwnd, pdata in existing_profile.items():
-                            if not user32.IsWindow(hwnd):
-                                continue
-                            source = saved_ws_map.get(hwnd, pdata)
-                            entry = _normalize_profile_entry(source)
-                            if entry is not None:
-                                reconciled[hwnd] = entry
-                        if reconciled:
+                        reconciled = _reconcile_manual_profile(saved_ws_map, existing_profile)
+                        has_live = any(user32.IsWindow(hwnd) for hwnd in reconciled.keys())
+                        if has_live:
                             self._manual_layout_profile_reset_block.discard(profile_key)
                             self._manual_layout_reset_block.discard((monitor_idx, ws))
                             self.workspace_layout_profiles[profile_key] = reconciled
@@ -3887,23 +4113,54 @@ class SmartGrid:
                         self.workspace_layout_profiles.pop(profile_key, None)
                 else:
                     if manual_locked:
-                        # Keep manual profile stable across autosaves. Using the full workspace
-                        # map here would auto-fill partial layouts (notably Master Stack).
-                        if existing_profile:
-                            reconciled = {}
-                            for hwnd, pdata in existing_profile.items():
-                                if not user32.IsWindow(hwnd):
+                        if runtime_manual_profile:
+                            # Persist what is actually on-screen now, and keep stale slot intent
+                            # only for slots that are currently unoccupied.
+                            merged_profile = dict(runtime_manual_profile)
+                            occupied_slots = {
+                                tuple(data['grid'])
+                                for data in runtime_manual_profile.values()
+                                if isinstance(data, dict) and isinstance(data.get('grid'), tuple)
+                            }
+                            for old_hwnd, old_data in existing_profile.items():
+                                old_entry = _normalize_profile_entry(old_data, old_hwnd)
+                                if old_entry is None:
                                     continue
-                                source = saved_ws_map.get(hwnd, pdata)
-                                entry = _normalize_profile_entry(source)
-                                if entry is not None:
-                                    reconciled[hwnd] = entry
+                                if tuple(old_entry['grid']) in occupied_slots:
+                                    continue
+                                merged_profile[old_hwnd] = old_entry
+                            self.workspace_layout_profiles[profile_key] = merged_profile
+                        elif existing_profile:
+                            reconciled = _reconcile_manual_profile(saved_ws_map, existing_profile)
                             if reconciled:
                                 self.workspace_layout_profiles[profile_key] = reconciled
                             else:
                                 self.workspace_layout_profiles[profile_key] = dict(existing_profile)
                     else:
                         self.workspace_layout_profiles[profile_key] = dict(saved_ws_map)
+
+                # Reconcile every manual profile variant of this workspace (all layouts),
+                # not only the currently active signature. This keeps slot persistence stable
+                # when apps are closed/reopened and the user switches workspaces without Apply.
+                if manual_locked and saved_ws_map:
+                    for any_key, any_profile_raw in list(self.workspace_layout_profiles.items()):
+                        if (
+                            not isinstance(any_key, tuple)
+                            or len(any_key) != 4
+                            or int(any_key[0]) != int(monitor_idx)
+                            or int(any_key[1]) != int(ws)
+                        ):
+                            continue
+                        if any_key == profile_key:
+                            continue
+                        if any_key in self._manual_layout_profile_reset_block:
+                            continue
+                        if not isinstance(any_profile_raw, dict) or not any_profile_raw:
+                            continue
+                        any_profile = dict(any_profile_raw)
+                        reconciled_any = _reconcile_manual_profile(saved_ws_map, any_profile)
+                        if reconciled_any:
+                            self.workspace_layout_profiles[any_key] = reconciled_any
 
         if preserved_count > 0:
             log(
@@ -3924,6 +4181,7 @@ class SmartGrid:
         manual_locked = False
         ws_sig_for_restore = None
         manual_profile_key = None
+        manual_profile_map_raw = {}
         manual_profile_map = {}
         manual_profile_reset_blocked = False
 
@@ -3953,8 +4211,186 @@ class SmartGrid:
                 state = str(data.get('state', 'normal')).lower()
                 if state not in ('normal', 'minimized', 'maximized'):
                     state = 'normal'
-                cleaned[hwnd] = {'pos': pos, 'grid': (col, row), 'state': state}
+                entry = {'pos': pos, 'grid': (col, row), 'state': state}
+                proc = str(data.get('process', '') or '').strip().lower()
+                if (not proc) and user32.IsWindow(hwnd):
+                    try:
+                        proc = get_process_name(hwnd)
+                    except Exception:
+                        proc = ""
+                    proc = str(proc or "").strip().lower()
+                if proc:
+                    entry['process'] = proc
+                title = str(data.get('title', '') or '').strip()
+                if (not title) and user32.IsWindow(hwnd):
+                    try:
+                        title = win32gui.GetWindowText(hwnd)
+                    except Exception:
+                        title = ""
+                    title = str(title or "").strip()
+                if title:
+                    entry['title'] = title
+                cleaned[hwnd] = entry
             return cleaned
+
+        def _rebind_profile_from_source(profile_map, source_map):
+            """
+            Rebind stale profile HWNDs to live windows currently occupying the same slot.
+            This keeps manual slot intent stable across app close/reopen (new HWND).
+            """
+            if not isinstance(profile_map, dict) or not profile_map:
+                return {}, {}
+            if not isinstance(source_map, dict):
+                source_map = {}
+
+            def _entry_process(hwnd, entry):
+                if isinstance(entry, dict):
+                    p = str(entry.get("process", "") or "").strip().lower()
+                    if p:
+                        return p
+                if hwnd is not None and user32.IsWindow(hwnd):
+                    try:
+                        return str(get_process_name(hwnd) or "").strip().lower()
+                    except Exception:
+                        return ""
+                return ""
+
+            def _slot_distance(a, b):
+                return abs(int(a[0]) - int(b[0])) + abs(int(a[1]) - int(b[1]))
+
+            source_by_slot = {}
+            for src_hwnd, src_data in source_map.items():
+                if not user32.IsWindow(src_hwnd) or not isinstance(src_data, dict):
+                    continue
+                grid = src_data.get("grid")
+                if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                    continue
+                try:
+                    slot = (int(grid[0]), int(grid[1]))
+                except Exception:
+                    continue
+                source_by_slot.setdefault(slot, []).append((src_hwnd, src_data))
+
+            rebound = {}
+            used_hwnds = set()
+            stale = {}
+            unresolved = []
+            for prof_hwnd, prof_data in profile_map.items():
+                if not isinstance(prof_data, dict):
+                    continue
+                grid = prof_data.get("grid")
+                if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                    continue
+                try:
+                    slot = (int(grid[0]), int(grid[1]))
+                except Exception:
+                    continue
+
+                if user32.IsWindow(prof_hwnd):
+                    source_data = source_map.get(prof_hwnd, prof_data)
+                    rebound[prof_hwnd] = dict(source_data) if isinstance(source_data, dict) else dict(prof_data)
+                    used_hwnds.add(prof_hwnd)
+                    continue
+
+                chosen = None
+                for cand_hwnd, cand_data in source_by_slot.get(slot, []):
+                    if cand_hwnd in used_hwnds or not user32.IsWindow(cand_hwnd):
+                        continue
+                    chosen = (cand_hwnd, cand_data)
+                    break
+
+                if chosen is not None:
+                    cand_hwnd, cand_data = chosen
+                    rebound[cand_hwnd] = dict(cand_data) if isinstance(cand_data, dict) else dict(prof_data)
+                    used_hwnds.add(cand_hwnd)
+                else:
+                    unresolved.append((prof_hwnd, dict(prof_data)))
+
+            # Fallback: one unresolved stale slot + one remaining live candidate.
+            # Bind candidate to stale slot, even if current slot differs.
+            if unresolved:
+                remaining_live = []
+                for cand_hwnd, cand_data in source_map.items():
+                    if cand_hwnd in used_hwnds or not user32.IsWindow(cand_hwnd):
+                        continue
+                    if not isinstance(cand_data, dict):
+                        continue
+                    cand_grid = cand_data.get("grid")
+                    if not isinstance(cand_grid, (list, tuple)) or len(cand_grid) != 2:
+                        continue
+                    try:
+                        int(cand_grid[0]); int(cand_grid[1])
+                    except Exception:
+                        continue
+                    remaining_live.append((cand_hwnd, dict(cand_data)))
+
+                if len(unresolved) == 1 and len(remaining_live) == 1:
+                    _stale_hwnd, stale_data = unresolved.pop(0)
+                    cand_hwnd, cand_data = remaining_live[0]
+                    target_grid = stale_data.get("grid")
+                    if isinstance(target_grid, (list, tuple)) and len(target_grid) == 2:
+                        try:
+                            cand_data["grid"] = (int(target_grid[0]), int(target_grid[1]))
+                        except Exception:
+                            pass
+                    rebound[cand_hwnd] = cand_data
+                    used_hwnds.add(cand_hwnd)
+
+                # Broader fallback: resolve each unresolved stale slot against the
+                # closest unused live candidate, preferring process match.
+                if unresolved and remaining_live:
+                    still_unresolved = []
+                    for stale_hwnd, stale_data in unresolved:
+                        target_grid = stale_data.get("grid")
+                        if not isinstance(target_grid, (list, tuple)) or len(target_grid) != 2:
+                            still_unresolved.append((stale_hwnd, stale_data))
+                            continue
+                        try:
+                            stale_slot = (int(target_grid[0]), int(target_grid[1]))
+                        except Exception:
+                            still_unresolved.append((stale_hwnd, stale_data))
+                            continue
+                        stale_proc = _entry_process(stale_hwnd, stale_data)
+
+                        candidate_pool = []
+                        for cand_hwnd, cand_data in remaining_live:
+                            if cand_hwnd in used_hwnds or not user32.IsWindow(cand_hwnd):
+                                continue
+                            c_grid = cand_data.get("grid")
+                            if not isinstance(c_grid, (list, tuple)) or len(c_grid) != 2:
+                                continue
+                            try:
+                                c_slot = (int(c_grid[0]), int(c_grid[1]))
+                            except Exception:
+                                continue
+                            candidate_pool.append((cand_hwnd, cand_data, c_slot))
+                        if not candidate_pool:
+                            still_unresolved.append((stale_hwnd, stale_data))
+                            continue
+
+                        if stale_proc:
+                            proc_matched = []
+                            for cand_hwnd, cand_data, c_slot in candidate_pool:
+                                if _entry_process(cand_hwnd, cand_data) == stale_proc:
+                                    proc_matched.append((cand_hwnd, cand_data, c_slot))
+                            if proc_matched:
+                                candidate_pool = proc_matched
+
+                        cand_hwnd, cand_data, _cand_slot = min(
+                            candidate_pool,
+                            key=lambda item: _slot_distance(item[2], stale_slot),
+                        )
+                        rebound_data = dict(cand_data)
+                        rebound_data["grid"] = stale_slot
+                        rebound[cand_hwnd] = rebound_data
+                        used_hwnds.add(cand_hwnd)
+                    unresolved = still_unresolved
+
+            for prof_hwnd, prof_data in unresolved:
+                # Keep stale intent so a future reopen can still rebind this slot.
+                stale[prof_hwnd] = dict(prof_data)
+
+            return rebound, stale
 
         cleaned_layout = _clean_layout_map(layout)
         layout = cleaned_layout
@@ -3970,9 +4406,11 @@ class SmartGrid:
                 manual_profile_key = self._layout_profile_key(
                     monitor_idx, ws_idx, ws_sig[0], ws_sig[1]
                 )
-                manual_profile_map = _clean_layout_map(
-                    self.workspace_layout_profiles.get(manual_profile_key, {})
+                raw_profile = self.workspace_layout_profiles.get(manual_profile_key, {})
+                manual_profile_map_raw = (
+                    dict(raw_profile) if isinstance(raw_profile, dict) else {}
                 )
+                manual_profile_map = _clean_layout_map(manual_profile_map_raw)
                 manual_profile_reset_blocked = (
                     manual_profile_key in self._manual_layout_profile_reset_block
                 )
@@ -4084,8 +4522,26 @@ class SmartGrid:
         if manual_locked and ws_sig_for_restore is not None:
             if manual_profile_reset_blocked:
                 layout = {}
-            elif manual_profile_map:
-                layout = dict(manual_profile_map)
+            elif manual_profile_map_raw:
+                rebound_live, stale_entries = _rebind_profile_from_source(
+                    manual_profile_map_raw, layout
+                )
+                rebound_clean = _clean_layout_map(rebound_live)
+                source_clean = _clean_layout_map(layout)
+                if rebound_clean:
+                    layout = rebound_clean
+                elif source_clean:
+                    # Safety fallback: avoid dropping live windows when profile rebinding
+                    # cannot resolve stale HWNDs in one pass.
+                    layout = source_clean
+                else:
+                    layout = {}
+                # Persist rebound mapping (plus stale intent) so subsequent switches stay stable.
+                if manual_profile_key is not None:
+                    with self.lock:
+                        persisted = dict(layout)
+                        persisted.update(stale_entries)
+                        self.workspace_layout_profiles[manual_profile_key] = persisted
             else:
                 layout = {}
 
@@ -4195,6 +4651,15 @@ class SmartGrid:
             self.is_active = False
             # Flush pending min/max transitions before persisting workspace map.
             self._sync_window_state_changes()
+            # Ensure reopened windows are represented in grid_state before save.
+            if was_active:
+                try:
+                    with self.lock:
+                        self.ignore_retile_until = 0.0
+                    self.smart_tile_with_restore()
+                    self._sync_window_state_changes()
+                except Exception:
+                    pass
             
             # Save current
             self.save_workspace(mon)
@@ -4989,6 +5454,24 @@ class SmartGrid:
             self._sync_manual_cross_monitor_moves()
         except Exception:
             pass
+
+        # Snapshot current runtime/workspace state before opening the manager UI.
+        # This prevents losing slot persistence when an app was closed/reopened
+        # and the user switches workspaces without re-applying the layout.
+        try:
+            self._sync_window_state_changes()
+            # Ensure newly reopened windows are bound to slots before persistence.
+            if self.is_active:
+                with self.lock:
+                    self.ignore_retile_until = 0.0
+                self.smart_tile_with_restore()
+                self._sync_window_state_changes()
+            with self.lock:
+                monitors_to_save = sorted(int(m) for m in self.workspaces.keys())
+            for mon_idx in monitors_to_save:
+                self.save_workspace(mon_idx)
+        except Exception as e:
+            log(f"[MANAGER] pre-open save failed: {e}")
 
         old_ignore = self.ignore_retile_until
         self.ignore_retile_until = float('inf')
