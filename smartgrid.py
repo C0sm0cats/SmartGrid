@@ -1594,18 +1594,42 @@ class SmartGrid:
 
                 prev_sig = self.layout_signature.get(mon_idx)
                 use_manual_layout = bool(manual_locked and forced_sig)
+
                 if use_manual_layout:
                     layout, info = forced_sig
-                    capacity = self._layout_capacity(layout, info)
-                    layout_changed = False
+                    base_capacity = self._layout_capacity(layout, info)
+
+                    # ✅ Shrink runtime: si on a moins de fenêtres que la capacité du layout manuel,
+                    # on choisit un layout dynamique basé sur visible_count (ex: 9 -> 3x3),
+                    # MAIS on ne touche pas aux profils/sig persistants du manager.
+                    if visible_count < base_capacity:
+                        layout, info = self.layout_engine.choose_layout(visible_count)
+                        capacity = self._layout_capacity(layout, info)
+                    else:
+                        capacity = base_capacity
+
+                    layout_changed = prev_sig is not None and prev_sig != (layout, info)
                 else:
                     layout, info = self.layout_engine.choose_layout(effective_count)
                     capacity = self._layout_capacity(layout, info)
                     layout_changed = prev_sig is not None and prev_sig != (layout, info)
                 self.layout_signature[mon_idx] = (layout, info)
                 self.layout_capacity[mon_idx] = capacity
+                is_shrunk = False
                 if not use_manual_layout:
-                    self.workspace_layout_signature[(mon_idx, active_ws)] = (layout, info)
+                    # shrink = quand on choisit un layout plus petit que le “dernier layout choisi”
+                    # (ex: tu étais 4x3, tu descends à 3x3 parce qu’une fenêtre est minimisée)
+                    prev_ws_sig = self.workspace_layout_signature.get((mon_idx, active_ws))
+                    if prev_ws_sig is not None:
+                        prev_ws_sig = self._normalize_layout_signature(prev_ws_sig[0], prev_ws_sig[1])
+                        prev_cap = self._layout_capacity(prev_ws_sig[0], prev_ws_sig[1])
+                        new_cap = self._layout_capacity(layout, info)
+                        if new_cap < prev_cap:
+                            is_shrunk = True
+
+                    # ✅ Ne pas écraser la signature persistante si shrink
+                    if not is_shrunk:
+                        self.workspace_layout_signature[(mon_idx, active_ws)] = (layout, info)
                 self._tile_monitor(
                     mon_idx,
                     windows,
@@ -1614,7 +1638,7 @@ class SmartGrid:
                     info,
                     capacity,
                     reserved_slots=reserved_slots,
-                    compact_after_restore=(layout_changed and not use_manual_layout),
+                    compact_after_restore=layout_changed,
                 )
             
             # Update grid_state with lock - ONLY ONCE
@@ -2581,9 +2605,14 @@ class SmartGrid:
                 manual_locked = (mon_idx, active_ws) in manual_lock_snapshot
                 forced_sig = ws_layout_sig_snapshot.get((mon_idx, active_ws)) if manual_locked else None
 
-                # When the active workspace is manually locked, keep compaction within that
-                # pinned layout instead of forcing an auto-layout retile by visible count.
                 if manual_locked and forced_sig is not None and current_sig == forced_sig:
+                    # ✅ Autoriser un shrink/expand runtime basé sur le COUNT,
+                    # tout en gardant le profil manuel intact (smart_tile_with_restore gère ça).
+                    if current_sig is None or current_sig != (desired_layout, desired_info):
+                        with self.lock:
+                            self.ignore_retile_until = 0.0
+                        self.smart_tile_with_restore()
+                        return
                     continue
 
                 if current_sig is None or current_sig != (desired_layout, desired_info):
@@ -4649,8 +4678,9 @@ class SmartGrid:
                 except Exception:
                     pass
             
-            # Save current
-            self.save_workspace(mon)
+            # Save current (persist ws_map only; do NOT reconcile/overwrite layout profiles)
+            self.save_workspace(mon, update_profiles="none")
+
             
             # Park and clear all runtime states from current workspace on this monitor.
             parked = 0
@@ -5574,7 +5604,8 @@ class SmartGrid:
                     ws_map = {}
                     if 0 <= ws_idx < len(ws_list) and isinstance(ws_list[ws_idx], dict):
                         ws_map = dict(ws_list[ws_idx])
-                    if remembered is None and ws_idx == active_ws:
+                    if ws_idx == active_ws:
+                        # ✅ Pour le workspace actif: on veut le layout RUNTIME actuel (après minimize => 3x3)
                         active_grid_count = sum(
                             1
                             for hwnd, (m, _c, _r) in self.window_mgr.grid_state.items()
