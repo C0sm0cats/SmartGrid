@@ -6624,6 +6624,7 @@ class SmartGrid:
             def update_apply_state():
                 if apply_btn is None and save_btn is None:
                     return
+                prev_reason = apply_reason_var.get()
                 filled = sum(1 for _coord, var in slot_vars if var.get().strip())
                 selected_sig = _get_selected_layout_signature()
                 selected_capacity = self._layout_capacity(selected_sig[0], selected_sig[1])
@@ -6645,8 +6646,8 @@ class SmartGrid:
                     selected_label = self._layout_label(selected_sig[0], selected_sig[1])
                     inferred_label = self._layout_label(inferred_sig[0], inferred_sig[1])
                     apply_reason_var.set(
-                        "Apply is disabled: this partial selection would switch layout "
-                        f"({selected_label} -> {inferred_label}). Fill the missing slot(s), choose another layout, "
+                        "Apply disabled: this partial selection would switch layout "
+                        f"({selected_label} -> {inferred_label}). Fill missing slot(s), choose another layout, "
                         "or use Save Changes."
                     )
                 elif filled <= 0:
@@ -6654,6 +6655,12 @@ class SmartGrid:
                 else:
                     apply_reason_var.set("")
                 update_apply_button_emphasis()
+                # Keep footer buttons visible when reason text grows/shrinks.
+                if apply_reason_var.get() != prev_reason:
+                    try:
+                        dialog.after_idle(resize_dialog_to_content)
+                    except Exception:
+                        pass
 
             def get_current_grid_prefill(layout, info, grid_coords):
                 """Return {(col,row): label} for the target workspace."""
