@@ -5725,6 +5725,7 @@ class SmartGrid:
             slot_vars = []
             slot_widgets = []
             apply_btn = None
+            save_btn = None
             apply_reason_var = tk.StringVar(value="")
             poll_shutdown_job = None
             preview_job = None
@@ -6588,16 +6589,26 @@ class SmartGrid:
                     apply_btn.config(text="Apply Changes & Switch")
 
             def update_apply_button_emphasis():
-                if apply_btn is None:
+                if apply_btn is None and save_btn is None:
                     return
-                base_bg = accent
-                hover_bg = accent_hover
-                active_bg = accent_dark
-                apply_btn._hover_base = base_bg
-                apply_btn._hover_hover = hover_bg
-                apply_btn.config(activebackground=active_bg)
-                if str(apply_btn["state"]) != "disabled":
-                    apply_btn.config(bg=base_bg)
+                if apply_btn is not None:
+                    base_bg = accent
+                    hover_bg = accent_hover
+                    active_bg = accent_dark
+                    apply_btn._hover_base = base_bg
+                    apply_btn._hover_hover = hover_bg
+                    apply_btn.config(activebackground=active_bg)
+                    if str(apply_btn["state"]) != "disabled":
+                        apply_btn.config(bg=base_bg)
+                if save_btn is not None:
+                    save_bg = "#4F86C6"
+                    save_hover = "#4277B7"
+                    save_active = "#3869A4"
+                    save_btn._hover_base = save_bg
+                    save_btn._hover_hover = save_hover
+                    save_btn.config(activebackground=save_active)
+                    if str(save_btn["state"]) != "disabled":
+                        save_btn.config(bg=save_bg)
 
             def _get_selected_layout_signature():
                 sel_label = layout_var.get()
@@ -6611,7 +6622,7 @@ class SmartGrid:
                 return self._normalize_layout_signature(layout, info)
 
             def update_apply_state():
-                if apply_btn is None:
+                if apply_btn is None and save_btn is None:
                     return
                 filled = sum(1 for _coord, var in slot_vars if var.get().strip())
                 selected_sig = _get_selected_layout_signature()
@@ -6624,17 +6635,22 @@ class SmartGrid:
                     )
                     shrink_type_switch = inferred_sig != selected_sig
                 update_apply_button_label()
+                can_save = filled > 0
                 can_apply = filled > 0 and (not shrink_type_switch)
-                apply_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
+                if apply_btn is not None:
+                    apply_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
+                if save_btn is not None:
+                    save_btn.config(state=tk.NORMAL if can_save else tk.DISABLED)
                 if shrink_type_switch and inferred_sig is not None:
                     selected_label = self._layout_label(selected_sig[0], selected_sig[1])
                     inferred_label = self._layout_label(inferred_sig[0], inferred_sig[1])
                     apply_reason_var.set(
                         "Apply is disabled: this partial selection would switch layout "
-                        f"({selected_label} -> {inferred_label}). Fill the missing slot(s) or choose another layout."
+                        f"({selected_label} -> {inferred_label}). Fill the missing slot(s), choose another layout, "
+                        "or use Save Changes."
                     )
                 elif filled <= 0:
-                    apply_reason_var.set("Select at least one slot to enable Apply.")
+                    apply_reason_var.set("Select at least one slot to enable Save/Apply.")
                 else:
                     apply_reason_var.set("")
                 update_apply_button_emphasis()
@@ -6807,7 +6823,7 @@ class SmartGrid:
                 tk.Label(
                     slots_frame,
                     text=(
-                        "Local edits are drafts until Apply Changes. "
+                        "Local edits are drafts until Save Changes or Apply Changes. "
                         "Reset Saved Slots (Persistent) updates the saved profile immediately."
                     ),
                     font=("Arial", 8, "italic"),
@@ -7003,7 +7019,7 @@ class SmartGrid:
                 update_current_badge()
                 resize_dialog_to_content()
 
-            def apply_layout():
+            def _get_selected_layout_and_assignments():
                 mon_idx = get_target_monitor_index()
                 sel_label = layout_var.get()
                 layout, info = dict(layout_presets).get(sel_label, (None, None))
@@ -7023,12 +7039,20 @@ class SmartGrid:
                     hwnd = label_to_hwnd.get(label)
                     if hwnd is None:
                         messagebox.showwarning("SmartGrid", "Invalid window selection.")
-                        return
+                        return None
                     if hwnd in used:
                         messagebox.showwarning("SmartGrid", "Duplicate window selected.")
-                        return
+                        return None
                     used.add(hwnd)
                     assignments[(col, row)] = hwnd
+
+                return mon_idx, layout, info, assignments
+
+            def apply_layout():
+                selection = _get_selected_layout_and_assignments()
+                if selection is None:
+                    return
+                mon_idx, layout, info, assignments = selection
 
                 target_ws = get_target_ws_index()
                 with self.lock:
@@ -7052,6 +7076,33 @@ class SmartGrid:
                 close_picker()
                 if not apply_now:
                     threading.Thread(target=self.ws_switch, args=(target_ws, mon_idx), daemon=True).start()
+
+            def save_layout():
+                selection = _get_selected_layout_and_assignments()
+                if selection is None:
+                    return
+                mon_idx, layout, info, assignments = selection
+
+                if not assignments:
+                    messagebox.showwarning("SmartGrid", "Select at least one slot to save changes.")
+                    return
+
+                target_ws = get_target_ws_index()
+                if not self._apply_manual_layout(
+                    mon_idx,
+                    layout,
+                    info,
+                    assignments,
+                    target_ws=target_ws,
+                    activate_target=False,
+                ):
+                    messagebox.showwarning("SmartGrid", "Failed to save changes.")
+                    return
+
+                refresh_window_choices()
+                rebuild_slots()
+                update_current_badge()
+                update_apply_state()
 
             def ask_reset_saved_slots_confirmation(layout_label, mon_idx, ws_idx):
                 """Styled modal confirmation for persistent layout reset."""
@@ -7195,6 +7246,7 @@ class SmartGrid:
             action_btn_labels = (
                 "Apply Changes",
                 "Apply Changes & Switch",
+                "Save Changes (No Apply)",
                 "Reset Saved Slots (Persistent)",
             )
             action_btn_max_px = max((font.measure(lbl) for lbl in action_btn_labels), default=160)
@@ -7214,17 +7266,18 @@ class SmartGrid:
             apply_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
             add_hover(apply_btn, accent, accent_hover)
 
-            apply_reason_label = tk.Label(
+            save_btn = tk.Button(
                 action_frame,
-                textvariable=apply_reason_var,
-                font=("Arial", 8),
-                fg="#8B5A14",
-                bg=section_bg,
-                justify=tk.LEFT,
-                anchor="e",
-                wraplength=max(190, action_btn_max_px + 24),
+                text="Save Changes (No Apply)",
+                command=save_layout,
+                width=action_btn_width,
+                bg="#4F86C6",
+                fg="white",
+                activebackground="#3869A4",
+                activeforeground="white",
             )
-            apply_reason_label.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="e")
+            save_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
+            add_hover(save_btn, "#4F86C6", "#4277B7")
 
             reset_btn = tk.Button(
                 action_frame,
@@ -7238,6 +7291,18 @@ class SmartGrid:
             )
             reset_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
             add_hover(reset_btn, RESET_BTN_BG, RESET_BTN_HOVER)
+
+            apply_reason_label = tk.Label(
+                action_frame,
+                textvariable=apply_reason_var,
+                font=("Arial", 8),
+                fg="#8B5A14",
+                bg=section_bg,
+                justify=tk.LEFT,
+                anchor="e",
+                wraplength=max(190, action_btn_max_px + 24),
+            )
+            apply_reason_label.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="e")
 
             layout_combo.bind("<<ComboboxSelected>>", rebuild_slots)
             layout_var.trace_add("write", lambda *_: rebuild_slots())
