@@ -5439,35 +5439,37 @@ class SmartGrid:
 
             coverage_legend_row = tk.Frame(coverage_frame, bg=section_bg)
             coverage_legend_row.pack(fill=tk.X, anchor="w", pady=(4, 0))
-            legend_chips = [
-                ("C Complete", "#E8F6EE", "#1D7047"),
-                ("P Partial", "#FFF4E5", "#8B5A14"),
-                ("E Empty", "#F1F3F6", "#556070"),
+            legend_items = [
+                ("C", "Complete", "all slots filled for this layout", "#1D7047", "#E8F6EE"),
+                ("P", "Partial", "some slots are still missing", "#8B5A14", "#FFF4E5"),
+                ("E", "Empty", "no slots saved for this layout", "#556070", "#F1F3F6"),
             ]
-            for text, bg_color, fg_color in legend_chips:
+            legend_text_labels = []
+            for code, title, desc, fg_color, bg_color in legend_items:
+                legend_item = tk.Frame(coverage_legend_row, bg=section_bg)
+                legend_item.pack(fill=tk.X, anchor="w", pady=(0, 1))
                 tk.Label(
-                    coverage_legend_row,
-                    text=text,
+                    legend_item,
+                    text=code,
                     font=("Arial", 7, "bold"),
                     fg=fg_color,
                     bg=bg_color,
-                    padx=5,
+                    width=2,
                     pady=1,
                     relief="solid",
                     bd=1,
-                ).pack(side=tk.LEFT, padx=(0, 4))
-
-            coverage_legend = tk.Label(
-                coverage_frame,
-                text="C/P/E markers also appear on dots and detail rows.",
-                font=("Arial", 8),
-                fg="gray",
-                bg=section_bg,
-                justify=tk.LEFT,
-                anchor="w",
-                wraplength=280,
-            )
-            coverage_legend.pack(fill=tk.X, anchor="w", pady=(2, 0))
+                ).pack(side=tk.LEFT, padx=(0, 6))
+                legend_text = tk.Label(
+                    legend_item,
+                    text=f"{title}: {desc}",
+                    font=("Arial", 8),
+                    fg="#5A6473",
+                    bg=section_bg,
+                    justify=tk.LEFT,
+                    anchor="w",
+                )
+                legend_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                legend_text_labels.append(legend_text)
 
             badge_font = tkfont.Font(family="Arial", size=7, weight="bold")
             ws_header_font = tkfont.Font(family="Arial", size=8, weight="bold")
@@ -5575,9 +5577,10 @@ class SmartGrid:
 
                     detect_label_w = coverage_detect_label.winfo_reqwidth() or 150
                     detect_wrap_w = max(120, coverage_w - detect_label_w - 26)
-                    legend_wrap_w = max(180, coverage_w - 24)
+                    legend_wrap_w = max(160, coverage_w - 48)
                     coverage_detect_value.config(wraplength=detect_wrap_w)
-                    coverage_legend.config(wraplength=legend_wrap_w)
+                    for legend_text in legend_text_labels:
+                        legend_text.config(wraplength=legend_wrap_w)
 
                     monitor_rows = max(1, len(self.monitors_cache))
                     target_canvas_h = 44 + ((monitor_rows + 1) * 52)
@@ -5722,6 +5725,7 @@ class SmartGrid:
             slot_vars = []
             slot_widgets = []
             apply_btn = None
+            apply_reason_var = tk.StringVar(value="")
             poll_shutdown_job = None
             preview_job = None
             picker_closing = False
@@ -6613,6 +6617,7 @@ class SmartGrid:
                 selected_sig = _get_selected_layout_signature()
                 selected_capacity = self._layout_capacity(selected_sig[0], selected_sig[1])
                 shrink_type_switch = False
+                inferred_sig = None
                 if 0 < filled < selected_capacity:
                     inferred_sig = self._normalize_layout_signature(
                         *self.layout_engine.choose_layout(filled)
@@ -6621,6 +6626,17 @@ class SmartGrid:
                 update_apply_button_label()
                 can_apply = filled > 0 and (not shrink_type_switch)
                 apply_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
+                if shrink_type_switch and inferred_sig is not None:
+                    selected_label = self._layout_label(selected_sig[0], selected_sig[1])
+                    inferred_label = self._layout_label(inferred_sig[0], inferred_sig[1])
+                    apply_reason_var.set(
+                        "Apply is disabled: this partial selection would switch layout "
+                        f"({selected_label} -> {inferred_label}). Fill the missing slot(s) or choose another layout."
+                    )
+                elif filled <= 0:
+                    apply_reason_var.set("Select at least one slot to enable Apply.")
+                else:
+                    apply_reason_var.set("")
                 update_apply_button_emphasis()
 
             def get_current_grid_prefill(layout, info, grid_coords):
@@ -7197,6 +7213,18 @@ class SmartGrid:
             )
             apply_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
             add_hover(apply_btn, accent, accent_hover)
+
+            apply_reason_label = tk.Label(
+                action_frame,
+                textvariable=apply_reason_var,
+                font=("Arial", 8),
+                fg="#8B5A14",
+                bg=section_bg,
+                justify=tk.LEFT,
+                anchor="e",
+                wraplength=max(190, action_btn_max_px + 24),
+            )
+            apply_reason_label.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="e")
 
             reset_btn = tk.Button(
                 action_frame,
