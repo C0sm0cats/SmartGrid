@@ -18,7 +18,7 @@ SmartGrid gives you instant tiling, drag & drop snapping, swap mode, a **Layout 
 - **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
 - **Layout Manager (`Ctrl+Alt+P`):** choose a target layout and assign windows/apps to slots visually
 - **Auto-Compact on minimize/close:** hybrid compaction (fills empty slots, retile only when layout must change)
-- **System tray menu:** toggle tiling, retile, swap mode, compact options, settings (gap/padding), hotkeys, quit
+- **System tray menu:** toggle tiling, retile, swap mode, settings (including Auto-Compact options), hotkeys, quit
 - **Active border:** green border follows the active tiled window
 
 ## Hotkeys
@@ -64,20 +64,20 @@ Press `Ctrl + Alt + T` to enable tiling.
 - Press `Ctrl+Alt+P` any time to open **Layout Manager** and manually rebuild a layout by slot
 - Press `Ctrl+Alt+T` again → free mode (move windows manually)
 - Press `Ctrl+Alt+T` again → everything snaps back into perfect order
-- Use the tray menu to toggle **Auto-Compact on Minimize/Close** if you want layouts to stay gap-free.
+- Open **Settings** (tray menu) to toggle **Auto-Compact on Minimize/Close** if you want layouts to stay gap-free.
 
 ## Layout Manager
 
 Use `Ctrl+Alt+P` (or tray menu) to open the visual layout picker.
 
-- Choose a layout preset (Full, Side-by-side, Master/Stack, Grid variants)
+- Choose a target monitor, target workspace, and layout preset (Full, Side-by-side, Master/Stack, Grid variants)
 - Assign visible windows/apps to target slots
-- Apply the layout instantly on the active monitor
-- Workspace-aware tabs let you target WS1/WS2/WS3
+- Apply with **Apply Changes** (current workspace) or **Apply Changes & Switch** (switch + apply)
+- Use **Reset Saved Slots (Persistent)** to clear the saved profile for the selected target layout
 
 Notes:
-- The manager works with currently visible/runnable windows on the active context.
-- It is optimized for fast manual reorganization, not persistent snapshot restore.
+- Local slot edits are drafts until you apply.
+- In AUTO strict mode, topology/profile persistence is handled automatically as layouts evolve.
 
 ## Workspaces (per monitor)
 
@@ -89,15 +89,6 @@ SmartGrid gives you **3 independent workspaces per monitor** — like having mul
 3. Tile different windows on workspace 2
 4. Press `Ctrl+Alt+1` → back to your first context, **pixel-perfect**
 
-**Example workflow:**
-```
-Monitor 1, Workspace 1: [Browser, VSCode, Terminal]  ← Dev environment
-Monitor 1, Workspace 2: [Spotify, Discord, OBS]      ← Entertainment/Streaming
-Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
-
-→ Switch contexts instantly without cluttering your taskbar!
-```
-
 ## Drag & Drop Snap
 
 1. You have 6 windows tiled
@@ -105,10 +96,9 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 3. **A blue preview rectangle appears** showing exactly where it will snap
 4. You **drop**
 → **BAM**. It snaps perfectly to the previewed position.
-→ If you dropped on another window → they **swap instantly**
-→ If you dropped in empty space → it **moves** there
+→ On the same monitor: dropping on an occupied slot can **swap**
+→ Across monitors: drop uses **add + reflow** (no swap), updating target and source monitor layouts
 → Works **across monitors**
-→ Works **across workspaces**
 → No keys. No thinking. Pure flow.
 
 ## Multi-Monitor Workflow
@@ -116,18 +106,21 @@ Monitor 1, Workspace 3: [Email, Slack, Calendar]     ← Communication
 **Move windows across screens (recommended):**
 1. Drag a tiled window by its title bar
 2. Drop it on the target monitor (preview shows the target slot)
-3. SmartGrid re-tiles it into the target monitor layout automatically
+3. SmartGrid adds it on the target monitor and reflows both target and source monitor layouts automatically
 
 For manual re-organization at scale, use **Layout Manager** (`Ctrl+Alt+P`) and pick:
 - Target Monitor
 - Target Workspace
 - Target Layout
 
-## Notes / Troubleshooting
+## Notes
 
 - **Maximize behavior:** while a window is maximized, SmartGrid intentionally avoids background reshuffles so other windows don’t move.
 - **Compact behavior:** when enabled, closing or minimizing a tiled window fills the empty slot without a full retile unless the layout must change.
-- **Layout Manager behavior:** slot assignment is based on windows visible in the current context (monitor/workspace).
+- **Layout Manager behavior:** slot assignment uses windows visible for the selected target monitor/workspace context.
+
+## Troubleshooting
+
 - **Hotkeys don’t work:** another application may already be using the same global shortcut.
 - **Some windows don’t tile:** SmartGrid filters overlays/toasts/taskbar/etc. You can tune the rules in `is_useful_window()` in `smartgrid.py`.
 - **Border colors:** DWM border coloring works best on Windows 11; on some Windows 10 builds it may be ignored.
