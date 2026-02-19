@@ -68,6 +68,11 @@ CLEAR_SLOT_BTN_FG = "#4A5568"
 CLEAR_SLOT_BTN_BORDER = "#CBD5E0"
 CLEAR_SLOT_BTN_HOVER_BG = "#FFECEC"
 CLEAR_SLOT_BTN_HOVER_FG = "#B42318"
+UNDO_SLOT_BTN_BG = "#EAF2FF"
+UNDO_SLOT_BTN_FG = "#1D4ED8"
+UNDO_SLOT_BTN_BORDER = "#C7D8FA"
+UNDO_SLOT_BTN_HOVER_BG = "#DCE9FF"
+UNDO_SLOT_BTN_HOVER_FG = "#1E3A8A"
 
 # Window styles
 GWL_STYLE = -16
@@ -5121,30 +5126,116 @@ class SmartGrid:
             with self._layout_picker_lock:
                 self._layout_picker_hwnd = int(dialog.winfo_id())
 
-            accent = "#3A7BD5"
-            accent_dark = "#2E64AE"
-            accent_hover = "#2F6FD0"
-            section_bg = "#F5F5F7"
+            # ------------------------------------------------------------------
+            # UI tokens (Layout Manager visual system)
+            # ------------------------------------------------------------------
+            font_family = "Segoe UI"
+            accent = "#2F6FED"
+            accent_dark = "#2457B8"
+            accent_hover = "#3E7BFA"
+            app_bg = "#EDF2F9"
+            section_bg = "#FFFFFF"
+            section_bg_soft = "#F6F9FF"
+            border_color = "#D3DEEE"
+            text_primary = "#1F2A3A"
+            text_secondary = "#5E6E83"
+            warning_text = "#8B5A14"
 
-            header = tk.Label(
+            font_title = (font_family, 13, "bold")
+            font_subtitle = (font_family, 9)
+            font_section = (font_family, 9, "bold")
+            font_label = (font_family, 8)
+            font_label_bold = (font_family, 8, "bold")
+
+            dialog.configure(bg=app_bg)
+
+            # Premium combobox styling (focus, border, readonly states).
+            combo_style = "Manager.TCombobox"
+            ttk_style = ttk.Style(dialog)
+            try:
+                ttk_style.theme_use("clam")
+            except Exception:
+                pass
+            try:
+                ttk_style.configure(
+                    combo_style,
+                    fieldbackground="#FFFFFF",
+                    background="#FFFFFF",
+                    foreground=text_primary,
+                    bordercolor=border_color,
+                    lightcolor=border_color,
+                    darkcolor=border_color,
+                    arrowsize=12,
+                    padding=(5, 3),
+                )
+                ttk_style.map(
+                    combo_style,
+                    fieldbackground=[("readonly", "#FFFFFF"), ("disabled", "#F1F4FA")],
+                    foreground=[("readonly", text_primary), ("disabled", "#92A0B5")],
+                    bordercolor=[("focus", accent), ("!focus", border_color)],
+                    lightcolor=[("focus", accent), ("!focus", border_color)],
+                    darkcolor=[("focus", accent), ("!focus", border_color)],
+                    background=[("active", "#FFFFFF"), ("!active", "#FFFFFF")],
+                )
+            except Exception:
+                # Theme fallback when specific border options are unavailable.
+                try:
+                    ttk_style.configure(
+                        combo_style,
+                        fieldbackground="#FFFFFF",
+                        background="#FFFFFF",
+                        foreground=text_primary,
+                        arrowsize=12,
+                        padding=(5, 3),
+                    )
+                    ttk_style.map(
+                        combo_style,
+                        fieldbackground=[("readonly", "#FFFFFF"), ("disabled", "#F1F4FA")],
+                        foreground=[("readonly", text_primary), ("disabled", "#92A0B5")],
+                    )
+                except Exception:
+                    pass
+
+            header_wrap = tk.Frame(
                 dialog,
-                text="Layout Manager",
-                font=("Arial", 12, "bold"),
-                bg=accent,
-                fg="white",
+                bg=accent_dark,
+                padx=12,
+                pady=10,
+                relief="flat",
             )
-            header.pack(fill=tk.X, pady=(8, 6))
+            header_wrap.pack(fill=tk.X, padx=12, pady=(10, 8))
+            tk.Label(
+                header_wrap,
+                text="SmartGrid Layout Manager",
+                font=font_title,
+                bg=accent_dark,
+                fg="white",
+                anchor="w",
+            ).pack(fill=tk.X)
+            tk.Label(
+                header_wrap,
+                text="Professional workspace targeting and slot assignment",
+                font=font_subtitle,
+                bg=accent_dark,
+                fg="#D9E6FF",
+                anchor="w",
+            ).pack(fill=tk.X, pady=(2, 0))
 
-            top_row = tk.Frame(dialog, bg=dialog.cget("bg"))
+            top_row = tk.Frame(dialog, bg=app_bg)
             top_row.pack(fill=tk.X, padx=12, pady=6)
 
             layout_frame = tk.LabelFrame(
                 top_row,
-                text="🧩 Choose Targets to Customize",
+                text="Workspace Targets",
                 padx=10,
                 pady=10,
-                font=("Arial", 9, "bold"),
+                font=font_section,
+                fg=text_primary,
                 bg=section_bg,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
             )
             layout_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 8))
 
@@ -5233,8 +5324,8 @@ class SmartGrid:
                     "Changes apply to Target Monitor + Target Workspace. "
                     "In AUTO STRICT, topology/profile persistence is automatic (grow + shrink)."
                 ),
-                font=("Arial", 8),
-                fg="gray",
+                font=font_label,
+                fg=text_secondary,
                 bg=section_bg,
                 anchor="w",
             ).pack(side=tk.LEFT)
@@ -5249,9 +5340,13 @@ class SmartGrid:
                 text="Target Selection",
                 padx=8,
                 pady=8,
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
+                font=font_label_bold,
+                fg=text_primary,
+                bg=section_bg_soft,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
             )
             target_controls_card.grid(row=0, column=0, sticky="ew")
             target_controls_card.grid_columnconfigure(0, weight=0)
@@ -5263,6 +5358,7 @@ class SmartGrid:
                 values=monitor_labels,
                 state="readonly",
                 width=control_combo_width,
+                style=combo_style,
             )
             target_ws_combo = ttk.Combobox(
                 target_controls_card,
@@ -5270,6 +5366,7 @@ class SmartGrid:
                 values=ws_labels,
                 state="readonly",
                 width=control_combo_width,
+                style=combo_style,
             )
 
             layout_combo = ttk.Combobox(
@@ -5278,6 +5375,7 @@ class SmartGrid:
                 values=layout_labels,
                 state="readonly",
                 width=control_combo_width,
+                style=combo_style,
             )
             control_rows = [
                 ("Target Monitor:", target_monitor_combo),
@@ -5289,69 +5387,109 @@ class SmartGrid:
                 tk.Label(
                     target_controls_card,
                     text=label_text,
-                    font=("Arial", 8, "bold"),
-                    fg="#555555",
-                    bg=section_bg,
+                    font=font_label_bold,
+                    fg=text_secondary,
+                    bg=section_bg_soft,
                     width=16,
                     anchor="w",
                 ).grid(row=row_idx, column=0, sticky="w", padx=(0, 8), pady=row_pad)
                 combo_widget.grid(row=row_idx, column=1, sticky="ew", pady=row_pad)
 
-            status_frame = tk.Frame(layout_frame, bg=section_bg)
+            status_frame = tk.LabelFrame(
+                layout_frame,
+                text="Current Context",
+                bg=section_bg_soft,
+                padx=8,
+                pady=8,
+                font=font_label_bold,
+                fg=text_primary,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
+            )
             status_frame.pack(fill=tk.X, padx=4, pady=(0, 6), before=controls_frame)
-            tk.Label(
+            for _col in range(3):
+                status_frame.grid_columnconfigure(_col, weight=1, uniform="status_cols")
+            status_frame.grid_rowconfigure(0, weight=1)
+
+            context_cell_bg = "#FFFFFF"
+            context_cell_border = "#DDE7F4"
+            context_value_bg = "#EAF1FF"
+            context_value_border = "#CBDCFA"
+
+            def _make_status_cell(parent, col_idx, title, value):
+                pad_left = 0 if col_idx == 0 else 4
+                pad_right = 0 if col_idx == 2 else 4
+                cell = tk.Frame(
+                    parent,
+                    bg=context_cell_bg,
+                    padx=8,
+                    pady=6,
+                    bd=1,
+                    relief="solid",
+                    highlightthickness=1,
+                    highlightbackground=context_cell_border,
+                )
+                cell.grid(row=0, column=col_idx, sticky="nsew", padx=(pad_left, pad_right))
+                tk.Label(
+                    cell,
+                    text=title.upper(),
+                    font=(font_family, 7, "bold"),
+                    fg=text_secondary,
+                    bg=context_cell_bg,
+                    anchor="center",
+                    justify=tk.CENTER,
+                ).pack(fill=tk.X)
+                value_label = tk.Label(
+                    cell,
+                    text=value,
+                    font=(font_family, 9, "bold"),
+                    fg=accent_dark,
+                    bg=context_value_bg,
+                    padx=10,
+                    pady=2,
+                    bd=1,
+                    relief="solid",
+                    highlightthickness=1,
+                    highlightbackground=context_value_border,
+                    anchor="center",
+                    justify=tk.CENTER,
+                )
+                value_label.pack(anchor="center", pady=(4, 0))
+                return value_label
+
+            status_mon_value = _make_status_cell(
                 status_frame,
-                text="Current monitor:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(0, 6))
-            status_mon_value = tk.Label(
-                status_frame,
-                text=f"M{get_target_monitor_index() + 1}",
-                font=("Arial", 8, "bold"),
-                bg=section_bg,
-                fg=accent_dark,
+                0,
+                "Current monitor",
+                f"M{get_target_monitor_index() + 1}",
             )
-            status_mon_value.pack(side=tk.LEFT, padx=(0, 10))
-            tk.Label(
+            status_ws_value = _make_status_cell(
                 status_frame,
-                text="Current workspace:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(0, 6))
-            status_ws_value = tk.Label(
-                status_frame,
-                text=f"WS{self.current_workspace.get(get_target_monitor_index(), 0) + 1}",
-                font=("Arial", 8, "bold"),
-                bg=section_bg,
-                fg=accent_dark,
+                1,
+                "Current workspace",
+                f"WS{self.current_workspace.get(get_target_monitor_index(), 0) + 1}",
             )
-            status_ws_value.pack(side=tk.LEFT, padx=(0, 10))
-            tk.Label(
+            status_layout_value = _make_status_cell(
                 status_frame,
-                text="Current layout:",
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
-            ).pack(side=tk.LEFT, padx=(0, 6))
-            status_layout_value = tk.Label(
-                status_frame,
-                text="—",
-                font=("Arial", 8, "bold"),
-                bg=section_bg,
-                fg=accent_dark,
+                2,
+                "Current layout",
+                "—",
             )
-            status_layout_value.pack(side=tk.LEFT, padx=(0, 6))
 
             coverage_frame = tk.LabelFrame(
                 top_row,
-                text="📊 Workspace Layout Coverage",
+                text="Workspace Layout Coverage",
                 padx=10,
                 pady=10,
-                font=("Arial", 9, "bold"),
+                font=font_section,
+                fg=text_primary,
                 bg=section_bg,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
             )
             coverage_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             coverage_frame.pack_propagate(False)
@@ -5361,8 +5499,8 @@ class SmartGrid:
             coverage_detect_label = tk.Label(
                 coverage_detect_row,
                 text="Windows/apps detected on:",
-                font=("Arial", 8),
-                fg="#555555",
+                font=font_label,
+                fg=text_secondary,
                 bg=section_bg,
                 anchor="w",
             )
@@ -5371,7 +5509,7 @@ class SmartGrid:
             coverage_detect_value = tk.Label(
                 coverage_detect_row,
                 text="None",
-                font=("Arial", 8, "bold"),
+                font=font_label_bold,
                 fg=accent_dark,
                 bg=section_bg,
                 justify=tk.LEFT,
@@ -5439,19 +5577,30 @@ class SmartGrid:
 
             coverage_legend_row = tk.Frame(coverage_frame, bg=section_bg)
             coverage_legend_row.pack(fill=tk.X, anchor="w", pady=(4, 0))
+            coverage_legend_row.grid_columnconfigure(0, weight=0)
             legend_items = [
                 ("C", "Complete", "all slots filled for this layout", "#1D7047", "#E8F6EE"),
                 ("P", "Partial", "some slots are still missing", "#8B5A14", "#FFF4E5"),
                 ("E", "Empty", "no slots saved for this layout", "#556070", "#F1F3F6"),
             ]
             legend_text_labels = []
-            for code, title, desc, fg_color, bg_color in legend_items:
-                legend_item = tk.Frame(coverage_legend_row, bg=section_bg)
-                legend_item.pack(fill=tk.X, anchor="w", pady=(0, 1))
+            legend_item_frames = []
+            for row_idx, (code, title, desc, fg_color, bg_color) in enumerate(legend_items):
+                legend_item = tk.Frame(
+                    coverage_legend_row,
+                    bg="#F8FAFE",
+                    padx=6,
+                    pady=3,
+                    relief="solid",
+                    bd=1,
+                    highlightthickness=1,
+                    highlightbackground="#E1E8F4",
+                )
+                legend_item.grid(row=row_idx, column=0, sticky="ew", pady=(0, 3))
                 tk.Label(
                     legend_item,
                     text=code,
-                    font=("Arial", 7, "bold"),
+                    font=(font_family, 7, "bold"),
                     fg=fg_color,
                     bg=bg_color,
                     width=2,
@@ -5462,17 +5611,35 @@ class SmartGrid:
                 legend_text = tk.Label(
                     legend_item,
                     text=f"{title}: {desc}",
-                    font=("Arial", 8),
-                    fg="#5A6473",
-                    bg=section_bg,
+                    font=font_label,
+                    fg=text_secondary,
+                    bg="#F8FAFE",
                     justify=tk.LEFT,
                     anchor="w",
                 )
-                legend_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+                legend_text.pack(side=tk.LEFT, anchor="w")
                 legend_text_labels.append(legend_text)
+                legend_item_frames.append(legend_item)
 
-            badge_font = tkfont.Font(family="Arial", size=7, weight="bold")
-            ws_header_font = tkfont.Font(family="Arial", size=8, weight="bold")
+            def sync_legend_item_width(max_allowed_width=None):
+                try:
+                    items = [item for item in legend_item_frames if item.winfo_exists()]
+                    if not items:
+                        return
+                    coverage_legend_row.update_idletasks()
+                    target_w = max(item.winfo_reqwidth() for item in items)
+                    if max_allowed_width is None:
+                        frame_w = coverage_frame.winfo_width() or coverage_frame.winfo_reqwidth()
+                        if frame_w > 0:
+                            max_allowed_width = max(120, frame_w - 24)
+                    if max_allowed_width is not None and max_allowed_width > 0:
+                        target_w = min(target_w, int(max_allowed_width))
+                    coverage_legend_row.grid_columnconfigure(0, minsize=max(120, int(target_w)))
+                except Exception:
+                    pass
+
+            badge_font = tkfont.Font(family=font_family, size=7, weight="bold")
+            ws_header_font = tkfont.Font(family=font_family, size=8, weight="bold")
             badge_samples = ("Complete 99", "Partial 99", "Empty 99")
             badge_chip_inner_pad = 8  # label padx=4 on both sides
             badge_chip_border = 2
@@ -5581,6 +5748,7 @@ class SmartGrid:
                     coverage_detect_value.config(wraplength=detect_wrap_w)
                     for legend_text in legend_text_labels:
                         legend_text.config(wraplength=legend_wrap_w)
+                    sync_legend_item_width(max_allowed_width=legend_wrap_w + 18)
 
                     monitor_rows = max(1, len(self.monitors_cache))
                     target_canvas_h = 44 + ((monitor_rows + 1) * 52)
@@ -5594,18 +5762,30 @@ class SmartGrid:
             layout_frame.bind("<Configure>", lambda _e: sync_coverage_panel_size())
             dialog.after(0, sync_coverage_panel_size)
 
+            preview_actions_row = tk.Frame(layout_frame, bg=section_bg)
+            preview_actions_row.pack(fill=tk.X, padx=4, pady=(6, 2))
+            # Keep preview card sized to its canvas width and give extra room to Actions.
+            preview_actions_row.grid_columnconfigure(0, weight=0)
+            preview_actions_row.grid_columnconfigure(1, weight=1)
+            preview_actions_row.grid_rowconfigure(0, weight=1)
+
             preview_card = tk.LabelFrame(
-                layout_frame,
+                preview_actions_row,
                 text="Target Layout Preview",
                 padx=8,
                 pady=8,
-                font=("Arial", 8, "bold"),
-                fg="#555555",
-                bg=section_bg,
+                font=font_label_bold,
+                fg=text_primary,
+                bg=section_bg_soft,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
             )
-            preview_card.pack(fill=tk.X, padx=4, pady=(6, 2))
-            preview_row = tk.Frame(preview_card, bg=section_bg)
-            preview_row.pack(anchor="w")
+            # Keep preview width compact, but stretch vertically to match the Actions card.
+            preview_card.grid(row=0, column=0, sticky="nsw", padx=(0, 8))
+            preview_row = tk.Frame(preview_card, bg=section_bg_soft)
+            preview_row.pack(fill=tk.BOTH, expand=True, anchor="w")
             preview_canvas_height = 120
             preview_canvas_pad = 0
 
@@ -5637,13 +5817,40 @@ class SmartGrid:
                 preview_row,
                 width=get_preview_canvas_width(get_target_monitor_index()),
                 height=preview_canvas_height,
-                bg="white",
+                bg="#FFFFFF",
                 highlightthickness=1,
-                highlightbackground="#cfcfcf",
+                highlightbackground=border_color,
             )
             layout_canvas.pack(side=tk.LEFT)
-            action_frame = tk.Frame(preview_row, bg=section_bg)
-            action_frame.pack(side=tk.LEFT, padx=(8, 0), pady=0)
+            action_frame = tk.LabelFrame(
+                preview_actions_row,
+                text="Actions",
+                padx=6,
+                pady=6,
+                font=font_label_bold,
+                fg=text_primary,
+                bg=section_bg_soft,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
+            )
+            action_frame.grid(row=0, column=1, sticky="nsew")
+
+            def sync_preview_actions_card_height(_event=None):
+                try:
+                    # Avoid feedback loop where minsize only increases over time.
+                    preview_actions_row.grid_rowconfigure(0, minsize=0)
+                    preview_actions_row.update_idletasks()
+                    target_h = max(preview_card.winfo_reqheight(), action_frame.winfo_reqheight())
+                    if target_h > 0:
+                        preview_actions_row.grid_rowconfigure(0, minsize=target_h)
+                except Exception:
+                    pass
+
+            preview_card.bind("<Configure>", sync_preview_actions_card_height)
+            action_frame.bind("<Configure>", sync_preview_actions_card_height)
+            dialog.after_idle(sync_preview_actions_card_height)
 
             font = tkfont.nametofont("TkDefaultFont")
             screen_w = dialog.winfo_screenwidth()
@@ -5714,21 +5921,39 @@ class SmartGrid:
 
             slots_frame = tk.LabelFrame(
                 dialog,
-                text="🧷 Assign windows/apps to slots",
+                text="Slot Assignments",
                 padx=10,
                 pady=10,
-                font=("Arial", 9, "bold"),
+                font=font_section,
+                fg=text_primary,
                 bg=section_bg,
+                bd=1,
+                relief="solid",
+                highlightthickness=1,
+                highlightbackground=border_color,
             )
-            slots_frame.pack(fill=tk.X, expand=False, padx=12, pady=6)
+            slots_frame.pack(fill=tk.X, expand=False, padx=12, pady=(6, 0))
 
             slot_vars = []
             slot_widgets = []
+            slot_notes_block = None
+            slot_baseline_assignments = {}
+            unsaved_local_edits = False
             apply_btn = None
             save_btn = None
+            reset_btn = None
+            dirty_badge = None
+            apply_reason_box = None
+            apply_reason_title_label = None
+            apply_reason_switch_row = None
+            apply_reason_switch_prefix_label = None
+            apply_reason_switch_value_label = None
+            apply_reason_detail_label = None
+            apply_reason_generic_label = None
             apply_reason_var = tk.StringVar(value="")
             poll_shutdown_job = None
             preview_job = None
+            btn_frame = None
             picker_closing = False
             coverage_details_popup = {"win": None}
 
@@ -5740,7 +5965,45 @@ class SmartGrid:
                 monitor_w, _monitor_h = _get_target_monitor_size()
                 screen_limit = max(520, monitor_w - 24)
                 target_width = min(screen_limit, max(min_dialog_w, req_w + 2))
-                target_height = max(340, req_h + 10)
+                # Compute height from visible content bounds. Prefer the footer
+                # (`Quit`) bottom edge when available to avoid cumulative empty
+                # space after repeated reset/undo edits.
+                content_bottom = 0
+                for child in dialog.winfo_children():
+                    try:
+                        if not child.winfo_ismapped():
+                            continue
+                        child_y = int(child.winfo_y())
+                        child_h = max(int(child.winfo_height()), int(child.winfo_reqheight()))
+                        content_bottom = max(content_bottom, child_y + child_h)
+                    except Exception:
+                        continue
+
+                slots_bottom = 0
+                try:
+                    if slots_frame is not None and slots_frame.winfo_exists() and slots_frame.winfo_ismapped():
+                        sy = int(slots_frame.winfo_y())
+                        sh = max(int(slots_frame.winfo_height()), int(slots_frame.winfo_reqheight()))
+                        slots_bottom = sy + sh
+                except Exception:
+                    slots_bottom = 0
+
+                footer_bottom = 0
+                try:
+                    if btn_frame is not None and btn_frame.winfo_exists() and btn_frame.winfo_ismapped():
+                        by = int(btn_frame.winfo_y())
+                        bh = max(int(btn_frame.winfo_height()), int(btn_frame.winfo_reqheight()))
+                        footer_bottom = by + bh
+                except Exception:
+                    footer_bottom = 0
+
+                anchor_bottom = max(content_bottom, slots_bottom, footer_bottom)
+                if anchor_bottom <= 0:
+                    anchor_bottom = req_h
+                # Use requested content height as the primary guard so footer
+                # controls (Quit) are always included at open, while keeping the
+                # anchored bound to avoid growth drift during reset/undo cycles.
+                target_height = max(360, req_h + 2, int(anchor_bottom) + 2)
                 dialog_size["width"] = target_width
                 self._center_tk_window(
                     dialog,
@@ -5777,9 +6040,21 @@ class SmartGrid:
                     sy = pad + (y - min_y) * scale
                     sw = w * scale
                     sh = h * scale
-                    fill = "#D7E6FA" if coord in selected_coords else "white"
-                    layout_canvas.create_rectangle(sx, sy, sx + sw, sy + sh, outline="#4a4a4a", fill=fill)
-                    layout_canvas.create_text(sx + sw / 2, sy + sh / 2, text=str(i), fill="#555", font=("Arial", 8))
+                    fill = "#E6EEFF" if coord in selected_coords else "#FFFFFF"
+                    outline = "#6F82A1" if coord in selected_coords else "#95A4BC"
+                    layout_canvas.create_rectangle(
+                        sx, sy, sx + sw, sy + sh,
+                        outline=outline,
+                        fill=fill,
+                        width=1.5 if coord in selected_coords else 1,
+                    )
+                    layout_canvas.create_text(
+                        sx + sw / 2,
+                        sy + sh / 2,
+                        text=str(i),
+                        fill="#4D5D73",
+                        font=(font_family, 8, "bold"),
+                    )
 
             def close_picker():
                 nonlocal poll_shutdown_job, preview_job, picker_closing
@@ -6093,7 +6368,7 @@ class SmartGrid:
                     tip_label = tk.Label(
                         tip,
                         text=text,
-                        font=("Arial", 8),
+                        font=font_label,
                         fg="#253247",
                         bg="#FFFFFF",
                         relief="solid",
@@ -6188,7 +6463,7 @@ class SmartGrid:
                         y,
                         text=style["symbol"],
                         fill=style["symbol_color"],
-                        font=("Arial", symbol_size, "bold"),
+                        font=(font_family, symbol_size, "bold"),
                         tags=(tag,),
                     )
                     canvas.tag_bind(
@@ -6219,12 +6494,12 @@ class SmartGrid:
                         ws_totals[ws_idx]["partial"] += int(cell.get("partial", 0))
                         ws_totals[ws_idx]["empty"] += int(cell.get("empty", 0))
 
-                header_bg = "#E8EDF5"
+                header_bg = "#EEF3FB"
                 tk.Label(
                     coverage_inner,
                     text="Mon",
-                    font=("Arial", 8, "bold"),
-                    fg="#3f4a5a",
+                    font=(font_family, 8, "bold"),
+                    fg=text_secondary,
                     bg=header_bg,
                     anchor="center",
                     padx=6,
@@ -6249,8 +6524,8 @@ class SmartGrid:
                     tk.Label(
                         header_top,
                         text=f"WS{ws_idx + 1}",
-                        font=("Arial", 8, "bold"),
-                        fg="#3f4a5a",
+                        font=(font_family, 8, "bold"),
+                        fg=text_secondary,
                         bg=header_bg,
                         anchor="center",
                     ).grid(row=0, column=1, sticky="n")
@@ -6265,7 +6540,7 @@ class SmartGrid:
                         tk.Label(
                             ws_badges,
                             text=f"{label} {value}",
-                            font=("Arial", 7, "bold"),
+                            font=(font_family, 7, "bold"),
                             fg=fg_color,
                             bg=bg_color,
                             padx=4,
@@ -6282,9 +6557,9 @@ class SmartGrid:
                     mon_label = tk.Label(
                         coverage_inner,
                         text=f"M{mon_idx + 1}",
-                        font=("Arial", 8, "bold"),
+                        font=(font_family, 8, "bold"),
                         fg="#22324A",
-                        bg="#DDE3ED",
+                        bg="#E4ECF8",
                         anchor="center",
                         width=5,
                         padx=2,
@@ -6300,10 +6575,10 @@ class SmartGrid:
                         is_target = mon_idx == target_mon_idx and ws_idx == target_ws_idx
                         base_bg = "#FFFFFF"
                         if is_active:
-                            base_bg = "#F3F4F7"
+                            base_bg = "#F4F7FC"
                         if is_target:
-                            base_bg = "#DDEBFF"
-                        border_color = "#2E64AE" if is_target else "#C4CCD8"
+                            base_bg = "#E3EEFF"
+                        cell_border_color = "#2E64AE" if is_target else "#C8D3E4"
 
                         cell_box = tk.Frame(
                             coverage_inner,
@@ -6311,8 +6586,8 @@ class SmartGrid:
                             relief="flat",
                             bd=0,
                             highlightthickness=2 if is_target else 1,
-                            highlightbackground=border_color,
-                            highlightcolor=border_color,
+                            highlightbackground=cell_border_color,
+                            highlightcolor=cell_border_color,
                             cursor="hand2",
                             padx=6,
                             pady=4,
@@ -6332,7 +6607,7 @@ class SmartGrid:
                         tk.Label(
                             title_row,
                             text=f"{cell['filled']}/{preset_total} prefilled layouts",
-                            font=("Arial", 8, "bold" if is_target else "normal"),
+                            font=(font_family, 8, "bold" if is_target else "normal"),
                             fg=title_fg,
                             bg=base_bg,
                             anchor="center",
@@ -6584,12 +6859,13 @@ class SmartGrid:
                 with self.lock:
                     active_ws = self.current_workspace.get(mon_idx, 0)
                 if target_ws == active_ws:
-                    apply_btn.config(text="Apply Changes")
+                    apply_btn.config(text="Apply Now")
                 else:
-                    apply_btn.config(text="Apply Changes & Switch")
+                    apply_btn.config(text="Apply Now & Switch")
 
             def update_apply_button_emphasis():
-                if apply_btn is None and save_btn is None:
+                nonlocal unsaved_local_edits
+                if apply_btn is None and save_btn is None and reset_btn is None:
                     return
                 if apply_btn is not None:
                     base_bg = accent
@@ -6601,14 +6877,28 @@ class SmartGrid:
                     if str(apply_btn["state"]) != "disabled":
                         apply_btn.config(bg=base_bg)
                 if save_btn is not None:
-                    save_bg = "#4F86C6"
-                    save_hover = "#4277B7"
-                    save_active = "#3869A4"
+                    if unsaved_local_edits:
+                        save_bg = "#C77800"
+                        save_hover = "#B26A00"
+                        save_active = "#9A5B00"
+                    else:
+                        save_bg = "#4F86C6"
+                        save_hover = "#4277B7"
+                        save_active = "#3869A4"
                     save_btn._hover_base = save_bg
                     save_btn._hover_hover = save_hover
                     save_btn.config(activebackground=save_active)
                     if str(save_btn["state"]) != "disabled":
                         save_btn.config(bg=save_bg)
+                if reset_btn is not None:
+                    reset_bg = RESET_BTN_BG
+                    reset_hover = RESET_BTN_HOVER
+                    reset_active = RESET_BTN_ACTIVE
+                    reset_btn._hover_base = reset_bg
+                    reset_btn._hover_hover = reset_hover
+                    reset_btn.config(activebackground=reset_active)
+                    if str(reset_btn["state"]) != "disabled":
+                        reset_btn.config(bg=reset_bg)
 
             def _get_selected_layout_signature():
                 sel_label = layout_var.get()
@@ -6621,11 +6911,23 @@ class SmartGrid:
                         layout, info = ("full", None)
                 return self._normalize_layout_signature(layout, info)
 
+            def _get_current_slot_assignments():
+                return {
+                    coord: var.get().strip()
+                    for coord, var in slot_vars
+                    if var.get().strip()
+                }
+
             def update_apply_state():
-                if apply_btn is None and save_btn is None:
+                nonlocal unsaved_local_edits
+                if apply_btn is None and save_btn is None and reset_btn is None:
                     return
                 prev_reason = apply_reason_var.get()
+                prev_unsaved = getattr(update_apply_state, "_prev_unsaved", None)
+                reason_key = ""
                 filled = sum(1 for _coord, var in slot_vars if var.get().strip())
+                current_assignments = _get_current_slot_assignments()
+                unsaved_local_edits = current_assignments != slot_baseline_assignments
                 selected_sig = _get_selected_layout_signature()
                 selected_capacity = self._layout_capacity(selected_sig[0], selected_sig[1])
                 shrink_type_switch = False
@@ -6636,28 +6938,140 @@ class SmartGrid:
                     )
                     shrink_type_switch = inferred_sig != selected_sig
                 update_apply_button_label()
-                can_save = filled > 0
+                can_save = filled > 0 and (not shrink_type_switch)
                 can_apply = filled > 0 and (not shrink_type_switch)
                 if apply_btn is not None:
                     apply_btn.config(state=tk.NORMAL if can_apply else tk.DISABLED)
                 if save_btn is not None:
+                    save_btn.config(
+                        text="Save Changes (Required)" if unsaved_local_edits else "Save Changes (No Apply)"
+                    )
                     save_btn.config(state=tk.NORMAL if can_save else tk.DISABLED)
+                if dirty_badge is not None:
+                    try:
+                        if unsaved_local_edits:
+                            if not dirty_badge.winfo_ismapped():
+                                dirty_badge.pack(fill=tk.X, pady=(0, 6), padx=2, before=apply_btn)
+                        else:
+                            if dirty_badge.winfo_ismapped():
+                                dirty_badge.pack_forget()
+                    except Exception:
+                        pass
+                if slot_notes_block is not None:
+                    try:
+                        if unsaved_local_edits:
+                            # Keep slot guidance at the top of Slot Assignments.
+                            # Re-pack each time to enforce ordering above slot rows.
+                            if slot_notes_block.winfo_ismapped():
+                                slot_notes_block.pack_forget()
+                            other_children = [
+                                w for w in slots_frame.winfo_children()
+                                if w is not slot_notes_block
+                            ]
+                            pack_kwargs = {"fill": tk.X, "anchor": "w", "pady": (0, 4)}
+                            if other_children:
+                                slot_notes_block.pack(before=other_children[0], **pack_kwargs)
+                            else:
+                                slot_notes_block.pack(**pack_kwargs)
+                        else:
+                            if slot_notes_block.winfo_ismapped():
+                                slot_notes_block.pack_forget()
+                    except Exception:
+                        pass
+                if reset_btn is not None:
+                    can_reset = False
+                    try:
+                        mon_idx = get_target_monitor_index()
+                        target_ws = get_target_ws_index()
+                        profile_key = self._layout_profile_key(
+                            mon_idx, target_ws, selected_sig[0], selected_sig[1]
+                        )
+                        with self.lock:
+                            profile_map_raw = self.workspace_layout_profiles.get(profile_key, {})
+                            profile_reset_blocked = profile_key in self._manual_layout_profile_reset_block
+                        saved_slot_count = 0
+                        if isinstance(profile_map_raw, dict):
+                            for data in profile_map_raw.values():
+                                if not isinstance(data, dict):
+                                    continue
+                                grid = data.get("grid")
+                                if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                                    continue
+                                try:
+                                    int(grid[0])
+                                    int(grid[1])
+                                except Exception:
+                                    continue
+                                saved_slot_count += 1
+                        can_reset = (not profile_reset_blocked) and (saved_slot_count > 0)
+                    except Exception:
+                        can_reset = True
+                    reset_btn.config(state=tk.NORMAL if can_reset else tk.DISABLED)
                 if shrink_type_switch and inferred_sig is not None:
                     selected_label = self._layout_label(selected_sig[0], selected_sig[1])
                     inferred_label = self._layout_label(inferred_sig[0], inferred_sig[1])
-                    apply_reason_var.set(
-                        "Apply disabled: this partial selection would switch layout "
-                        f"({selected_label} -> {inferred_label}). Fill missing slot(s), choose another layout, "
-                        "or use Save Changes."
-                    )
+                    reason_key = f"switch:{selected_label}->{inferred_label}"
+                    if apply_reason_box is not None:
+                        try:
+                            apply_reason_title_label.config(text="Apply & Save Changes disabled:")
+                            apply_reason_switch_prefix_label.config(
+                                text="This partial selection would switch layout: "
+                            )
+                            apply_reason_switch_value_label.config(
+                                text=f"{selected_label} -> {inferred_label}"
+                            )
+                            apply_reason_detail_label.config(
+                                text="Fix missing slots to enable Save/Apply Now."
+                            )
+                            if not apply_reason_box.winfo_ismapped():
+                                apply_reason_box.pack(fill=tk.X, pady=(2, 0), padx=2)
+                            if apply_reason_generic_label.winfo_ismapped():
+                                apply_reason_generic_label.pack_forget()
+                            if not apply_reason_title_label.winfo_ismapped():
+                                apply_reason_title_label.pack(fill=tk.X, padx=6, pady=(4, 0))
+                            if not apply_reason_switch_row.winfo_ismapped():
+                                apply_reason_switch_row.pack(fill=tk.X, padx=6, pady=(2, 0))
+                            if not apply_reason_detail_label.winfo_ismapped():
+                                apply_reason_detail_label.pack(fill=tk.X, padx=6, pady=(2, 4))
+                        except Exception:
+                            pass
                 elif filled <= 0:
-                    apply_reason_var.set("Select at least one slot to enable Save/Apply.")
+                    reason_key = "generic:select-one"
+                    if apply_reason_box is not None:
+                        try:
+                            apply_reason_generic_label.config(
+                                text="Select at least one slot to enable Save/Apply."
+                            )
+                            if not apply_reason_box.winfo_ismapped():
+                                apply_reason_box.pack(fill=tk.X, pady=(2, 0), padx=2)
+                            for widget in (
+                                apply_reason_title_label,
+                                apply_reason_switch_row,
+                                apply_reason_detail_label,
+                            ):
+                                if widget.winfo_ismapped():
+                                    widget.pack_forget()
+                            if not apply_reason_generic_label.winfo_ismapped():
+                                apply_reason_generic_label.pack(fill=tk.X, padx=6, pady=4)
+                        except Exception:
+                            pass
                 else:
-                    apply_reason_var.set("")
+                    if apply_reason_box is not None:
+                        try:
+                            if apply_reason_box.winfo_ismapped():
+                                apply_reason_box.pack_forget()
+                        except Exception:
+                            pass
+                apply_reason_var.set(reason_key)
                 update_apply_button_emphasis()
+                update_apply_state._prev_unsaved = unsaved_local_edits
                 # Keep footer buttons visible when reason text grows/shrinks.
-                if apply_reason_var.get() != prev_reason:
+                if (reason_key != prev_reason) or (prev_unsaved != unsaved_local_edits):
                     try:
+                        dialog.after_idle(sync_action_text_wrap)
+                        dialog.after_idle(sync_preview_actions_card_height)
+                        # Resize after wrap + card-height sync so hidden blocks
+                        # do not leave visual gaps and footer stays visible.
                         dialog.after_idle(resize_dialog_to_content)
                     except Exception:
                         pass
@@ -6746,7 +7160,30 @@ class SmartGrid:
                 if reset_blocked and not profile_map:
                     return prefill
 
-                # For the active workspace, prefer current runtime grid when layout matches.
+                # First try saved profile for this exact target layout.
+                for hwnd, data in profile_map.items():
+                    if not isinstance(data, dict):
+                        continue
+                    grid = data.get("grid")
+                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
+                        continue
+                    try:
+                        c = int(grid[0])
+                        r = int(grid[1])
+                    except Exception:
+                        continue
+                    coord = (c, r)
+                    if coord not in valid_coords:
+                        continue
+                    label = _resolve_saved_label(hwnd, data)
+                    claimed = _claim_label(label)
+                    if claimed:
+                        prefill[coord] = claimed
+                if prefill:
+                    return prefill
+
+                # For the active workspace, fallback to current runtime grid only when
+                # no saved mapping could be resolved for this selected layout.
                 if target_ws == active_ws:
                     filtered = [(hwnd, c, r) for hwnd, c, r in grid_items if user32.IsWindow(hwnd)]
                     if runtime_sig is not None:
@@ -6770,28 +7207,6 @@ class SmartGrid:
                                 prefill[coord] = claimed
                         if prefill:
                             return prefill
-
-                # Then try saved profile for this exact target layout.
-                for hwnd, data in profile_map.items():
-                    if not isinstance(data, dict):
-                        continue
-                    grid = data.get("grid")
-                    if not isinstance(grid, (list, tuple)) or len(grid) != 2:
-                        continue
-                    try:
-                        c = int(grid[0])
-                        r = int(grid[1])
-                    except Exception:
-                        continue
-                    coord = (c, r)
-                    if coord not in valid_coords:
-                        continue
-                    label = _resolve_saved_label(hwnd, data)
-                    claimed = _claim_label(label)
-                    if claimed:
-                        prefill[coord] = claimed
-                if prefill:
-                    return prefill
 
                 # Fallback to workspace map only when this is the workspace's current layout.
                 if ws_sig != selected_sig:
@@ -6817,27 +7232,59 @@ class SmartGrid:
                 return prefill
 
             def rebuild_slots(*_):
-                nonlocal combo_width, preview_job
+                nonlocal combo_width, preview_job, slot_baseline_assignments
+                nonlocal slot_notes_block
                 mon_idx = get_target_monitor_index()
                 sync_preview_canvas_size(mon_idx)
                 for w in slots_frame.winfo_children():
                     w.destroy()
                 slot_vars.clear()
                 slot_widgets.clear()
-                clear_slot_buttons = []
+                slot_notes_block = None
+                slot_baseline_assignments = {}
+                clear_slot_states = []
+                clear_state_by_var = {}
                 no_windows_available = not display_labels
 
+                notes_block = tk.Frame(slots_frame, bg=section_bg)
+                slot_notes_block = notes_block
+
+                note_line = tk.Frame(notes_block, bg=section_bg)
+                note_line.pack(fill=tk.X, anchor="w")
                 tk.Label(
-                    slots_frame,
-                    text=(
-                        "Local edits are drafts until Save Changes or Apply Changes. "
-                        "Reset Saved Slots (Persistent) updates the saved profile immediately."
-                    ),
-                    font=("Arial", 8, "italic"),
-                    fg="#5D6778",
+                    note_line,
+                    text="Save Changes",
+                    font=(font_family, 8, "bold"),
+                    fg=text_secondary,
                     bg=section_bg,
                     anchor="w",
-                ).pack(anchor="w", pady=(0, 4))
+                ).pack(side=tk.LEFT)
+                tk.Label(
+                    note_line,
+                    text=" to persist your edits (locally), then ",
+                    font=(font_family, 8),
+                    fg=text_secondary,
+                    bg=section_bg,
+                    anchor="w",
+                    justify=tk.LEFT,
+                ).pack(side=tk.LEFT)
+                tk.Label(
+                    note_line,
+                    text="Apply Now",
+                    font=(font_family, 8, "bold"),
+                    fg=text_secondary,
+                    bg=section_bg,
+                    anchor="w",
+                ).pack(side=tk.LEFT)
+                tk.Label(
+                    note_line,
+                    text=" to apply them immediately and keep runtime in sync.",
+                    font=(font_family, 8),
+                    fg=text_secondary,
+                    bg=section_bg,
+                    anchor="w",
+                    justify=tk.LEFT,
+                ).pack(side=tk.LEFT)
 
                 sel_label = layout_var.get()
                 layout, info = dict(layout_presets).get(sel_label, (None, None))
@@ -6860,20 +7307,50 @@ class SmartGrid:
                     tk.Label(
                         slots_frame,
                         text="No windows detected on this monitor. Slots are shown for preview.",
-                        font=("Arial", 9, "italic"),
-                        fg="gray",
+                        font=(font_family, 8, "italic"),
+                        fg=text_secondary,
                         bg=section_bg,
                         anchor="w",
                     ).pack(anchor="w", pady=(0, 4))
 
                 # Keep Clear buttons aligned without a large character-based width gap.
-                slot_label_font = tkfont.Font(family="Arial", size=8)
+                slot_label_font = tkfont.Font(family=font_family, size=8)
                 slot_label_min_px = 0
                 if grid_coords:
                     slot_label_min_px = max(
                         slot_label_font.measure(f"Slot {idx} ({c},{r})")
                         for idx, (c, r) in enumerate(grid_coords, start=1)
                     ) + 4
+
+                def set_local_reset_button_mode(button, undo_enabled=False):
+                    if undo_enabled:
+                        button.config(
+                            text="Undo Reset",
+                            bg=UNDO_SLOT_BTN_BG,
+                            fg=UNDO_SLOT_BTN_FG,
+                            activebackground=UNDO_SLOT_BTN_HOVER_BG,
+                            activeforeground=UNDO_SLOT_BTN_HOVER_FG,
+                            highlightbackground=UNDO_SLOT_BTN_BORDER,
+                            highlightcolor=UNDO_SLOT_BTN_BORDER,
+                        )
+                        button._slot_base_bg = UNDO_SLOT_BTN_BG
+                        button._slot_base_fg = UNDO_SLOT_BTN_FG
+                        button._slot_hover_bg = UNDO_SLOT_BTN_HOVER_BG
+                        button._slot_hover_fg = UNDO_SLOT_BTN_HOVER_FG
+                    else:
+                        button.config(
+                            text="Reset Slot (Local)",
+                            bg=CLEAR_SLOT_BTN_BG,
+                            fg=CLEAR_SLOT_BTN_FG,
+                            activebackground=CLEAR_SLOT_BTN_HOVER_BG,
+                            activeforeground=CLEAR_SLOT_BTN_HOVER_FG,
+                            highlightbackground=CLEAR_SLOT_BTN_BORDER,
+                            highlightcolor=CLEAR_SLOT_BTN_BORDER,
+                        )
+                        button._slot_base_bg = CLEAR_SLOT_BTN_BG
+                        button._slot_base_fg = CLEAR_SLOT_BTN_FG
+                        button._slot_hover_bg = CLEAR_SLOT_BTN_HOVER_BG
+                        button._slot_hover_fg = CLEAR_SLOT_BTN_HOVER_FG
 
                 for i, (col, row) in enumerate(grid_coords, start=1):
                     row_frame = tk.Frame(slots_frame, bg=section_bg)
@@ -6889,7 +7366,7 @@ class SmartGrid:
                         font=slot_label_font,
                         anchor="e",
                         bg=section_bg,
-                        fg="#333333",
+                        fg=text_primary,
                     ).grid(row=0, column=0, sticky="e")
 
                     var = tk.StringVar()
@@ -6897,7 +7374,7 @@ class SmartGrid:
                         row_frame,
                         text="Reset Slot (Local)",
                         width=16,
-                        font=("Arial", 8),
+                        font=(font_family, 8),
                         bg=CLEAR_SLOT_BTN_BG,
                         fg=CLEAR_SLOT_BTN_FG,
                         activebackground=CLEAR_SLOT_BTN_HOVER_BG,
@@ -6918,6 +7395,7 @@ class SmartGrid:
                         state="readonly" if display_labels else "disabled",
                         height=15,
                         width=combo_width,
+                        style=combo_style,
                     )
                     # Keep a small right-side breathing space near the combobox arrow.
                     combo.grid(row=0, column=2, sticky="w", padx=(0, 2))
@@ -6932,30 +7410,37 @@ class SmartGrid:
                         text="",
                         fg=accent,
                         bg=section_bg,
-                        font=("Arial", 8, "bold"),
+                        font=font_label_bold,
                         anchor="w",
                         width=proc_col_width,
                     )
                     proc_label.grid(row=0, column=3, sticky="w", padx=(1, 1))
-
+                    set_local_reset_button_mode(clear_btn, undo_enabled=False)
                     clear_btn.bind(
                         "<Enter>",
                         lambda _e, b=clear_btn: b.config(
-                            bg=CLEAR_SLOT_BTN_HOVER_BG,
-                            fg=CLEAR_SLOT_BTN_HOVER_FG,
+                            bg=getattr(b, "_slot_hover_bg", CLEAR_SLOT_BTN_HOVER_BG),
+                            fg=getattr(b, "_slot_hover_fg", CLEAR_SLOT_BTN_HOVER_FG),
                         ),
                     )
                     clear_btn.bind(
                         "<Leave>",
                         lambda _e, b=clear_btn: b.config(
-                            bg=CLEAR_SLOT_BTN_BG,
-                            fg=CLEAR_SLOT_BTN_FG,
+                            bg=getattr(b, "_slot_base_bg", CLEAR_SLOT_BTN_BG),
+                            fg=getattr(b, "_slot_base_fg", CLEAR_SLOT_BTN_FG),
                         ),
                     )
 
                     slot_vars.append(((col, row), var))
                     slot_widgets.append((var, combo, proc_label))
-                    clear_slot_buttons.append((clear_btn, var, proc_label))
+                    state = {
+                        "button": clear_btn,
+                        "var": var,
+                        "proc_label": proc_label,
+                        "last_cleared": "",
+                    }
+                    clear_slot_states.append(state)
+                    clear_state_by_var[id(var)] = state
 
                 def update_proc_label(label_text, target_label):
                     if not label_text:
@@ -6989,20 +7474,53 @@ class SmartGrid:
                 def on_combo_selected(current_var, current_proc_label):
                     on_select(current_var)
                     update_proc_label(current_var.get(), current_proc_label)
+                    state = clear_state_by_var.get(id(current_var))
+                    if state is not None:
+                        state["last_cleared"] = ""
+                        set_local_reset_button_mode(state["button"], undo_enabled=False)
 
                 for v, c, pl in slot_widgets:
                     c.bind("<<ComboboxSelected>>", lambda _e, var=v, pl=pl: on_combo_selected(var, pl))
 
-                def clear_slot_value(current_var, current_proc_label):
-                    if not current_var.get().strip():
+                def clear_slot_value(current_state):
+                    current_var = current_state["var"]
+                    current_proc_label = current_state["proc_label"]
+                    last_value = current_var.get().strip()
+                    if not last_value:
                         return
+                    current_state["last_cleared"] = last_value
                     current_var.set("")
                     current_proc_label.config(text="")
+                    set_local_reset_button_mode(current_state["button"], undo_enabled=True)
                     refresh_options()
 
-                for clear_btn, var, proc_label in clear_slot_buttons:
-                    clear_btn.config(
-                        command=lambda v=var, pl=proc_label: clear_slot_value(v, pl)
+                def undo_clear_slot_value(current_state):
+                    current_var = current_state["var"]
+                    current_proc_label = current_state["proc_label"]
+                    restored = str(current_state.get("last_cleared", "")).strip()
+                    if not restored:
+                        return
+                    if restored not in display_labels:
+                        current_state["last_cleared"] = ""
+                        set_local_reset_button_mode(current_state["button"], undo_enabled=False)
+                        refresh_options()
+                        return
+                    current_var.set(restored)
+                    on_select(current_var)
+                    update_proc_label(current_var.get(), current_proc_label)
+                    current_state["last_cleared"] = ""
+                    set_local_reset_button_mode(current_state["button"], undo_enabled=False)
+                    refresh_options()
+
+                def on_local_slot_button(current_state):
+                    if str(current_state.get("last_cleared", "")).strip():
+                        undo_clear_slot_value(current_state)
+                    else:
+                        clear_slot_value(current_state)
+
+                for current_state in clear_slot_states:
+                    current_state["button"].config(
+                        command=lambda s=current_state: on_local_slot_button(s)
                     )
 
                 # Auto-prefill from currently active tiled grid when selected layout matches it.
@@ -7011,6 +7529,8 @@ class SmartGrid:
                     label = prefill_by_coord.get(coord)
                     if label:
                         var.set(label)
+
+                slot_baseline_assignments = _get_current_slot_assignments()
 
                 refresh_options()
                 draw_layout_preview(positions, grid_coords, get_selected_coords())
@@ -7024,7 +7544,8 @@ class SmartGrid:
                     lambda p=positions, g=grid_coords: draw_layout_preview(p, g, get_selected_coords())
                 )
                 update_current_badge()
-                resize_dialog_to_content()
+                # Let geometry settle first (rows + optional notes), then resize.
+                dialog.after_idle(resize_dialog_to_content)
 
             def _get_selected_layout_and_assignments():
                 mon_idx = get_target_monitor_index()
@@ -7163,7 +7684,7 @@ class SmartGrid:
 
                 tk.Label(
                     container,
-                    text="This action is persistent and updates the saved profile immediately.",
+                    text="This action is persistent and deletes the saved profile immediately.",
                     font=("Arial", 8, "italic"),
                     fg="#7A2633",
                     bg="#F6F8FC",
@@ -7251,65 +7772,226 @@ class SmartGrid:
                     pass
 
             action_btn_labels = (
-                "Apply Changes",
-                "Apply Changes & Switch",
+                "Apply Now",
+                "Apply Now & Switch",
                 "Save Changes (No Apply)",
                 "Reset Saved Slots (Persistent)",
             )
             action_btn_max_px = max((font.measure(lbl) for lbl in action_btn_labels), default=160)
             action_btn_avg_char_px = max(1, font.measure("0"))
             action_btn_width = max(16, int(math.ceil((action_btn_max_px + 24) / action_btn_avg_char_px)))
+            action_text_wrap_default = max(190, action_btn_max_px + 24)
+
+            action_content = tk.Frame(action_frame, bg=section_bg_soft)
+            action_content.pack(fill=tk.BOTH, expand=True)
+            action_help_frame = tk.Frame(action_content, bg=section_bg_soft)
+            action_help_frame.pack(fill=tk.X, pady=(0, 6), padx=2)
+
+            action_help_apply_row = tk.Frame(action_help_frame, bg=section_bg_soft)
+            action_help_apply_row.pack(fill=tk.X, anchor="w")
+            action_help_apply_prefix = tk.Label(
+                action_help_apply_row,
+                text="Apply:",
+                font=(font_family, 8, "bold"),
+                fg=text_secondary,
+                bg=section_bg_soft,
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            action_help_apply_prefix.pack(side=tk.LEFT)
+            action_help_apply_text = tk.Label(
+                action_help_apply_row,
+                text=" save assignments and retile now (switch workspace if needed).",
+                font=font_label,
+                fg=text_secondary,
+                bg=section_bg_soft,
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=action_text_wrap_default,
+            )
+            action_help_apply_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            action_help_save_row = tk.Frame(action_help_frame, bg=section_bg_soft)
+            action_help_save_row.pack(fill=tk.X, anchor="w")
+            action_help_save_prefix = tk.Label(
+                action_help_save_row,
+                text="Save:",
+                font=(font_family, 8, "bold"),
+                fg=text_secondary,
+                bg=section_bg_soft,
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            action_help_save_prefix.pack(side=tk.LEFT)
+            action_help_save_text = tk.Label(
+                action_help_save_row,
+                text=" save assignments only (no immediate retile).",
+                font=font_label,
+                fg=text_secondary,
+                bg=section_bg_soft,
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=action_text_wrap_default,
+            )
+            action_help_save_text.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+            dirty_badge = tk.Label(
+                action_content,
+                text="Unsaved local edits",
+                font=(font_family, 8, "bold"),
+                fg="#7A4B00",
+                bg="#FFF1D6",
+                justify=tk.LEFT,
+                anchor="w",
+                relief="solid",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#EAC58C",
+                padx=6,
+                pady=2,
+            )
 
             apply_btn = tk.Button(
-                action_frame,
-                text="Apply Changes",
+                action_content,
+                text="Apply Now",
                 command=apply_layout,
                 width=action_btn_width,
+                font=(font_family, 8, "bold"),
                 bg=accent,
                 fg="white",
                 activebackground=accent_dark,
                 activeforeground="white",
+                relief="flat",
+                bd=0,
+                padx=6,
+                pady=5,
             )
-            apply_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
+            apply_btn.pack(fill=tk.X, pady=(0, 4), padx=2)
             add_hover(apply_btn, accent, accent_hover)
 
             save_btn = tk.Button(
-                action_frame,
+                action_content,
                 text="Save Changes (No Apply)",
                 command=save_layout,
                 width=action_btn_width,
+                font=(font_family, 8, "bold"),
                 bg="#4F86C6",
                 fg="white",
                 activebackground="#3869A4",
                 activeforeground="white",
+                relief="flat",
+                bd=0,
+                padx=6,
+                pady=5,
             )
-            save_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
+            save_btn.pack(fill=tk.X, pady=(0, 4), padx=2)
             add_hover(save_btn, "#4F86C6", "#4277B7")
 
             reset_btn = tk.Button(
-                action_frame,
+                action_content,
                 text="Reset Saved Slots (Persistent)",
                 command=reset_layout,
                 width=action_btn_width,
+                font=(font_family, 8, "bold"),
                 bg=RESET_BTN_BG,
                 fg="white",
                 activebackground=RESET_BTN_ACTIVE,
                 activeforeground="white",
+                relief="flat",
+                bd=0,
+                padx=6,
+                pady=5,
             )
-            reset_btn.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="ne")
+            reset_btn.pack(fill=tk.X, pady=(0, 4), padx=2)
             add_hover(reset_btn, RESET_BTN_BG, RESET_BTN_HOVER)
 
-            apply_reason_label = tk.Label(
-                action_frame,
-                textvariable=apply_reason_var,
-                font=("Arial", 8),
-                fg="#8B5A14",
-                bg=section_bg,
-                justify=tk.LEFT,
-                anchor="e",
-                wraplength=max(190, action_btn_max_px + 24),
+            apply_reason_box = tk.Frame(
+                action_content,
+                bg="#FFF7E8",
+                relief="solid",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground="#F2D8A8",
             )
-            apply_reason_label.pack(side=tk.TOP, pady=(0, 4), padx=2, anchor="e")
+            apply_reason_title_label = tk.Label(
+                apply_reason_box,
+                text="Apply & Save Changes disabled:",
+                font=(font_family, 8, "bold"),
+                fg=warning_text,
+                bg="#FFF7E8",
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            apply_reason_switch_row = tk.Frame(
+                apply_reason_box,
+                bg="#FFF7E8",
+            )
+            apply_reason_switch_prefix_label = tk.Label(
+                apply_reason_switch_row,
+                text="This partial selection would switch layout: ",
+                font=font_label,
+                fg=warning_text,
+                bg="#FFF7E8",
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            apply_reason_switch_prefix_label.pack(side=tk.LEFT)
+            apply_reason_switch_value_label = tk.Label(
+                apply_reason_switch_row,
+                text="",
+                font=(font_family, 8, "bold"),
+                fg=warning_text,
+                bg="#FFF7E8",
+                justify=tk.LEFT,
+                anchor="w",
+            )
+            apply_reason_switch_value_label.pack(side=tk.LEFT)
+            apply_reason_detail_label = tk.Label(
+                apply_reason_box,
+                text="",
+                font=font_label,
+                fg=warning_text,
+                bg="#FFF7E8",
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=action_text_wrap_default,
+            )
+            apply_reason_generic_label = tk.Label(
+                apply_reason_box,
+                text="",
+                font=font_label,
+                fg=warning_text,
+                bg="#FFF7E8",
+                justify=tk.LEFT,
+                anchor="w",
+                wraplength=action_text_wrap_default,
+            )
+
+            def sync_action_text_wrap(_event=None):
+                try:
+                    action_content.update_idletasks()
+                    content_w = action_content.winfo_width()
+                    if content_w <= 1:
+                        content_w = action_content.winfo_reqwidth()
+                    action_help_apply_prefix.update_idletasks()
+                    action_help_save_prefix.update_idletasks()
+                    prefix_w = max(
+                        action_help_apply_prefix.winfo_reqwidth(),
+                        action_help_save_prefix.winfo_reqwidth(),
+                    )
+                    wrap_w = max(120, int(content_w) - prefix_w - 20)
+                    action_help_apply_text.config(wraplength=wrap_w)
+                    action_help_save_text.config(wraplength=wrap_w)
+                    if apply_reason_detail_label is not None:
+                        apply_reason_detail_label.config(wraplength=wrap_w)
+                    if apply_reason_generic_label is not None:
+                        apply_reason_generic_label.config(wraplength=wrap_w)
+                except Exception:
+                    pass
+
+            action_content.bind("<Configure>", sync_action_text_wrap)
+            action_frame.bind("<Configure>", sync_action_text_wrap, add="+")
+            dialog.after_idle(sync_action_text_wrap)
 
             layout_combo.bind("<<ComboboxSelected>>", rebuild_slots)
             layout_var.trace_add("write", lambda *_: rebuild_slots())
@@ -7346,11 +8028,12 @@ class SmartGrid:
             rebuild_slots()
             update_apply_state()
 
-            btn_frame = tk.Frame(dialog)
-            btn_frame.pack(pady=8)
-            tk.Button(btn_frame, text="Quit", command=close_picker, width=10).pack(side=tk.LEFT, padx=6)
+            btn_frame = tk.Frame(dialog, bg=app_bg)
+            # Keep Quit directly below Slot Assignments (not pinned to window bottom).
+            btn_frame.pack(fill=tk.X, padx=12, pady=(2, 2))
+            tk.Button(btn_frame, text="Quit", command=close_picker, width=10).pack(anchor="center")
             # Recompute final size after footer buttons are created, so Quit is never clipped.
-            resize_dialog_to_content()
+            dialog.after_idle(resize_dialog_to_content)
 
             dialog.protocol("WM_DELETE_WINDOW", close_picker)
             dialog.bind("<Control-Alt-q>", quit_from_picker)
