@@ -3378,6 +3378,7 @@ class SmartGrid:
             # This matches user expectation: dropping any window on another monitor
             # consolidates that monitor layout instead of replacing an existing slot.
             if old_pos[0] != target_mon_idx:
+                touched_monitors = {int(old_pos[0]), int(target_mon_idx)}
                 with self.lock:
                     log(
                         f"[SNAP] MOVE to monitor {target_mon_idx+1} "
@@ -3391,6 +3392,10 @@ class SmartGrid:
                         self.layout_capacity.pop(mon, None)
                     self.ignore_retile_until = 0.0
                 self.smart_tile_with_restore()
+                # Ensure source/target monitors are hole-free even when layout type
+                # stays identical (e.g. grid 4x3 -> grid 4x3 after N-1 on source).
+                # Keep this local to touched monitors.
+                self._compact_grid_after_close(target_monitors=touched_monitors)
                 return
             
             # Check if target cell is occupied (atomic)
