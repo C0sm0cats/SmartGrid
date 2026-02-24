@@ -2459,18 +2459,41 @@ class SmartGrid:
                     continue
                 _repack_monitor_without_holes(mon_idx, preferred_slots=preferred)
 
-    def _compact_grid_after_minimize(self):
-        """Fill earliest empty slots by moving windows from the end of the layout."""
+    def _compact_grid_after_minimize(self, target_monitors=None):
+        """
+        Fill earliest empty slots by moving windows from the end of the layout.
+        Compaction is monitor-local: monitors with a maximized window are skipped.
+        Returns True when at least one compaction/reflow action ran.
+        """
         with self._tiling_lock:
             with self.lock:
                 grid_snapshot = dict(self.window_mgr.grid_state)
                 layout_signature = dict(self.layout_signature)
                 layout_capacity = dict(self.layout_capacity)
+                maximized_snapshot = dict(self.window_mgr.maximized_windows)
+
+            frozen_monitors = {
+                int(mon_idx)
+                for hwnd, (mon_idx, _c, _r) in maximized_snapshot.items()
+                if user32.IsWindow(hwnd)
+            }
+            target_set = None
+            if target_monitors is not None:
+                target_set = {int(m) for m in target_monitors}
+
+            def _is_compactable_monitor(mon_idx):
+                if mon_idx in frozen_monitors:
+                    return False
+                if target_set is not None and mon_idx not in target_set:
+                    return False
+                return True
+
+            did_compact = False
 
             # Hybrid behavior: if the window count implies a different layout, retile fully.
             counts_by_monitor = {}
             for hwnd, (mon_idx, _, _) in grid_snapshot.items():
-                if user32.IsWindow(hwnd):
+                if user32.IsWindow(hwnd) and _is_compactable_monitor(mon_idx):
                     counts_by_monitor[mon_idx] = counts_by_monitor.get(mon_idx, 0) + 1
             for mon_idx, count in counts_by_monitor.items():
                 if count <= 0:
@@ -2484,9 +2507,11 @@ class SmartGrid:
                     with self.lock:
                         self.ignore_retile_until = 0.0
                     self.smart_tile_with_restore()
-                    return
+                    return True
 
             for mon_idx, (layout, info) in layout_signature.items():
+                if not _is_compactable_monitor(mon_idx):
+                    continue
                 capacity = layout_capacity.get(mon_idx, 0)
                 if capacity <= 0 or mon_idx >= len(self.monitors_cache):
                     continue
@@ -2539,30 +2564,34 @@ class SmartGrid:
                         self.window_mgr.grid_state[hwnd] = (mon_idx, target_coord[0], target_coord[1])
                     slot_to_hwnd[target_coord] = hwnd
                     bisect.insort(filled_indices, target_idx)
+                    did_compact = True
 
-    def _compact_grid_after_close(self):
+            return did_compact
+
+    def _compact_grid_after_close(self, target_monitors=None):
         """Compact grid after a window closes (hybrid layout change)."""
-        self._compact_grid_after_minimize()
+        return self._compact_grid_after_minimize(target_monitors=target_monitors)
 
     def _run_deferred_compactions(self):
         """Apply deferred compact operations once locks/freeze allow it."""
         with self.lock:
-            has_maximized = any(
-                user32.IsWindow(hwnd) for hwnd in self.window_mgr.maximized_windows.keys()
-            )
             do_minimize = self.compact_on_minimize and self._pending_compact_minimize
             do_close = self.compact_on_close and self._pending_compact_close
 
-        if has_maximized or not (do_minimize or do_close):
+        if not (do_minimize or do_close):
             return False
 
+        executed = False
         # Prioritize minimize compaction when both are pending.
         if do_minimize:
             log("[AUTO-COMPACT] running deferred minimize compaction")
-            self._compact_grid_after_minimize()
+            executed = self._compact_grid_after_minimize()
         else:
             log("[AUTO-COMPACT] running deferred close compaction")
-            self._compact_grid_after_close()
+            executed = self._compact_grid_after_close()
+
+        if not executed:
+            return False
 
         now = time.time()
         visible_windows = self.window_mgr.get_visible_windows(
@@ -8192,43 +8221,21 @@ class SmartGrid:
                         time.sleep(0.08)
                         continue
 
-                    # Hard rule: while ANY window is maximized, do not auto-retile/reflow.
-                    # This prevents "background retiles" from moving other windows (Hyprland-like).
+                    # Freeze is monitor-local (handled in smart_tile_with_restore), not global.
+                    # Keep a status log to help diagnose maximize interactions.
                     with self.lock:
-                        has_maximized = any(
-                            user32.IsWindow(hwnd) for hwnd in self.window_mgr.maximized_windows.keys()
-                        )
+                        maximized_monitors = sorted({
+                            int(m_idx)
+                            for hwnd, (m_idx, _c, _r) in self.window_mgr.maximized_windows.items()
+                            if user32.IsWindow(hwnd)
+                        })
+                    has_maximized = len(maximized_monitors) > 0
                     if has_maximized and not self._maximize_freeze_active:
-                        log("[FREEZE] Maximize detected -> auto-retile paused")
+                        labels = ", ".join(f"M{m + 1}" for m in maximized_monitors)
+                        log(f"[FREEZE] Maximize detected on {labels} -> monitor-local freeze active")
                     elif not has_maximized and self._maximize_freeze_active:
-                        log("[FREEZE] Maximize cleared -> auto-retile resumed")
+                        log("[FREEZE] Maximize cleared -> monitor-local freeze cleared")
                     self._maximize_freeze_active = has_maximized
-                    if has_maximized:
-                        if minimized_moved and self.compact_on_minimize:
-                            with self.lock:
-                                self._pending_compact_minimize = True
-                        with self.lock:
-                            known_hwnds_pre = (
-                                set(self.window_mgr.grid_state.keys())
-                                | set(self.window_mgr.minimized_windows.keys())
-                                | set(self.window_mgr.maximized_windows.keys())
-                            )
-                        if self.compact_on_close and len(known_hwnds_pre) < self.last_known_count:
-                            with self.lock:
-                                self._pending_compact_close = True
-                        # Keep the counters in sync to avoid a retile storm when unmaximizing.
-                        visible_windows = self.window_mgr.get_visible_windows(
-                            self.monitors_cache, self.overlay_hwnd
-                        )
-                        current_count = len(visible_windows)
-                        with self.lock:
-                            known_hwnds = (set(self.window_mgr.grid_state.keys()) |
-                                           set(self.window_mgr.minimized_windows.keys()) |
-                                           set(self.window_mgr.maximized_windows.keys()))
-                        self.last_visible_count = current_count
-                        self.last_known_count = len(known_hwnds)
-                        time.sleep(0.06)
-                        continue
 
                     self._enforce_tiled_slot_bounds()
 
@@ -8240,9 +8247,14 @@ class SmartGrid:
                         # Minimizing a tiled window reduces the effective count; do a single
                         # reflow so the remaining windows fill the layout.
                         if self.compact_on_minimize:
-                            self._compact_grid_after_minimize()
-                            with self.lock:
-                                self._pending_compact_minimize = False
+                            compacted = self._compact_grid_after_minimize()
+                            if compacted:
+                                with self.lock:
+                                    self._pending_compact_minimize = False
+                            else:
+                                with self.lock:
+                                    self._pending_compact_minimize = True
+                                self.smart_tile_with_restore()
                         else:
                             self.smart_tile_with_restore()
 
@@ -8295,12 +8307,13 @@ class SmartGrid:
                     )
                     if minimize_hole_detected and now >= self.ignore_retile_until:
                         log(f"[AUTO-COMPACT] minimize fallback {self.last_visible_count} → {current_count} windows")
-                        self._compact_grid_after_minimize()
-                        self.last_visible_count = current_count
-                        self.last_known_count = known_count
-                        self.last_retile_time = now
-                        time.sleep(0.08)
-                        continue
+                        compacted = self._compact_grid_after_minimize()
+                        if compacted:
+                            self.last_visible_count = current_count
+                            self.last_known_count = known_count
+                            self.last_retile_time = now
+                            time.sleep(0.08)
+                            continue
                     
                     # Debounced retiling
                     if now >= self.ignore_retile_until and current_count > 0:
@@ -8313,11 +8326,16 @@ class SmartGrid:
                             should_retile = True
 
                         if should_retile and now - self.last_retile_time >= self.retile_debounce:
-                            if self.compact_on_close and closed_windows and not new_windows:
+                            if self.compact_on_close and closed_windows and (not new_windows):
                                 log(f"[AUTO-RETILE] close compaction {self.last_visible_count} → {current_count} windows")
-                                self._compact_grid_after_close()
-                                with self.lock:
-                                    self._pending_compact_close = False
+                                compacted = self._compact_grid_after_close()
+                                if compacted:
+                                    with self.lock:
+                                        self._pending_compact_close = False
+                                else:
+                                    with self.lock:
+                                        self._pending_compact_close = True
+                                    self.smart_tile_with_restore()
                             else:
                                 log(f"[AUTO-RETILE] {self.last_visible_count} → {current_count} windows")
                                 self.smart_tile_with_restore()
@@ -8325,7 +8343,7 @@ class SmartGrid:
                             self.last_known_count = known_count
                             self.last_retile_time = now
                             time.sleep(0.2)
-                        elif should_retile and self.compact_on_close and closed_windows and not new_windows:
+                        elif should_retile and self.compact_on_close and closed_windows and (not new_windows):
                             with self.lock:
                                 self._pending_compact_close = True
                         elif not should_retile:
