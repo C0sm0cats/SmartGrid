@@ -869,6 +869,11 @@ class SmartGrid:
         self.compact_on_close = True
         self._pending_compact_minimize = False
         self._pending_compact_close = False
+        # Cross-monitor drop stabilization:
+        # - short no-animation window for moved hwnd
+        # - deferred reflow nonce to avoid overlapping reflow threads
+        self._cross_drop_noanim_until = {}  # hwnd -> monotonic deadline
+        self._cross_drop_reflow_nonce = 0
         self.window_state_ws = {}  # hwnd -> workspace index when cached in min/max maps
         # (monitor_idx, ws_idx) -> set(hwnd) that were parked during workspace switch.
         # Used as a safety net to avoid losing windows when a workspace map is stale.
@@ -1640,7 +1645,10 @@ class SmartGrid:
                 target_coords not in assigned and
                 saved_col < 10 and saved_row < 10):  # ← ADD VALIDATION
                 x, y, w, h = pos_map[target_coords]
-                self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                self.window_mgr.force_tile_resizable(
+                    hwnd, x, y, w, h,
+                    animate=self._should_animate_tiling_for_hwnd(hwnd),
+                )
                 new_grid[hwnd] = (mon_idx, saved_col, saved_row)
                 assigned.add(target_coords)
                 log(f"   ✓ RESTORED to ({saved_col},{saved_row}): {title[:50]} [{win_class}]")
@@ -1671,7 +1679,10 @@ class SmartGrid:
             
             available_positions.remove((col, row))
             x, y, w, h = pos_map[(col, row)]
-            self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+            self.window_mgr.force_tile_resizable(
+                hwnd, x, y, w, h,
+                animate=self._should_animate_tiling_for_hwnd(hwnd),
+            )
             new_grid[hwnd] = (mon_idx, col, row)
             log(f"   → NEW position ({col},{row}): {title[:50]} [{win_class}]")
             time.sleep(0.015)
@@ -1696,7 +1707,10 @@ class SmartGrid:
                         continue
 
                     x, y, w, h = pos_map[target_coord]
-                    self.window_mgr.force_tile_resizable(hwnd, x, y, w, h)
+                    self.window_mgr.force_tile_resizable(
+                        hwnd, x, y, w, h,
+                        animate=self._should_animate_tiling_for_hwnd(hwnd),
+                    )
                     new_grid[hwnd] = (mon_idx, target_coord[0], target_coord[1])
                     log(
                         f"   ↻ COMPACT ({old_coord[0]},{old_coord[1]}) -> "
@@ -3295,6 +3309,60 @@ class SmartGrid:
         except Exception as e:
             log(f"[ERROR] calculate_target_rect: {e}")
             return None
+
+    def _mark_cross_drop_noanim_locked(self, hwnd, ttl=0.9):
+        """Mark a moved hwnd to be tiled without animation for a short settle window."""
+        try:
+            deadline = time.time() + max(0.1, float(ttl))
+        except Exception:
+            deadline = time.time() + 0.9
+        self._cross_drop_noanim_until[hwnd] = deadline
+
+    def _should_animate_tiling_for_hwnd(self, hwnd):
+        """Return False during short post cross-monitor-drop settle window."""
+        now = time.time()
+        with self.lock:
+            deadline = self._cross_drop_noanim_until.get(hwnd, 0.0)
+            if deadline and deadline > now:
+                return False
+            if deadline:
+                self._cross_drop_noanim_until.pop(hwnd, None)
+        return True
+
+    def _schedule_cross_monitor_drop_reflow(self, touched_monitors, moved_hwnd=None):
+        """
+        Run a short deferred reflow sequence after cross-monitor drop.
+        This avoids compositor races (notably Chromium/Electron) right at mouse-release.
+        """
+        target_monitors = {int(m) for m in touched_monitors}
+        with self.lock:
+            self._cross_drop_reflow_nonce += 1
+            nonce = int(self._cross_drop_reflow_nonce)
+
+        def _worker():
+            # Two short settle passes: fast + confirm.
+            for delay_s in (0.06, 0.14):
+                time.sleep(delay_s)
+                with self.lock:
+                    if nonce != self._cross_drop_reflow_nonce:
+                        return
+                    self.ignore_retile_until = 0.0
+                self.smart_tile_with_restore()
+                self._compact_grid_after_close(target_monitors=target_monitors)
+                if moved_hwnd and user32.IsWindow(moved_hwnd):
+                    try:
+                        user32.RedrawWindow(
+                            moved_hwnd,
+                            None,
+                            None,
+                            win32con.RDW_INVALIDATE
+                            | win32con.RDW_UPDATENOW
+                            | win32con.RDW_ALLCHILDREN,
+                        )
+                    except Exception:
+                        pass
+
+        threading.Thread(target=_worker, daemon=True).start()
     
     def handle_snap_drop(self, source_hwnd, cursor_pos):
         """Handle window drop during drag."""
@@ -3387,15 +3455,16 @@ class SmartGrid:
                     self._bind_window_to_target_monitor_workspace_locked(
                         source_hwnd, target_mon_idx, target_col, target_row
                     )
+                    self._mark_cross_drop_noanim_locked(source_hwnd, ttl=0.9)
                     for mon in {old_pos[0], target_mon_idx}:
                         self.layout_signature.pop(mon, None)
                         self.layout_capacity.pop(mon, None)
-                    self.ignore_retile_until = 0.0
-                self.smart_tile_with_restore()
-                # Ensure source/target monitors are hole-free even when layout type
-                # stays identical (e.g. grid 4x3 -> grid 4x3 after N-1 on source).
-                # Keep this local to touched monitors.
-                self._compact_grid_after_close(target_monitors=touched_monitors)
+                    # Let OS finish drag-release/compositor transitions before reflow.
+                    self.ignore_retile_until = time.time() + 0.05
+                self._schedule_cross_monitor_drop_reflow(
+                    touched_monitors=touched_monitors,
+                    moved_hwnd=source_hwnd,
+                )
                 return
             
             # Check if target cell is occupied (atomic)
