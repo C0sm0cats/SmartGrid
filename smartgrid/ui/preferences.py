@@ -2,7 +2,7 @@
 from copy import deepcopy
 from dataclasses import asdict
 from PySide6.QtCore import Qt,QTimer,QSignalBlocker
-from PySide6.QtGui import QColor,QKeySequence
+from PySide6.QtGui import QColor,QKeySequence,QFont,QFontMetrics
 from PySide6.QtWidgets import (QDialog,QWidget,QVBoxLayout,QHBoxLayout,QFormLayout,QLabel,QPushButton,
     QTabWidget,QScrollArea,QComboBox,QSpinBox,QDoubleSpinBox,QCheckBox,QColorDialog,QKeySequenceEdit,
     QPlainTextEdit,QGroupBox,QFileDialog,QLineEdit,QTreeWidget,QTreeWidgetItem)
@@ -56,7 +56,7 @@ class Preferences(QDialog):
             container=QWidget();row=QHBoxLayout(container);row.setContentsMargins(0,0,0,0)
             reset=QPushButton('↶');reset.setFixedWidth(38);reset.setToolTip(f'Reset {edge} spacing to default')
             reset.clicked.connect(lambda checked=False,e=edge:self.margin_controls[e].setValue(Settings().margins[e]))
-            spin.setFixedWidth(120);row.addStretch();row.addWidget(reset);row.addWidget(spin)
+            row.addStretch();row.addWidget(reset);row.addWidget(self._stepper(spin))
             room.addRow(f'{edge.title()} edge spacing',container)
             self.edge_rows.append(container)
             spin.valueChanged.connect(self._changed)
@@ -168,7 +168,7 @@ class Preferences(QDialog):
 
     def _group(self,page,title,description=''):
         group=QGroupBox(title);group.setProperty('preferences',True)
-        form=QFormLayout(group);form.setSpacing(10)
+        form=QFormLayout(group);form.setSpacing(10);form.setVerticalSpacing(12)
         form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         if description:
             label=QLabel(description);label.setWordWrap(True);label.setProperty('muted',True);form.addRow(label)
@@ -182,7 +182,9 @@ class Preferences(QDialog):
         label.setTextFormat(Qt.TextFormat.RichText if subtitle else Qt.TextFormat.PlainText)
         label.setWordWrap(True)
         # Wrap only when the window is narrow: keep the title on one line up to 300 px.
-        label.setMinimumWidth(min(label.fontMetrics().horizontalAdvance(title)+8,300))
+        small=QFont(label.font());small.setPointSizeF(max(6,small.pointSizeF()*.83))
+        widest=max(label.fontMetrics().horizontalAdvance(title),QFontMetrics(small).horizontalAdvance(subtitle))
+        label.setMinimumWidth(min(widest+8,300))
         return label
 
     def _row(self,form,key,title,control,subtitle=''):
@@ -194,10 +196,32 @@ class Preferences(QDialog):
         reset.clicked.connect(lambda checked=False,k=key:self.reset_setting(k))
         self.resets[key]=reset
         # Adwaita rows keep their control compact at the right edge.
-        if isinstance(control,QSpinBox) or isinstance(control,QDoubleSpinBox): control.setFixedWidth(120)
-        elif isinstance(control,(QComboBox,QPushButton)): control.setFixedWidth(180)
-        row.addStretch();row.addWidget(reset);row.addWidget(control);form.addRow(self._title(title,subtitle),container)
+        widget=control
+        if isinstance(control,(QSpinBox,QDoubleSpinBox)): widget=self._stepper(control)
+        elif isinstance(control,(QComboBox,QPushButton)) and control is not getattr(self,'color_button',None): control.setFixedWidth(180)
+        # Every row is tall enough for its control on Windows (Segoe UI metrics).
+        container.setMinimumHeight(36);row.setContentsMargins(0,1,0,1)
+        row.addStretch();row.addWidget(reset);row.addWidget(widget);form.addRow(self._title(title,subtitle),container)
         control._preference_row=(form,container)
+
+    @staticmethod
+    def _stepper(spin):
+        """Adw.SpinRow: the value followed by large − and + buttons."""
+        spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        spin.setAlignment(Qt.AlignmentFlag.AlignCenter);spin.setFixedWidth(72)
+        box=QWidget();layout=QHBoxLayout(box);layout.setContentsMargins(0,1,0,1);layout.setSpacing(4)
+        box.setMinimumHeight(36);spin.setFixedHeight(32)
+        layout.addWidget(spin)
+        for text,step,tip in (('−',-1,'Decrease'),('+',1,'Increase')):
+            button=QPushButton(text);button.setFixedSize(34,32);button.setToolTip(tip);button.setAccessibleName(tip)
+            button.setAutoRepeat(True);button.setAutoRepeatDelay(400);button.setAutoRepeatInterval(60)
+            button.clicked.connect(lambda checked=False,s=step:spin.stepBy(s))
+            layout.addWidget(button)
+        def refresh(*args):
+            buttons=box.findChildren(QPushButton)
+            buttons[0].setEnabled(spin.value()>spin.minimum());buttons[1].setEnabled(spin.value()<spin.maximum())
+        spin.valueChanged.connect(refresh);refresh()
+        return box
 
     def _spin(self,form,key,title,lower,upper,percent=False,subtitle=''):
         control=QSpinBox();value=getattr(self.settings,key)*100 if percent else getattr(self.settings,key)
@@ -229,9 +253,9 @@ class Preferences(QDialog):
 
     def _paint_color_button(self,color):
         # Gtk.ColorDialogButton: a colour swatch, not a hex label.
-        self.color_button.setText('');self.color_button.setFixedSize(56,30)
+        self.color_button.setText('');self.color_button.setFixedSize(56,32)
         self.color_button.setToolTip(color)
-        self.color_button.setStyleSheet(f'QPushButton {{ background:{color}; border:2px solid palette(mid); border-radius:6px; }}'
+        self.color_button.setStyleSheet(f'QPushButton {{ background:{color}; border:2px solid palette(mid); border-radius:6px; padding:0; min-height:0; }}'
                                         ' QPushButton:disabled { border-style:dashed; }')
 
     def choose_focus_color(self):
@@ -259,7 +283,7 @@ class Preferences(QDialog):
 
     def _refresh_visibility(self):
         independent=self.controls['independent_padding'].isChecked()
-        self.controls['padding'].setEnabled(not independent)
+        self.controls['padding'].parentWidget().setEnabled(not independent)
         form=self.controls['padding']._preference_row[0]
         for row in self.edge_rows: form.setRowVisible(row,independent)
         self.focus_group.parentWidget().setEnabled(self.controls['active_border'].isChecked())
@@ -277,6 +301,7 @@ class Preferences(QDialog):
         self.preview_label.setText(text)
         self.preview_title.setText(f'Current space preview<br><span style="font-size:small;color:palette(placeholder-text)">{text}</span>')
         self.preview_title.setTextFormat(Qt.TextFormat.RichText)
+        self.preview_title.setMinimumWidth(min(QFontMetrics(self.preview_title.font()).horizontalAdvance(text)+8,300))
 
     def refresh_preview(self,*args):
         if not hasattr(self,'preview') or self._building: return

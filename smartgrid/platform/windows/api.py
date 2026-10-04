@@ -65,7 +65,7 @@ class Win32:
                 'EnumWindows': (BOOL, [ENUMPROC, LPARAM]), 'EnumChildWindows': (BOOL, [HWND, ENUMPROC, LPARAM]), 'EnumDisplayMonitors': (BOOL, [HDC, p(RECT), MONITORPROC, LPARAM]),
                 'GetMonitorInfoW': (BOOL, [HMONITOR, p(MONITORINFOEX)]), 'EnumDisplayDevicesW': (BOOL, [C.c_wchar_p, DWORD, p(DISPLAY_DEVICE), DWORD]),
                 'MonitorFromWindow': (HMONITOR, [HWND, DWORD]), 'GetWindowRect': (BOOL, [HWND, p(RECT)]),
-                'IsWindow': (BOOL, [HWND]), 'IsWindowVisible': (BOOL, [HWND]), 'IsIconic': (BOOL, [HWND]), 'IsZoomed': (BOOL, [HWND]),
+                'IsWindow': (BOOL, [HWND]), 'IsWindowVisible': (BOOL, [HWND]), 'IsIconic': (BOOL, [HWND]), 'IsZoomed': (BOOL, [HWND]), 'IsHungAppWindow': (BOOL, [HWND]), 'MoveWindow': (BOOL, [HWND, C.c_int, C.c_int, C.c_int, C.c_int, BOOL]),
                 'GetWindow': (HWND, [HWND, UINT]), 'GetAncestor': (HWND, [HWND, UINT]),
                 'GetWindowThreadProcessId': (DWORD, [HWND, p(DWORD)]), 'GetWindowTextLengthW': (C.c_int, [HWND]),
                 'SetWindowTextW': (BOOL, [HWND, C.c_wchar_p]), 'GetWindowTextW': (C.c_int, [HWND, C.c_wchar_p, C.c_int]), 'GetClassNameW': (C.c_int, [HWND, C.c_wchar_p, C.c_int]),

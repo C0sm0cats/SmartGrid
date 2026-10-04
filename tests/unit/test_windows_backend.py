@@ -91,7 +91,7 @@ class PlacementTests(TestCase):
 
     def test_success_and_cancel_use_same_verification(self):
         backend = self.backend()
-        def place(hwnd, rect):
+        def place(hwnd, rect, force=False):
             backend.current = rect
             return True
         backend._place_once = place
@@ -100,7 +100,7 @@ class PlacementTests(TestCase):
 
     def test_refusing_app_is_bounded_and_reported(self):
         backend = self.backend()
-        backend._place_once = lambda hwnd, rect: True
+        backend._place_once = lambda hwnd, rect, force=False: True
         result = backend.place_result(1, Rect(0, 0, 150, 100), timeout=.05, retries=20)
         self.assertFalse(result.success)
         self.assertLessEqual(result.attempts, 1)
@@ -314,3 +314,35 @@ class ForcedResizeTests(TestCase):
         self.assertFalse(styles['value'] & 0x01000000)
         self.assertEqual(calls[0][-1] & 0x0020, 0x0020)
         self.assertFalse(backend.force_resizable(10))
+
+
+class ForcedPlacementFlagTests(TestCase):
+    def test_forced_placement_skips_minimum_size_enforcement(self):
+        from types import SimpleNamespace
+        backend = WindowsBackend.__new__(WindowsBackend)
+        calls = []
+        backend._raw_rect = backend.window_rect = lambda hwnd: Rect(0, 0, 800, 600)
+        backend.api = SimpleNamespace(SetWindowPos=lambda *args: calls.append(args) or 1, IsHungAppWindow=lambda hwnd: 0)
+        backend._place_once(10, Rect(0, 0, 300, 200), force=True)
+        backend._place_once(10, Rect(0, 0, 300, 200))
+        self.assertTrue(calls[0][-1] & 0x0400)
+        self.assertFalse(calls[0][-1] & 0x4000)
+        self.assertFalse(calls[1][-1] & 0x0400)
+
+
+class ForceFitTests(TestCase):
+    def test_window_that_grows_back_is_corrected_by_its_overshoot(self):
+        from types import SimpleNamespace
+        backend = WindowsBackend.__new__(WindowsBackend)
+        state = {'outer': Rect(0, 0, 520, 420)}
+        # The visible frame is 8 px inside the outer rectangle, and the client
+        # adds 20 px to whatever width it is given, once.
+        backend._raw_rect = lambda hwnd: state['outer']
+        backend.window_rect = lambda hwnd: Rect(state['outer'].x + 8, state['outer'].y, state['outer'].width - 16, state['outer'].height - 8)
+        def set_pos(hwnd, after, x, y, w, h, flags):
+            state['outer'] = Rect(x, y, w, h)
+            return 1
+        backend.api = SimpleNamespace(IsHungAppWindow=lambda hwnd: 0, SetWindowPos=set_pos,
+                                      MoveWindow=lambda hwnd, x, y, w, h, repaint: set_pos(hwnd, None, x, y, w, h, 0))
+        tile = Rect(100, 50, 400, 300)
+        self.assertEqual(backend._force_fit(10, tile), tile)

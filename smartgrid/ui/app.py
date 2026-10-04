@@ -1,4 +1,5 @@
 """Qt application lifetime, tray commands and DPI-aware reserved-slot cards."""
+import logging
 import time
 from PySide6.QtCore import Qt, QTimer, QRect
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPixmap
@@ -14,6 +15,8 @@ from .window_actions import WindowActions
 from .guides import TargetGuide,SpaceOsd,SwapHint,PinPlaceholder,PlacementGhost,SourceGuide
 from .tile_view import application_icon
 from smartgrid.core.geometry import effective_layout,preset_name
+
+log = logging.getLogger(__name__)
 
 
 class DesktopUI:
@@ -256,8 +259,17 @@ class DesktopUI:
         names = (display.id.casefold(),display.name.casefold(),getattr(self.controller.backend,'monitor_devices',{}).get(display.id,'').casefold())
         screen = next((s for s in screens if s.name().casefold() in names),None)
         if screen is None:
+            # Qt names screens after the monitor model ("DELL U2720Q"), Windows
+            # after the device: match the physical size of the work area instead.
             screen = next((s for s in screens if abs(s.availableGeometry().width()*s.devicePixelRatio()-display.work_area.width)<4
                            and abs(s.availableGeometry().height()*s.devicePixelRatio()-display.work_area.height)<4),None)
+        if screen is None:
+            screen = next((s for s in screens if abs(s.geometry().width()*s.devicePixelRatio()-display.work_area.width)<64
+                           and abs(s.geometry().height()*s.devicePixelRatio()-display.work_area.height)<160),None)
+        if screen is None and len(screens) == 1:
+            screen = screens[0]
+        if screen is None and display.primary:
+            screen = self.app.primaryScreen()
         return screen
 
     def _logical(self, display_id, rect):
@@ -349,7 +361,7 @@ class DesktopUI:
             self._last_app_window=selected.ref
         display=next((d for d in controller.displays if selected and d.id==selected.display_id),None)
         device=getattr(controller.backend,'monitor_devices',{}).get(display.id,'') if display else ''
-        screen=next((s for s in self.app.screens() if s.name().casefold() in (device.casefold(),display.name.casefold() if display else '')),None)
+        screen=self._screen(display) if display else None
         # The palette is hidden while the Studio or the switcher is open.
         dialogs=any(w.isVisible() for k,w in self.windows.items() if k in ('studio','quick_switcher'))
         allowed=bool(controller.running and not controller.paused and selected and selected.eligible and selected.state in ('normal','maximized') and not controller._interacting and not controller._swap_snapshot and not self.app.activeModalWidget() and not dialogs)
@@ -385,7 +397,7 @@ class DesktopUI:
         for frame,(display_id,rect) in zip(self.resize_frames,previews):
             display=next((d for d in controller.displays if d.id==display_id),None)
             device=getattr(controller.backend,'monitor_devices',{}).get(display_id,'')
-            screen=next((s for s in self.app.screens() if s.name().casefold()==device.casefold()),None)
+            screen=self._screen(display) if display else None
             if not display or not screen:
                 frame.hide()
                 continue
@@ -408,7 +420,7 @@ class DesktopUI:
             return
         display=next((d for d in controller.displays if d.id==window.display_id),None)
         screens=self.app.screens()
-        screen=next((s for s in screens if s.name().casefold() in (display.id.casefold(),display.name.casefold(),getattr(self.controller.backend,'monitor_devices',{}).get(display.id,'').casefold())),None) if display else None
+        screen=self._screen(display) if display else None
         if screen is None:
             # Do not put a frame onto an unrelated monitor when mapping is unknown.
             self.focus_frame.hide()
@@ -437,20 +449,42 @@ class DesktopUI:
         self.focus_frame.show_for(window.ref,logical,controller.settings.visual_duration(140),restack)
 
     def request_quit(self):
+        """Restore the windows, then always quit: a window that could not be put
+        back exactly is reported, but never keeps SmartGrid running."""
         if self.quitting:
             return
         self.quitting = True
-        def restored(success):
-            if not success:
-                self.quitting = False
-                self.error('Some windows could not be restored. Use Stop and restore windows again before quitting.')
-                return
-            self.bridge.submit('quit',on_success=lambda _: self.app.quit())
-        self.bridge.submit('stop',on_success=restored)
+        def shutdown():
+            restored = True
+            try:
+                restored = self.controller.stop()
+            except Exception:
+                log.exception('Restoring windows before quitting failed')
+                restored = False
+            try:
+                self.controller.quit()
+            except Exception:
+                log.exception('Shutdown did not complete cleanly')
+            return restored
+        def done(restored):
+            if restored is False:
+                self.tray.showMessage('SmartGrid', 'Some windows could not be restored exactly.',
+                                      QSystemTrayIcon.MessageIcon.Warning, 3000)
+            self.app.quit()
+        future = self.bridge.submit(shutdown, on_success=done)
+        # Never stay running if the shutdown hangs or fails.
+        QTimer.singleShot(8000, self.app.quit)
+        if future is None:
+            self.app.quit()
 
     def cleanup(self):
-        self.bridge.shutdown()
-        self.controller.quit()
+        self.tray.hide()
+        # Do not wait for a command stuck on a hung application.
+        self.bridge.shutdown(wait=False)
+        try:
+            self.controller.quit()
+        except Exception:
+            log.exception('Shutdown did not complete cleanly')
         self.timer.stop()
         self.focus_frame.close()
         for widget in [self.target_guide,self.space_osd,self.swap_from,self.swap_to,*self.swap_hints.values()]:

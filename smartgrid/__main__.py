@@ -76,7 +76,15 @@ def main(argv=None):
         logging.getLogger('smartgrid').addHandler(handler)
         logging.getLogger('smartgrid').setLevel(logging.INFO)
         from .ui.app import run_ui
-        return run_ui(controller,[sys.argv[0]])
+        code=run_ui(controller,[sys.argv[0]])
+        if args.demo:
+            return code
+        # A native thread blocked by a hung application must not keep the
+        # process (and the single-instance lock) alive after Quit.
+        controller.quit()
+        if guard: guard.close()
+        logging.shutdown()
+        os._exit(code)
     except ImportError as error:
         report(f'Missing dependency: {error}. Run smartgrid.bat to repair the installation.')
         return 2

@@ -361,13 +361,29 @@ class WindowsBackend:
     def _close_rect(actual, expected, tolerance=2):
         return actual is not None and all(abs(a - b) <= tolerance for a, b in zip((actual.x, actual.y, actual.width, actual.height), (expected.x, expected.y, expected.width, expected.height)))
 
-    def _place_once(self, hwnd, rect):
+    def _place_once(self, hwnd, rect, force=False):
         raw, visible = self._raw_rect(hwnd), self.window_rect(hwnd)
         if not raw or not visible:
             return False
         # Requested bounds refer to visible DWM frame, Win32 receives outer bounds.
         return bool(self.api.SetWindowPos(hwnd, None, rect.x + raw.x - visible.x, rect.y + raw.y - visible.y,
-                                         rect.width + raw.width - visible.width, rect.height + raw.height - visible.height, 0x4000 | 0x14))
+                                         rect.width + raw.width - visible.width, rect.height + raw.height - visible.height,
+                                         self._placement_flags(hwnd, force)))
+
+    def _placement_flags(self, hwnd, force):
+        """SWP_NOZORDER|SWP_NOACTIVATE, asynchronous by default.
+
+        Forced placement adds SWP_NOSENDCHANGING, which skips WM_WINDOWPOSCHANGING
+        where Windows enforces the application's minimum track size, and
+        SWP_FRAMECHANGED. It is synchronous like a direct SetWindowPos (an
+        asynchronous request is replayed by the application's own thread, which
+        can enforce its minimum again); a hung application stays asynchronous.
+        """
+        if not force:
+            return 0x4000 | 0x14
+        hung = getattr(self.api, 'IsHungAppWindow', None)
+        asynchronous = 0x4000 if hung and hung(hwnd) else 0
+        return asynchronous | 0x14 | 0x0400 | 0x0020
 
     def force_resizable(self, hwnd):
         """Give a fixed-size window a resizable frame (WS_THICKFRAME) so it can be
@@ -409,7 +425,7 @@ class WindowsBackend:
                 if cancel and cancel():
                     return PlacementResult(False, rect, self.window_rect(hwnd), attempts, 'Cancelled')
                 t = min(1, (time.monotonic() - started) / duration)
-                self._place_once(hwnd, animation_rect(actual, rect, t, effect, minimum))
+                self._place_once(hwnd, animation_rect(actual, rect, t, effect, minimum), force)
                 time.sleep(min(1 / fps, max(0, started + duration - time.monotonic()), max(0, deadline - time.monotonic())))
         for attempt in range(max(1, min(int(retries), 20))):
             if cancel and cancel():
@@ -417,8 +433,14 @@ class WindowsBackend:
             if time.monotonic() >= deadline:
                 break
             attempts += 1
-            if not self._place_once(hwnd, rect):
+            if not self._place_once(hwnd, rect, force):
                 return PlacementResult(False, rect, self.window_rect(hwnd), attempts, f'Windows denied placement ({C.get_last_error()})')
+            if force:
+                # Correct a window that grows back at once, as soon as it does,
+                # instead of letting it overlap its neighbours while waiting.
+                time.sleep(.015)
+                if not self._close_rect(self.window_rect(hwnd), rect):
+                    self._force_fit(hwnd, rect)
             settle = min(deadline, time.monotonic() + .15)
             stable_since = None
             while time.monotonic() < settle:
@@ -434,12 +456,46 @@ class WindowsBackend:
                     stable_since = None
                 time.sleep(min(.015, max(0, settle - time.monotonic())))
         actual = self.window_rect(hwnd)
+        if force and not self._close_rect(actual, rect) and self.alive(hwnd):
+            actual = self._force_fit(hwnd, rect)
         return PlacementResult(self._close_rect(actual, rect), rect, actual, attempts, '' if self._close_rect(actual, rect) else 'Application refused requested geometry or placement timed out')
+
+    def _force_fit(self, hwnd, rect):
+        """Last resort for windows that resize themselves back (GTK, Qt, Electron):
+        correct by the measured difference, then MoveWindow to the tile."""
+        hung = getattr(self.api, 'IsHungAppWindow', None)
+        if hung and hung(hwnd):
+            return self.window_rect(hwnd)
+        for _ in range(2):
+            raw, visible = self._raw_rect(hwnd), self.window_rect(hwnd)
+            if not raw or not visible or self._close_rect(visible, rect):
+                break
+            # Shrink the outer rectangle by exactly what the visible frame overshoots.
+            x = raw.x + rect.x - visible.x
+            y = raw.y + rect.y - visible.y
+            width = raw.width + rect.width - visible.width
+            height = raw.height + rect.height - visible.height
+            self.api.SetWindowPos(hwnd, None, x, y, max(1, width), max(1, height), 0x14 | 0x0400 | 0x0020)
+            time.sleep(.015)
+        visible = self.window_rect(hwnd)
+        if not self._close_rect(visible, rect, 6):
+            raw = self._raw_rect(hwnd)
+            if raw and visible:
+                self.api.MoveWindow(hwnd, raw.x + rect.x - visible.x, raw.y + rect.y - visible.y,
+                                    max(1, raw.width + rect.width - visible.width),
+                                    max(1, raw.height + rect.height - visible.height), True)
+                time.sleep(.015)
+        visible = self.window_rect(hwnd)
+        if visible and not self._close_rect(visible, rect):
+            log.info('Forced fit of %s ended at %sx%s for a %sx%s tile', hwnd, visible.width, visible.height, rect.width, rect.height)
+        return visible
 
     def place(self, hwnd, rect, animate=False, **kwargs):
         self.last_result = self.place_result(hwnd, rect, animate, **kwargs)
         if not self.last_result.success:
-            log.warning('Placement %s: %s', hwnd, self.last_result.reason)
+            actual = self.last_result.actual
+            log.warning('Placement %s: %s (requested %sx%s, got %s)', hwnd, self.last_result.reason, rect.width, rect.height,
+                        f'{actual.width}x{actual.height}' if actual else 'unknown')
         return self.last_result.success
 
     def alive(self, hwnd):

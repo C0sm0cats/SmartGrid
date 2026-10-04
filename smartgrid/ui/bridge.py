@@ -56,9 +56,9 @@ class AppBridge(QObject):
                 self.status.emit(message)
         self.changed.emit()
 
-    def shutdown(self):
+    def shutdown(self, wait=True):
         self.closed = True
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.executor.shutdown(wait=wait, cancel_futures=True)
 
 
 def bridge_for(controller):

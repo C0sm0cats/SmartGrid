@@ -154,6 +154,13 @@ class UITests(unittest.TestCase):
         ui.window_actions.close()
         ui.tray.hide()
 
+    def test_screen_mapping_does_not_depend_on_monitor_names(self):
+        from smartgrid.ui.app import DesktopUI
+        ui=DesktopUI(self.controller,self.app);self.settle()
+        display=self.controller.displays[0]
+        self.assertIsNotNone(ui._screen(display))
+        ui.tray.hide()
+
     def test_preview_scales_physical_padding_and_complete_auto_grid(self):
         studio=Studio(self.controller); self.widgets.append(studio)
         profile=self.controller.draft('demo-primary',0).profile
