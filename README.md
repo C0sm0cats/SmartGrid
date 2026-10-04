@@ -1,148 +1,122 @@
+<div align="center">
+
 # SmartGrid
 
-[![Release](https://img.shields.io/github/v/release/C0sm0cats/SmartGrid)](https://github.com/C0sm0cats/SmartGrid/releases/latest)
-[![License](https://img.shields.io/github/license/C0sm0cats/SmartGrid)](LICENSE)
-[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-blue)](https://github.com/C0sm0cats/SmartGrid)
+**Your windows, beautifully arranged — on Windows.**
 
-SmartGrid gives you instant tiling, drag & drop snapping, swap mode, a **Layout Manager**, and **workspaces per monitor** — with a system tray UI and global hotkeys.
+Automatic window tiling for **Windows 10 / 11**.
 
-![SmartGrid overview](docs/smartgrid-overview-blurred.png)
+[![License: MIT](https://img.shields.io/badge/license-MIT-8ce8c3)](LICENSE)
+[![Windows 10/11](https://img.shields.io/badge/Windows-10%20%2F%2011-3584e4)](#install)
+[![Python 3.11+](https://img.shields.io/badge/Python-3.11%2B-3584e4)](requirements.txt)
 
-## Features
+**One shortcut to arrange. One shortcut to give your desktop back.**
 
-- **Dynamic layouts** (1 → full, 2 → split, 3 → master/stack, 4+ → grid up to 5×3)
-- **Maximize-safe tiling:** maximizing a tiled window won’t reshuffle other windows; restore returns to the original slot
-- **Drag & drop snap:** drag a tiled window by the title bar, preview appears, drop to snap (supports cross-monitor)
-- **Swap Mode:** red border + arrow keys to swap with adjacent windows
-- **Floating windows toggle:** keep specific windows out of the grid (video/chat/reference)
-- **Workspaces per monitor:** 3 workspaces per screen, instant switching, layout remembered
-- **Layout Manager (`Ctrl+Alt+P`):** choose a target layout and assign windows/apps to slots visually
-- **Auto-Compact on minimize/close:** hybrid compaction (fills empty slots, retile only when layout must change)
-- **System tray menu:** toggle tiling, retile, swap mode, settings (including Auto-Compact options), hotkeys, quit
-- **Active border:** green border follows the active tiled window
+</div>
 
-## Hotkeys
+![SmartGrid arranging sixteen application windows in a 4 × 4 grid on Windows 11, with contents blurred](docs/smartgrid-overview.png)
 
-| Shortcut             | Action                                                                      |
-|:---------------------|-----------------------------------------------------------------------------|
-| `Ctrl + Alt + T`     | Toggle tiling (on/off)                                                      |
-| `Ctrl + Alt + R`     | Force re-tile all windows now                                               |
-| `Ctrl + Alt + S`     | Enter Swap Mode (red border + arrows)                                       |
-| `Ctrl + Alt + F`     | Toggle Floating Selected Window                                             |
-| `Ctrl + Alt + P`     | Open Layout Manager (manual layout assignment)                              |
-| `Ctrl + Alt + 1/2/3` | Switch to workspace 1/2/3 (current monitor)                                 |
-| `Ctrl + Alt + Q`     | Quit SmartGrid                                                              |
+SmartGrid is a tray application written in Python with Qt (PySide6) and the native Win32/DWM APIs. It starts paused: launching it does not rearrange your windows.
 
-## Install & Run
+## What it does
 
-### Option A — Download the latest release
+- **Automatic layouts:** full, split, 60/40 focus-and-stack, and grid presets through 5×5. Classic layouts grow and shrink automatically, and can expand beyond 25 slots.
+- **Layout Studio:** an overlay with application icons, numbered slots, drag-to-swap, layout presets, display/space selection, and a window library for assigning windows across displays. Create a named layout from a built-in preset or design custom tiles with splits, merges and percentage dimensions. Edit saved templates or the current space. Edits stay in a draft until applied or saved. **Window previews** shows live DWM thumbnails in the tiles.
+- **Quick layout switcher:** open it from the tray menu or press Ctrl+Alt+L. See how many windows each saved layout will reuse, open, or hide before applying it to the focused display and space. Arrange open windows automatically without opening apps.
+- **Drag to snap:** move a tiled window by its title bar, see the translucent target with *Swap · App* or *Move here*, and release. Same-display drops swap; cross-display drops insert and reflow both displays.
+- **Directional focus:** press Ctrl+Alt+arrow to activate a neighboring tiled window without moving it.
+- **Linked tile resize:** drag a shared window edge to resize neighboring tiles, continuing into further tiles when a neighbor reaches its minimum size. Proportions are kept for that display, space and window count. Arrange again (Ctrl+Alt+R) resets them.
+- **Three spaces per display:** independent window groups within each Windows virtual desktop. Switching parks windows with native minimization; stopping reveals and restores them.
+- **Force into tiles:** windows that refuse to be resized get a resizable frame and are sized into their tile. Original window styles are restored when tiling stops.
+- **Stay in control:** floating windows, per-app rules, configurable compaction, maximize/fullscreen freeze, a focused-window outline that follows the Windows accent color, a window action palette (float, minimize, maximize, close), animated guides, and ten-level arrangement undo.
+- **Pinned slots:** a card marks a reserved tile when its app is minimized, floating, or closed. Click it to restore, retile, or reopen the app.
+- **Tray menu:** status, **Arrange windows**, one submenu per display with its three spaces, focused-window actions (float, swap, undo, redo), **Arrange again**, **Change layout…**, **Layout Studio…**, **Preferences** and **Stop and restore windows**. The **Windows tools** submenu adds **Open Windows Recycle Bin** and **Quit and restore windows**.
+- **Import and export:** save named layouts and per-space profiles as a JSON file from Preferences, then import them on another installation without replacing existing ones.
 
-https://github.com/C0sm0cats/SmartGrid/releases/latest
+## Install
 
-### Option B — Run from source
+Requires Windows 10 or 11 and [Python 3.11 or later for Windows](https://www.python.org/downloads/windows/).
 
-Requirements:
-- Windows 10 / 11 (64-bit)
-- Python 3.9+
-- Dependencies: `pywin32`, `pystray`, `pillow` (PIL)
+1. Download or clone this repository.
+2. Double-click **`smartgrid.bat`**. On first run it creates a `.venv`, installs PySide6 and Pillow (a few minutes, Internet required), adds a **SmartGrid** shortcut to the Desktop, and starts SmartGrid.
+3. From then on, start SmartGrid from the **Desktop shortcut**. It runs without a console; its icon appears in the notification area (on Windows 11 it may be behind the **^** arrow of the taskbar).
 
-```bash
-git clone https://github.com/C0sm0cats/SmartGrid.git
-cd SmartGrid
-python -m pip install --upgrade pip
-python -m pip install pywin32 pystray pillow
-python smartgrid.py
-```
-
-Press `Ctrl + Alt + T` to enable tiling.
-
-## Usage
-
-- Launch SmartGrid → nothing moves (you see the welcome message)
-- Press `Ctrl+Alt+T` → instant tiling + auto-retile activated
-- From now on: restore a window, minimize one, open whatever you want → layout updates **automatically**
-- Press `Ctrl+Alt+P` any time to open **Layout Manager** and manually rebuild a layout by slot
-- Press `Ctrl+Alt+T` again → free mode (move windows manually)
-- Press `Ctrl+Alt+T` again → everything snaps back into perfect order
-- Open **Settings** (tray menu) to toggle **Auto-Compact on Minimize/Close** if you want layouts to stay gap-free.
-
-## Layout Manager
-
-Use `Ctrl+Alt+P` (or tray menu) to open the visual layout picker.
-
-- Choose a target monitor, target workspace, and layout preset (Full, Side-by-side, Master/Stack, Grid variants)
-- Assign visible windows/apps to target slots
-- Apply with **Apply Changes** (current workspace) or **Apply Changes & Switch** (switch + apply)
-- Use **Reset Saved Slots (Persistent)** to clear the saved profile for the selected target layout
+Open the tray icon, or press **Ctrl+Alt+T** to begin arranging. **Ctrl+Alt+P** opens Layout Studio. Stop with **Ctrl+Alt+Q** to restore the original window geometry.
 
 Notes:
-- Local slot edits are drafts until you apply.
-- In AUTO strict mode, topology/profile persistence is handled automatically as layouts evolve.
 
-## Workspaces (per monitor)
+- `smartgrid.bat` is the installer and repair tool. It reuses an existing Windows `.venv` and installs only missing or incompatible dependencies. A `.venv` created on another OS is reported and must be deleted.
+- Keep `smartgrid.bat` next to `smartgrid.py`. If the Desktop shortcut is deleted, delete `.venv\.smartgrid-shortcut-v3` and run `smartgrid.bat` again to recreate it.
+- Running `smartgrid.bat` from a network share (`\\server\...`) prints a harmless cmd warning about UNC paths; the Desktop shortcut does not.
+- Starting SmartGrid while it is already running shows a message instead of a second instance.
 
-SmartGrid gives you **3 independent workspaces per monitor** — like having multiple virtual desktops, but better.
+Manual installation, from a command prompt in the project folder:
 
-**How it works:**
-1. Tile your windows on workspace 1 (default)
-2. Press `Ctrl+Alt+2` → workspace 1 windows **hide instantly** (no minimize animation)
-3. Tile different windows on workspace 2
-4. Press `Ctrl+Alt+1` → back to your first context, **pixel-perfect**
+```bat
+py -3 -m venv .venv
+.venv\Scripts\python -m pip install -r requirements.txt
+.venv\Scripts\pythonw smartgrid.py
+```
 
-## Drag & Drop Snap
+Settings, profiles, saved layouts and the log (`smartgrid.log`) are stored in `%LOCALAPPDATA%\SmartGrid`. To remove SmartGrid, choose **Windows tools → Quit and restore windows** in the tray menu, then delete the project folder, the Desktop shortcut and `%LOCALAPPDATA%\SmartGrid`.
 
-1. You have 6 windows tiled
-2. You grab **one** by the title bar
-3. **A blue preview rectangle appears** showing exactly where it will snap
-4. You **drop**
-→ **BAM**. It snaps perfectly to the previewed position.
-→ On the same monitor: dropping on an occupied slot can **swap**
-→ Across monitors: drop uses **add + reflow** (no swap), updating target and source monitor layouts
-→ Works **across monitors**
-→ No keys. No thinking. Pure flow.
+## Shortcuts
 
-## Multi-Monitor Workflow
+All shortcuts can be changed or disabled in Preferences. A shortcut must include Ctrl, Alt or Win.
 
-**Move windows across screens (recommended):**
-1. Drag a tiled window by its title bar
-2. Drop it on the target monitor (preview shows the target slot)
-3. SmartGrid adds it on the target monitor and reflows both target and source monitor layouts automatically
+| Shortcut | Action |
+|---|---|
+| Ctrl+Alt+T | Start / stop tiling and restore |
+| Ctrl+Alt+P | Layout Studio |
+| Ctrl+Alt+L | Change layout |
+| Ctrl+Alt+R | Arrange again and reset manually resized tile proportions |
+| Ctrl+Alt+F | Float / tile the focused window |
+| Ctrl+Alt+S | Enter / leave swap mode |
+| Ctrl+Alt+← / → / ↑ / ↓ | Focus the tiled window to the left / right / above / below |
+| Ctrl+Alt+Z | Undo the last arrangement |
+| Ctrl+Alt+Y | Redo the last undone arrangement |
+| Ctrl+Alt+1 / 2 / 3 | Switch space on the focused display |
+| Ctrl+Alt+Q | Stop and restore windows |
 
-For manual re-organization at scale, use **Layout Manager** (`Ctrl+Alt+P`) and pick:
-- Target Monitor
-- Target Workspace
-- Target Layout
+**Swap mode:** Ctrl+Alt+S starts a mode in which plain arrow keys exchange window positions; arrows on the window edges show the possible moves. Enter (or Ctrl+Alt+S again) keeps the changes; Escape cancels them.
 
-## Notes
+**Conflicts:** Ctrl+Win+← / → switches Windows virtual desktops, so directional focus uses Ctrl+Alt+arrow. Some older Intel graphics drivers rotate the screen with Ctrl+Alt+arrow; disable that driver hotkey or choose another shortcut. Conflicts with other tools are reported in Preferences.
 
-- **Maximize behavior:** while a window is maximized, SmartGrid intentionally avoids background reshuffles so other windows don’t move.
-- **Compact behavior:** when enabled, closing or minimizing a tiled window fills the empty slot without a full retile unless the layout must change.
-- **Layout Manager behavior:** slot assignment uses windows visible for the selected target monitor/workspace context.
+## Preferences
 
-## Troubleshooting
+- **Make room:** window spacing, one common screen margin or separate top, right, bottom and left margins, and the Focus layout's large tile width. The live preview reflects these settings.
+- **Keep your flow:** focused-window highlight, placement guides, and closing gaps when windows are minimized or closed.
+- **Focus outline:** follow the Windows accent color or choose a custom color, set thickness from 1 to 6 pixels, and choose a plain outline or subtle halo.
+- **Animations:** Fast, Normal, Slow or a custom base duration (40–500 ms), with ease out, linear or ease in and out motion.
+- **Back up and share:** export or import named layouts and per-space profiles.
+- **Applications:** search an application and mark it **Always floating** or **Explicitly include** it. **Keep common overlays out of the grid** (on by default) lets media players, game launchers, streaming and monitoring tools, call windows and other window managers float.
+- **Windows tools and advanced settings:** force windows into their tiles, native window animation, reconciliation delay, placement retries and time budget.
 
-- **Hotkeys don’t work:** another application may already be using the same global shortcut.
-- **Some windows don’t tile:** SmartGrid filters overlays/toasts/taskbar/etc. You can tune the rules in `is_useful_window()` in `smartgrid.py`.
-- **Border colors:** DWM border coloring works best on Windows 11; on some Windows 10 builds it may be ignored.
+## How spaces and profiles work
+
+Spaces are window groups managed by SmartGrid, not additional Windows virtual desktops. Each virtual desktop has its own three spaces per display. Assigning, in another space of the same display, a window that is already placed shares it between both spaces; Studio marks it **SHARED**. Assigning a window from another display moves it instead.
+
+In Studio, select a window and choose **Pin this app to this tile** to reserve its place when it closes and reopens. **Clear tile** removes an assignment without closing the window. **Reset Space** clears the selected space's draft. **Apply arrangement** applies every edited display and space as one undoable arrangement; choosing an installed app reserves its tile and Apply reuses an existing window or opens the missing app.
+
+**Saved layouts** are named templates. **Restore in this space** reuses matching windows, launches missing apps when available, and minimizes surplus windows without closing them. Custom layouts keep their geometry; classic layouts grow and shrink with the number of windows. Import renames conflicting layouts with an "(imported)" suffix and keeps existing profiles.
+
+Maximizing or fullscreening a managed window freezes automatic layout changes on that display. With **Force windows into their tiles** enabled (the default), windows are sized to their tile even below the minimum size they report; turn it off to respect application minimum sizes, in which case refused placements are reported.
+
+## Development
+
+```sh
+python smartgrid.py --demo          # Studio on a simulated desktop
+python smartgrid.py --diagnose      # read-only JSON diagnostics (Windows)
+python -m unittest discover -s tests/unit
+QT_QPA_PLATFORM=offscreen python -m unittest discover -s tests/ui
+```
+
+`py tests/integration/windows/smoke.py --allow-desktop` runs a native check on Windows; it creates, places and closes its own windows.
 
 ## Contributing
 
-Ideas, issues and PRs are welcome. For bug reports, please include:
-- Windows version (10/11 + build)
-- Monitor setup (count + resolution + scaling)
-- App names involved (and whether they were maximized/minimized/restored)
+Report your Windows version, display resolutions and scaling, the applications involved and exact steps in an issue, and attach `%LOCALAPPDATA%\SmartGrid\smartgrid.log`.
 
-## Why This Script Exists
+## Credits
 
-Many great tiling solutions exist for Windows, but a surprising number of modern applications resist standard window-management APIs. SmartGrid forces every window into perfect obedience using raw Win32 + DWM tricks.
-Plus, it adds **workspace management** that most Windows tiling tools don't have and a **system tray icon** with a **context menu** for quick access to all major features.
-
-## Author
-
-Made with passion and pure determination by [@C0sm0cats](https://github.com/C0sm0cats)
-
----
-
-**SmartGrid — Because sometimes you just want your windows to line up perfectly.**
-
-Press `Ctrl + Alt + T` and feel the difference.
+Created by [C0sm0cats](https://github.com/C0sm0cats). MIT licensed; see [LICENSE](LICENSE).
