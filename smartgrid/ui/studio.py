@@ -673,8 +673,12 @@ class Studio(QMainWindow):
         self.apply_button.setVisible((current or preview) and not chooser)
         self.undo_button.setVisible(not chooser);self.redo_button.setVisible(not chooser)
         QTimer.singleShot(0,self._fit_canvas)
-        # The saved-layout chooser replaces the grid.
+        # The saved-layout chooser replaces the grid and takes its room: the
+        # list grows instead of leaving empty bands between the controls.
         self.splitter.setVisible(not chooser)
+        self.saved_list.setMaximumHeight(16777215 if chooser else 180)
+        outer=self.saved_controls.parentWidget().layout()
+        outer.setStretchFactor(self.saved_controls,1 if chooser else 0)
         self.current_layout.setVisible(current)
         self.preview_button.setVisible(current)
         if not current and self.preview_button.isChecked(): self.preview_button.setChecked(False)

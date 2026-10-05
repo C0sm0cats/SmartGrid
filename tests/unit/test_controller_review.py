@@ -691,6 +691,21 @@ class SeveralPinsTests(unittest.TestCase):
             self.assertNotIn(assignments[1].window_id,(None,sibling))
 
 
+class ForcedResizeTests(unittest.TestCase):
+    def test_tiles_forced_below_their_minimum_can_still_be_resized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(i) for i in range(1,5)],[])
+            for i in range(1,5): backend.minimums[i]=(1200,700)
+            controller=Controller(backend,Repository(directory));controller.start()
+            before=backend.windows[1].rect
+            after=Rect(before.x,before.y,before.width+150,before.height)
+            controller._native_resize(1,before,after,None)
+            tiles=controller.profile('d1',0).resize_tiles
+            self.assertTrue(tiles)
+            self.assertGreater(tiles[0].width,.5)
+
+
 class FloatCenteringTests(unittest.TestCase):
     def test_a_window_made_floating_keeps_its_size_and_is_centred(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -22,6 +22,8 @@ from .commands import ApplyResult
 from smartgrid.storage.archive import export_archive, import_archive
 
 log = logging.getLogger(__name__)
+# Smallest tile a linked resize leaves when windows are forced into their tiles.
+FORCED_MINIMUM = (160, 120)
 
 DEFAULT_HOTKEYS = {
     "toggle": "Ctrl+Alt+T", "arrange": "Ctrl+Alt+R", "studio": "Ctrl+Alt+P",
@@ -1354,6 +1356,16 @@ class Controller:
                 return True
         return False
 
+    def _reachable_minimums(self, rects, minimums):
+        """Minimum tile sizes for a linked resize.
+
+        With forced tiling, application minimum sizes do not apply: tiles keep
+        a small usable size. Otherwise a tile already below its application
+        minimum never shrinks further, instead of refusing the whole gesture."""
+        if self.settings.force_resize:
+            minimums = [FORCED_MINIMUM] * len(minimums)
+        return [(min(m[0], r.width), min(m[1], r.height)) for r, m in zip(rects, minimums)]
+
     def _native_resize(self, hwnd, before, after, snapshot):
         window = self._window(hwnd)
         if not window:
@@ -1365,6 +1377,7 @@ class Controller:
         rects = self._profile_rects(profile)
         min_sizes = [getattr(self.backend, "min_size", lambda h: (80, 80))(a.window_id) if a and a.window_id else (3, 3) for a in profile.assignments]
         min_sizes += [(3, 3)] * (len(rects) - len(min_sizes))
+        min_sizes = self._reachable_minimums(rects, min_sizes)
         changed = rects
         for edge, delta in (("left", after.x - before.x), ("right", after.right - before.right),
                             ("top", after.y - before.y), ("bottom", after.bottom - before.bottom)):
@@ -1462,6 +1475,7 @@ class Controller:
                     else:
                         minimums.append((3,3))
                 minimums += [(3,3)]*(len(rects)-len(minimums))
+                minimums=self._reachable_minimums(rects,minimums)
                 for edge,delta in (("left",after.x-before.x),("right",after.right-before.right),
                                    ("top",after.y-before.y),("bottom",after.bottom-before.bottom)):
                     if abs(delta)>5:
