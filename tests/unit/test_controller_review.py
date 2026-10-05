@@ -652,6 +652,45 @@ class OverlayApplicationTests(unittest.TestCase):
             self.assertFalse(controller._ruled_out(window))
 
 
+class SeveralPinsTests(unittest.TestCase):
+    def setup(self, directory, count):
+        display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+        backend=FakeBackend([display],[record(i,'chrome') for i in range(1,count+1)]+[record(9,'editor')],[ApplicationRef('chrome','Chrome')])
+        controller=Controller(backend,Repository(directory));controller.start()
+        return backend,controller
+
+    def test_several_windows_of_one_application_keep_their_own_pinned_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.setup(directory,3)
+            profile=controller.profile('d1',0)
+            for i in (0,2): profile.assignments[i].pinned=True
+            pins=[(i,a.window_id) for i,a in enumerate(profile.assignments) if a and a.pinned]
+            controller.refresh()
+            self.assertEqual([(i,a.window_id) for i,a in enumerate(controller.profile('d1',0).assignments) if a and a.pinned],pins)
+            self.assertEqual(len({w for _,w in pins}),2)
+
+    def test_a_closed_pinned_window_leaves_a_closed_card_not_its_sibling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.setup(directory,2)
+            profile=controller.profile('d1',0)
+            for a in profile.assignments[:2]: a.pinned=True
+            closed=profile.assignments[1].window_id
+            del backend.windows[closed];controller.refresh()
+            assignments=controller.profile('d1',0).assignments
+            self.assertIsNotNone(assignments[0].window_id)
+            self.assertIsNone(assignments[1].window_id)
+            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'CLOSED')])
+            # Its card opens a new window for that tile; the sibling stays in place.
+            sibling=assignments[0].window_id
+            controller.activate_reserved('d1',0,1)
+            assignments=controller.profile('d1',0).assignments
+            self.assertEqual(backend.launches,['chrome'])
+            backend.add_window('chrome',hwnd=20);controller.refresh()
+            assignments=controller.profile('d1',0).assignments
+            self.assertEqual(assignments[0].window_id,sibling)
+            self.assertNotIn(assignments[1].window_id,(None,sibling))
+
+
 class FloatCenteringTests(unittest.TestCase):
     def test_a_window_made_floating_keeps_its_size_and_is_centred(self):
         with tempfile.TemporaryDirectory() as directory:

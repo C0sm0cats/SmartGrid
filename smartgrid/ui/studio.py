@@ -986,11 +986,9 @@ class Studio(QMainWindow):
             return
         index=self.selected_index
         def pin(profile):
+            # Each tile has its own pin: several windows of one application
+            # (several Chrome windows) can each be pinned to a tile.
             if index<len(profile.assignments) and profile.assignments[index]:
-                app_id=profile.assignments[index].app_id
-                # One pin per application in a space.
-                for a in profile.assignments:
-                    if pinned and a and a.app_id==app_id: a.pinned=False
                 profile.assignments[index].pinned=pinned
         self._mutate_profile(pin)
 

@@ -169,6 +169,15 @@ class UITests(unittest.TestCase):
         self.assertEqual((settings.overlay_words_added,settings.overlay_words_removed),([],[]))
         self.assertFalse(prefs.words_reset.isEnabled())
 
+    def test_several_tiles_of_one_application_can_be_pinned(self):
+        studio=Studio(self.controller); self.widgets.append(studio)
+        for index in (0,1): self.controller.set_assignment('demo-primary',0,index,Assignment('editor'))
+        studio.refresh_from_controller();self.settle()
+        for index in (0,1):
+            studio.selected_index=index;studio._pin_changed(True);self.settle()
+        profile=self.controller.draft('demo-primary',0).profile
+        self.assertEqual([a.pinned for a in profile.assignments[:2]],[True,True])
+
     def test_auto_five_windows_convert_to_full_custom_partition(self):
         studio=Studio(self.controller); self.widgets.append(studio)
         profile=self.controller.draft('demo-primary',0).profile
