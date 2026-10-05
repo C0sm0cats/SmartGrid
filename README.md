@@ -14,7 +14,7 @@ Automatic window tiling for **Windows 10 / 11**.
 
 </div>
 
-![SmartGrid arranging sixteen application windows in a 4 × 4 grid on Windows 11, with contents blurred](docs/smartgrid-overview.png)
+![SmartGrid arranging fifteen application windows in a 5 × 3 grid on Windows 11, with contents blurred](docs/smartgrid-overview.png)
 
 SmartGrid is a tray application written in Python with Qt (PySide6) and the native Win32/DWM APIs. It starts paused: launching it does not rearrange your windows.
 
