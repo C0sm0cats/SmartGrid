@@ -4,7 +4,7 @@ import time
 from PySide6.QtCore import Qt, QTimer, QRect
 from PySide6.QtGui import QAction, QActionGroup, QColor, QIcon, QPainter, QPixmap
 from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QPushButton, QMessageBox, QWidgetAction, QLabel
-from smartgrid.core.models import app_display_name
+from smartgrid.core.models import app_display_name, Rect
 from .bridge import bridge_for
 from .studio import Studio
 from .quick_switcher import QuickSwitcher
@@ -12,7 +12,7 @@ from .preferences import Preferences
 from .theme import apply_theme
 from .focus_frame import FocusFrame
 from .window_actions import WindowActions
-from .guides import TargetGuide,SpaceOsd,SwapHint,PinPlaceholder,PlacementGhost,SourceGuide
+from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,SourceGuide
 from .tile_view import application_icon
 from smartgrid.core.geometry import effective_layout,preset_name
 
@@ -26,7 +26,7 @@ class DesktopUI:
         self.windows, self.cards = {}, {}
         self.focus_frame = FocusFrame()
         self.target_guide=TargetGuide();self.space_osd=SpaceOsd()
-        self.swap_hints={d:SwapHint(d) for d in ('left','right','up','down')}
+        self._last_hints=None
         self._last_space_event=controller.space_event
         self.swap_from=SourceGuide();self.swap_to=TargetGuide()
         self._seen_motion=len(controller.motion_events) and controller.motion_events[-1][4]
@@ -333,17 +333,33 @@ class DesktopUI:
                 self.swap_to.color,self.swap_to.label=color,event[3]
                 self.swap_from.show();self.swap_to.show();self.swap_to.update()
                 self.swap_timer.start(360)
-        # Swap mode arrows on edges that have a neighbour.
+
+    def _swap_arrows(self,rect):
+        """Swap mode: one badge per neighbouring window, on the edge they share.
+
+        rect is the window's live native frame; badges are returned in Qt
+        logical coordinates and painted by the focus outline, which is
+        reliably shown above the window.
+        """
+        controller=self.controller
         hints=controller.swap_hints()
-        frame=self._logical(hints[0],hints[1]) if hints else None
-        for direction,hint in self.swap_hints.items():
-            if frame is None or direction not in hints[2]:
-                hint.hide();continue
-            x={'left':frame.left(),'right':frame.right()}.get(direction,frame.center().x())
-            y={'up':frame.top(),'down':frame.bottom()}.get(direction,frame.center().y())
-            hint.color=color;hint.move(x-13,y-13);hint.update()
-            if not hint.isVisible(): hint.show()
-            hint.raise_()
+        arrows=[]
+        if hints:
+            for direction,target,x,y,primary in hints[2]:
+                if direction in ('left','right'):
+                    x=rect.x if direction=='left' else rect.right
+                    y=min(max(y,rect.y+13),rect.bottom-13)
+                else:
+                    y=rect.y if direction=='up' else rect.bottom
+                    x=min(max(x,rect.x+13),rect.right-13)
+                point=self._logical(hints[0],Rect(round(x),round(y),1,1))
+                if point is not None: arrows.append((direction,primary,point.x(),point.y()))
+        key=(hints[0],hints[1],[a[:2] for a in hints[2]]) if hints else bool(controller._swap_snapshot)
+        if key!=self._last_hints:
+            self._last_hints=key
+            if hints: log.info('Swap arrows for tile %s: %s',hints[1],arrows)
+            elif key: log.info('Swap mode without arrows: window %s is not a normal tiled window',controller._swap_hwnd)
+        return arrows
 
     def refresh_focus(self):
         try:
@@ -351,7 +367,15 @@ class DesktopUI:
         finally:
             # Guides are drawn after the focus outline so they stay above it:
             # swap arrows sit on the outline.
-            self.refresh_guides()
+            try:
+                self.refresh_guides()
+            except Exception:
+                # Logged once per message: a timer slot error is otherwise invisible under pythonw.
+                import traceback
+                text=traceback.format_exc()
+                if text!=getattr(self,'_guide_error',None):
+                    self._guide_error=text
+                    log.error('Guides could not be drawn:\n%s',text)
 
     def _refresh_focus(self):
         controller=self.controller
@@ -415,7 +439,9 @@ class DesktopUI:
         if getattr(controller.backend,'is_fake',False):
             window=None
         dialogs=any(w.isVisible() for k,w in self.windows.items() if k in ('studio','quick_switcher'))
-        if not window or window.state!='normal' or not controller.running or controller.paused or not controller.settings.border_width or not controller.settings.active_border or dialogs:
+        swapping=bool(controller._swap_snapshot)
+        if not window or window.state!='normal' or not controller.running or controller.paused or dialogs or (
+                not swapping and (not controller.settings.border_width or not controller.settings.active_border)):
             self.focus_frame.hide()
             return
         display=next((d for d in controller.displays if d.id==window.display_id),None)
@@ -442,7 +468,8 @@ class DesktopUI:
         # fully opaque, thicker and with a soft band.
         self.focus_frame.width_px=controller.settings.border_width
         self.focus_frame.style=controller.settings.border_style
-        self.focus_frame.emphasized=bool(controller._swap_snapshot)
+        self.focus_frame.emphasized=swapping
+        self.focus_frame.arrows=self._swap_arrows(rect) if swapping else []
         self.focus_frame.color=controller.focus_color
         stack=getattr(controller.backend,'stack_above',None)
         restack=(lambda:stack(int(self.focus_frame.winId()),window.ref.hwnd)) if stack else None
@@ -487,7 +514,7 @@ class DesktopUI:
             log.exception('Shutdown did not complete cleanly')
         self.timer.stop()
         self.focus_frame.close()
-        for widget in [self.target_guide,self.space_osd,self.swap_from,self.swap_to,*self.swap_hints.values()]:
+        for widget in [self.target_guide,self.space_osd,self.swap_from,self.swap_to]:
             widget.close()
         self.window_actions.close()
         for frame in self.resize_frames:

@@ -672,11 +672,31 @@ class Studio(QMainWindow):
         self.apply_button.setText('Restore in this space' if preview else 'Apply arrangement')
         self.apply_button.setVisible((current or preview) and not chooser)
         self.undo_button.setVisible(not chooser);self.redo_button.setVisible(not chooser)
+        QTimer.singleShot(0,self._fit_canvas)
         # The saved-layout chooser replaces the grid.
         self.splitter.setVisible(not chooser)
         self.current_layout.setVisible(current)
         self.preview_button.setVisible(current)
         if not current and self.preview_button.isChecked(): self.preview_button.setChecked(False)
+
+    def _fit_canvas(self):
+        """Give the grid the same size in every view (current space, saved
+        preview, new or edited layout): up to 480 px high at the display's
+        aspect ratio. The Studio grows to make room, within the screen."""
+        display=next((d for d in self.controller.displays if d.id==self.display_id),None)
+        ratio=display.work_area.height/max(1,display.work_area.width) if display else 9/16
+        wanted=min(480,round((self.width()-40)*ratio))
+        screen=self.screen().availableGeometry() if self.screen() else None
+        if screen is not None:
+            # Keep room for the header, controls and footer on small screens.
+            wanted=min(wanted,max(160,screen.height()-420))
+        self.canvas.setMinimumHeight(wanted)
+        need=self.sizeHint().height()
+        if screen is not None and need>self.height():
+            height=min(need,screen.height()-24)
+            self.resize(self.width(),height)
+            if self.geometry().bottom()>screen.bottom():
+                self.move(self.x(),max(screen.top()+12,screen.bottom()-height-12))
 
     def _close_or_back(self):
         self.close()
@@ -1264,8 +1284,6 @@ class Studio(QMainWindow):
                 self.preset_grid.addWidget(button,i//columns,i%columns)
         if hasattr(self,'preset_menu_button') and not self._refreshing:
             QTimer.singleShot(0,self.refresh_from_controller)
-        if hasattr(self,'canvas'):
-            self.canvas.setMinimumHeight(80 if event.size().height()<600 else 180)
         if hasattr(self,'effect'):
             self.effect.setVisible(bool(self.effect.text()) and event.size().height()>=600)
         super().resizeEvent(event)

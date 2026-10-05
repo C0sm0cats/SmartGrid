@@ -1,12 +1,14 @@
 """Nonactivating transparent focus outline drawn around the focused window."""
 import math
 from PySide6.QtCore import Qt, QRectF, QPropertyAnimation, QEasingCurve
-from PySide6.QtGui import QPainter, QColor, QPen
+from PySide6.QtGui import QPainter, QColor, QFont, QPen
 from PySide6.QtWidgets import QWidget
 
 # Windows 11 rounds top-level window corners by 8 logical pixels.
 WINDOW_RADIUS = 8
 HALO = 10
+BADGE = 26
+SYMBOLS = {'left': '←', 'right': '→', 'up': '↑', 'down': '↓'}
 
 
 class FocusFrame(QWidget):
@@ -23,6 +25,9 @@ class FocusFrame(QWidget):
         self.width_px=2
         self.style='outline'
         self.emphasized=False
+        # Swap mode: [(direction, primary, x, y)] badges in global logical
+        # coordinates, centred on the window edges.
+        self.arrows=[]
         self.radius=WINDOW_RADIUS
         self.window=None
         self.setAccessibleName('Focused window outline')
@@ -31,7 +36,10 @@ class FocusFrame(QWidget):
         self.target=None
 
     def outset(self):
-        """Stroke, swap band and halo are drawn outside the window."""
+        """Stroke, swap band, halo and swap badges are drawn outside the window."""
+        return max(self.ring_outset(),BADGE/2+1 if self.arrows else 0)
+
+    def ring_outset(self):
         return self.stroke()+(4 if self.emphasized else 0)+(HALO if self.style in ('glow','halo') else 0)
 
     def stroke(self):
@@ -84,7 +92,8 @@ class FocusFrame(QWidget):
         stroke=self.stroke()
         band=4 if self.emphasized else 0
         halo=HALO if self.style in ('glow','halo') else 0
-        outer=QRectF(self.rect())
+        pad=math.ceil(self.outset())-self.ring_outset()
+        outer=QRectF(self.rect()).adjusted(pad,pad,-pad,-pad)
         def ring(distance,width,alpha):
             # distance: from the outer edge of the widget to the centre of the ring.
             c=QColor(color);c.setAlphaF(alpha)
@@ -99,3 +108,11 @@ class FocusFrame(QWidget):
         if band:
             ring(halo+band/2,band,.3)
         ring(halo+band+stroke/2,stroke,1.0)
+        # Filled badge: the neighbour the arrow key swaps with; outlined: other neighbours.
+        font=QFont('Segoe UI',11);font.setBold(True);painter.setFont(font)
+        for direction,primary,x,y in self.arrows:
+            badge=QRectF(x-self.x()-BADGE/2,y-self.y()-BADGE/2,BADGE,BADGE)
+            painter.setPen(QPen(color,1));painter.setBrush(color if primary else QColor(24,30,37,240))
+            painter.drawRoundedRect(badge.adjusted(.5,.5,-.5,-.5),BADGE/2,BADGE/2)
+            painter.setPen(QColor('#ffffff') if primary else color)
+            painter.drawText(badge,Qt.AlignmentFlag.AlignCenter,SYMBOLS[direction])

@@ -372,6 +372,68 @@ def directional_neighbor(rects, index, direction, available=None) -> int | None:
     return min(candidates)[1] if candidates else None
 
 
+EDGE_SLACK = 2
+
+
+def edge_neighbors(rects, index, direction, available=None) -> list[tuple[int, float]]:
+    """Every tile directly across one edge of a tile, with the centre of the shared span.
+
+    A tile can have several neighbours on one side (the large tile of Focus,
+    custom layouts, uneven grids). Only tiles that share part of the edge and
+    have nothing in between are returned, as (index, centre along the edge).
+    """
+    if direction not in ('left', 'right', 'up', 'down'):
+        raise ValueError('Direction must be left, right, up or down')
+    if not 0 <= index < len(rects):
+        return []
+    allowed = set(range(len(rects))) if available is None else set(available)
+    source = rects[index]
+    horizontal = direction in ('left', 'right')
+
+    def distance(r):
+        return {'right': r.x - source.right, 'left': source.x - r.right,
+                'down': r.y - source.bottom, 'up': source.y - r.bottom}[direction]
+
+    def span(r):
+        return (max(source.y, r.y), min(source.bottom, r.bottom)) if horizontal else \
+               (max(source.x, r.x), min(source.right, r.right))
+
+    # A few pixels of tolerance: rounded fractional tiles can touch or overlap by 1 px.
+    facing = [(i, r) for i, r in enumerate(rects) if i != index and distance(r) >= -EDGE_SLACK
+              and span(r)[1] - span(r)[0] > EDGE_SLACK]
+    result = []
+    for i, r in facing:
+        if i not in allowed:
+            continue
+        low, high = span(r)
+        # Blocked when another facing tile sits closer over the same stretch.
+        if any(j != i and distance(o) < distance(r) - EDGE_SLACK and min(high, span(o)[1]) - max(low, span(o)[0]) > EDGE_SLACK
+               for j, o in facing):
+            continue
+        result.append((i, (low + high) / 2))
+    return sorted(result, key=lambda item: item[1])
+
+
+def swap_neighbor(rects, index, direction, available=None) -> int | None:
+    """The tile an arrow key swaps with: a tile across that edge, never one beyond.
+
+    With several neighbours on one side, the one sharing the longest stretch
+    of the edge, then the one closest to the centre of the edge.
+    """
+    neighbors = edge_neighbors(rects, index, direction, available)
+    if not neighbors:
+        return None
+    source = rects[index]
+    horizontal = direction in ('left', 'right')
+    middle = source.y + source.height / 2 if horizontal else source.x + source.width / 2
+
+    def shared(i):
+        r = rects[i]
+        return (min(source.bottom, r.bottom) - max(source.y, r.y)) if horizontal else \
+               (min(source.right, r.right) - max(source.x, r.x))
+    return min(neighbors, key=lambda item: (-shared(item[0]), abs(item[1] - middle), item[0]))[0]
+
+
 def linked_resize(rects, index, edge, delta, min_sizes=None) -> list[Rect]:
     """Resize shared dividers with bounded cascading to adjacent minimum sizes.
 

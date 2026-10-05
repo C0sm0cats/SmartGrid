@@ -1,4 +1,4 @@
-"""Desktop guides: drop target, space indicator, swap arrows, pinned-tile cards."""
+"""Desktop guides: drop target, space indicator, swap guides, pinned-tile cards."""
 from PySide6.QtCore import Qt, QRectF, QTimer, QPropertyAnimation, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen, QBrush
 from PySide6.QtWidgets import QWidget
@@ -95,25 +95,6 @@ class SpaceOsd(Overlay):
             painter.drawEllipse(QRectF(self.width() / 2 - 20 + i * 16, 16, 8, 8))
         painter.setPen(QColor('#eef3f4')); painter.setFont(self.font(9))
         painter.drawText(QRectF(0, 30, self.width(), 24), Qt.AlignmentFlag.AlignCenter, self.text)
-
-
-class SwapHint(Overlay):
-    """A 26 px arrow badge on an edge with a swap neighbour."""
-    SYMBOLS = {'left': '←', 'right': '→', 'up': '↑', 'down': '↓'}
-
-    def __init__(self, direction):
-        super().__init__()
-        self.direction = direction
-        self.resize(26, 26)
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        accent = QColor(self.color)
-        painter.setPen(QPen(accent, 1)); painter.setBrush(QColor(24, 30, 37, 240))
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 13, 13)
-        painter.setPen(accent); painter.setFont(self.font(11))
-        painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self.SYMBOLS[self.direction])
 
 
 class PinPlaceholder(Overlay):

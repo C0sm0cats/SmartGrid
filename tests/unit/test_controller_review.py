@@ -480,8 +480,8 @@ class GuideStateTests(unittest.TestCase):
             self.assertIsNone(controller.swap_hints())
             backend.focused=1
             controller._swap_hwnd=1;controller._swap_snapshot=controller._snapshot()
-            display_id,rect,directions=controller.swap_hints()
-            self.assertEqual((display_id,directions),('d1',['right']))
+            display_id,rect,arrows=controller.swap_hints()
+            self.assertEqual((display_id,[(d,t) for d,t,x,y,_ in arrows]),('d1',[('right',1)]))
             controller._swap_snapshot=None
             controller.switch_space('d1',1)
             self.assertEqual(controller.space_event[:2],('d1',1))
@@ -573,3 +573,86 @@ class OverflowCompactionTests(unittest.TestCase):
             before=backend.windows[3].rect
             backend.windows[2].state='minimized';controller.refresh()
             self.assertEqual(backend.windows[3].rect,before)
+
+
+class SwapArrowTests(unittest.TestCase):
+    def arrows(self, count, focused, preset='auto', tiles=()):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(i) for i in range(1,count+1)],[])
+            controller=Controller(backend,Repository(directory))
+            profile=controller.profile('d1',0);profile.preset=preset;profile.tiles=list(tiles)
+            controller.start()
+            controller._swap_hwnd=focused;controller._swap_snapshot=controller._snapshot()
+            return sorted((d,t) for d,t,x,y,_ in controller.swap_hints()[2])
+
+    def test_focus_layout_large_tile_shows_both_right_neighbours(self):
+        self.assertEqual(self.arrows(3,1),[('right',1),('right',2)])
+
+    def test_grid_middle_tile_shows_all_four_sides(self):
+        self.assertEqual(self.arrows(9,5),[('down',7),('left',3),('right',5),('up',1)])
+
+    def test_custom_layout_with_t_junction(self):
+        tiles=[Tile('a',0,0,.5,.5),Tile('b',.5,0,.5,1),Tile('c',0,.5,.25,.5),Tile('d',.25,.5,.25,.5)]
+        self.assertEqual(self.arrows(4,2,'custom',tiles),[('left',0),('left',3)])
+        self.assertEqual(self.arrows(4,3,'custom',tiles),[('right',3),('up',0)])
+
+    def swap(self, count, focused, direction):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(i) for i in range(1,count+1)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            backend.foreground_hwnd=focused;controller.begin_swap()
+            controller.swap_direction(direction)
+            return [a.window_id if a else None for a in controller.profile('d1',0).assignments]
+
+    def test_arrow_keys_never_swap_beyond_a_neighbour(self):
+        # Master with two stacked windows: nothing above or below the master.
+        self.assertEqual(self.swap(3,1,'up'),[1,2,3])
+        self.assertEqual(self.swap(3,1,'down'),[1,2,3])
+        # 5 windows in 3x2: the bottom-middle window has no window on its right.
+        self.assertEqual(self.swap(5,5,'right'),[1,2,3,4,5])
+        self.assertEqual(self.swap(5,5,'left'),[1,2,3,5,4])
+        self.assertEqual(self.swap(5,5,'up'),[1,5,3,4,2])
+
+    def test_pinned_windows_are_swap_neighbours(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(i) for i in range(1,5)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            for assignment in controller.profile('d1',0).assignments: assignment.pinned=True
+            backend.foreground_hwnd=1;controller.begin_swap()
+            self.assertEqual(sorted((d,t) for d,t,x,y,_ in controller.swap_hints()[2]),[('down',2),('right',1)])
+            controller.swap_direction('right')
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[2,1,3,4])
+
+    def test_every_arrow_key_target_has_an_arrow(self):
+        from smartgrid.core.geometry import auto_preset, capacity, resolve_layout, edge_neighbors, swap_neighbor
+        for count in range(2,10):
+            preset=auto_preset(count)
+            rects=resolve_layout(Rect(0,0,1920,1040),capacity(preset),preset=preset)
+            for index in range(count):
+                for direction in ('left','right','up','down'):
+                    target=swap_neighbor(rects,index,direction,set(range(count)))
+                    shown=[i for i,_ in edge_neighbors(rects,index,direction,set(range(count)))]
+                    self.assertEqual(target is None,not shown)
+                    if target is not None: self.assertIn(target,shown)
+
+
+class FloatingMoveTests(unittest.TestCase):
+    def test_moving_a_floating_window_is_not_a_drop_and_it_returns_to_its_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(i) for i in range(1,7)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            tile=backend.windows[2].rect
+            controller.toggle_float(2)
+            controller._handle_event({'type':'move_start','hwnd':2})
+            self.assertNotIn(2,controller._interacting)
+            backend.windows[2]=backend.windows[2].__class__(**{**backend.windows[2].__dict__,'rect':Rect(1400,700,500,300)})
+            controller._handle_event({'type':'location','hwnd':2})
+            self.assertIsNone(controller.drag_guide)
+            controller._handle_event({'type':'move_end','hwnd':2})
+            self.assertEqual([a.window_id if a else None for a in controller.profile('d1',0).assignments],[1,None,3,4,5,6])
+            controller.toggle_float(2)
+            self.assertEqual(backend.windows[2].rect,tile)

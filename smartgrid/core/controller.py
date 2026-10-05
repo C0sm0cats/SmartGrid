@@ -14,7 +14,7 @@ import time
 import uuid
 
 from .models import app_display_name, Assignment, Draft, LayoutTemplate, Settings, SpaceProfile, Tile, Rect
-from .geometry import capacity, resolve_layout, auto_preset, effective_layout, directional_neighbor, nearest_slot, valid_tiles, linked_resize
+from .geometry import capacity, resolve_layout, auto_preset, effective_layout, directional_neighbor, edge_neighbors, swap_neighbor, nearest_slot, valid_tiles, linked_resize
 from .reconcile import compact_assignments
 from .exclusions import excluded_window
 from .history import History
@@ -390,6 +390,10 @@ class Controller:
         with self._lock:
             if kind in ("move_start", "resize_start", "movesize_start") and hwnd:
                 self.refresh(auto=False)
+                # Moving a floating or unmanaged window is an ordinary move: no
+                # drop target, no snapping, and its reserved tile is kept.
+                if not self._is_tiled(hwnd):
+                    return
                 self._interacting.add(hwnd)
                 self._interaction_started[hwnd]=time.monotonic()
                 self._last_preview=0.0
@@ -400,6 +404,8 @@ class Controller:
                     self._resize_snapshot = self._snapshot()
                 return
             if kind in ("move_end", "resize_end", "movesize_end") and hwnd:
+                if hwnd not in self._interacting:
+                    return
                 self._interacting.discard(hwnd)
                 original = self._move_origins.pop(hwnd, None)
                 # A size change made by SmartGrid itself during the gesture (an
@@ -1253,32 +1259,47 @@ class Controller:
                     self.finish_swap(False)
                     raise ValueError("Swap mode keys are already in use.")
             self.status = "Swap: arrows move, Enter accepts, Escape cancels."
+            self._update_border()
             self._notify()
+
+    def _swap_context(self):
+        window = self._window(self._swap_hwnd)
+        if not window:
+            return None
+        profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
+        index = next((i for i, a in enumerate(profile.assignments) if a and a.window_id == self._swap_hwnd), None)
+        if index is None:
+            return None
+        # Every tile holding a window, pinned or not; an empty (reserved) tile is not a target.
+        available = {i for i, a in enumerate(profile.assignments) if a and a.window_id}
+        return window, profile, index, available
 
     def swap_direction(self, direction):
         with self._lock:
             if self._swap_snapshot is None:
                 return
-            window = self._window(self._swap_hwnd)
-            if not window:
-                return self.finish_swap(False)
-            profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
-            index = next((i for i, a in enumerate(profile.assignments) if a and a.window_id == self._swap_hwnd), None)
-            if index is None:
-                return
-            available = {i for i, a in enumerate(profile.assignments) if a and a.window_id}
-            target = directional_neighbor(self._profile_rects(profile), index, direction, available)
+            context = self._swap_context()
+            if context is None:
+                return self.finish_swap(False) if not self._window(self._swap_hwnd) else None
+            window, profile, index, available = context
+            # Only a window across that edge, never one further away.
+            target = swap_neighbor(self._profile_rects(profile), index, direction, available)
+            log.info('Swap %s from tile %s of %s: %s', direction, index, len(profile.assignments),
+                     'tile %s' % target if target is not None else 'no neighbour')
             if target is not None:
-                rects = self._profile_rects(profile)
-                other = profile.assignments[target]
-                app = next((a for a in self.apps if other and a.id == other.app_id), None)
-                label = ('Swap · ' + (app.name if app else app_display_name(other.app_id))) if other and other.window_id else 'Move here'
-                # Source and target guides with a label, 360 ms.
-                self.swap_event = (window.display_id, rects[index], rects[target], label, time.monotonic())
-                profile.assignments[index], profile.assignments[target] = profile.assignments[target], profile.assignments[index]
-                self._apply_profile(profile)
-                self.backend.focus(self._swap_hwnd)
-                self._notify()
+                self._swap_tiles(window, profile, index, target)
+
+    def _swap_tiles(self, window, profile, index, target):
+        rects = self._profile_rects(profile)
+        other = profile.assignments[target]
+        app = next((a for a in self.apps if other and a.id == other.app_id), None)
+        label = ('Swap · ' + (app.name if app else app_display_name(other.app_id))) if other and other.window_id else 'Move here'
+        # Source and target guides with a label, 360 ms.
+        self.swap_event = (window.display_id, rects[index], rects[target], label, time.monotonic())
+        profile.assignments[index], profile.assignments[target] = profile.assignments[target], profile.assignments[index]
+        self._apply_profile(profile)
+        self.backend.focus(self._swap_hwnd)
+        self._notify()
 
     def finish_swap(self, commit=True):
         with self._lock:
@@ -1388,6 +1409,14 @@ class Controller:
         self._save()
         self._notify()
 
+    def _is_tiled(self, hwnd):
+        """A window placed in a tile of the active space of its display."""
+        window = self._window(hwnd)
+        if not window or not self.running or self.paused or hwnd in self._floating or not self._eligible(window):
+            return False
+        profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
+        return any(a and a.window_id == hwnd for a in profile.assignments)
+
     def _preview_native_drag(self, hwnd):
         if not self.running or self.paused:
             return
@@ -1450,21 +1479,30 @@ class Controller:
             self._notify()
 
     def swap_hints(self):
-        """(display_id, window rect, [directions]) of the window in swap mode, or None."""
+        """(display_id, window rect, [(direction, target, x, y, primary)]) for the window in swap mode.
+
+        One arrow per neighbouring window, centred on the edge they share, so
+        every possible swap is shown, including several neighbours on one side.
+        primary marks the neighbour the arrow key swaps with.
+        """
         if self._swap_snapshot is None or not self._swap_hwnd:
             return None
-        window = self._window(self._swap_hwnd)
-        if not window or window.state != 'normal':
+        context = self._swap_context()
+        if context is None or context[0].state != 'normal':
             return None
-        profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
-        index = next((i for i, a in enumerate(profile.assignments) if a and a.window_id == self._swap_hwnd), None)
-        if index is None:
-            return None
+        window, profile, index, available = context
         rects = self._profile_rects(profile)
-        available = {i for i, a in enumerate(profile.assignments) if a and a.window_id and not a.pinned}
-        directions = [d for d in ('left', 'right', 'up', 'down')
-                      if directional_neighbor(rects, index, d, available) is not None]
-        return window.display_id, rects[index], directions
+        source = rects[index]
+        arrows = []
+        for direction in ('left', 'right', 'up', 'down'):
+            keyed = swap_neighbor(rects, index, direction, available)
+            for target, centre in edge_neighbors(rects, index, direction, available):
+                if direction in ('left', 'right'):
+                    x, y = (source.x if direction == 'left' else source.right), centre
+                else:
+                    x, y = centre, (source.y if direction == 'up' else source.bottom)
+                arrows.append((direction, target, x, y, target == keyed))
+        return window.display_id, source, arrows
 
     def reserved_slots(self):
         """Empty pinned tiles and their state: MINIMIZED, FLOATING,
@@ -1541,7 +1579,8 @@ class Controller:
             self._last_tiled_selection = focused
         else:
             focused = None
-        if not self.settings.border_width or not self.settings.active_border:
+        # Swap mode always outlines its window: the swap arrows are drawn on it.
+        if not self._swap_snapshot and (not self.settings.border_width or not self.settings.active_border):
             focused = None
         color="#ff9b91" if self._swap_snapshot else self.focus_color
         if self._last_border != focused or getattr(self,'_last_border_color',None)!=color:
