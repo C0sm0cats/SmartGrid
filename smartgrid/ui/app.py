@@ -75,6 +75,7 @@ class DesktopUI:
         self.tray.activated.connect(lambda reason: self.open('studio') if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
         self.bridge.ui_action.connect(self.open, Qt.ConnectionType.QueuedConnection)
         self.bridge.changed.connect(self.refresh, Qt.ConnectionType.QueuedConnection)
+        self.bridge.guides.connect(self.refresh_drag, Qt.ConnectionType.QueuedConnection)
         self.bridge.error.connect(self.error)
         self.tray.show()
         self.refresh()
@@ -361,6 +362,40 @@ class DesktopUI:
             elif key: log.info('Swap mode without arrows: window %s is not a normal tiled window',controller._swap_hwnd)
         return arrows
 
+    def _refresh_resize_frames(self):
+        """Linked-resize preview outlines while a window edge is dragged."""
+        controller=self.controller
+        previews=[] if getattr(controller.backend,'is_fake',False) else list(controller.preview_rectangles)
+        while len(self.resize_frames)>len(previews):
+            self.resize_frames.pop().deleteLater()
+        while len(self.resize_frames)<len(previews):
+            self.resize_frames.append(FocusFrame(topmost=True))
+        for frame,(display_id,rect) in zip(self.resize_frames,previews):
+            display=next((d for d in controller.displays if d.id==display_id),None)
+            device=getattr(controller.backend,'monitor_devices',{}).get(display_id,'')
+            screen=self._screen(display) if display else None
+            if not display or not screen:
+                frame.hide()
+                continue
+            native,logical=display.work_area,screen.availableGeometry()
+            scale=screen.devicePixelRatio() or 1
+            frame.move_preview(QRect(logical.x()+round((rect.x-native.x)/scale),logical.y()+round((rect.y-native.y)/scale),round(rect.width/scale),round(rect.height/scale)),controller.settings)
+            frame.color=controller.settings.accent
+            frame.width_px=2
+            frame.style='outline'
+            frame.update()
+            if not frame.isVisible():
+                frame.show()
+
+    def refresh_drag(self):
+        """Drag guides only: called as soon as they change, without waiting
+        for the 100 ms timer."""
+        try:
+            self._refresh_resize_frames()
+            self.refresh_guides()
+        except Exception:
+            log.exception('Drag guides could not be drawn')
+
     def refresh_focus(self):
         try:
             self._refresh_focus()
@@ -413,27 +448,7 @@ class DesktopUI:
                 self.window_actions.show_handle(controller.settings.visual_duration(120))
         else:
             self.window_actions.dismiss();self.action_reference=None
-        previews=[] if getattr(controller.backend,'is_fake',False) else list(controller.preview_rectangles)
-        while len(self.resize_frames)>len(previews):
-            self.resize_frames.pop().deleteLater()
-        while len(self.resize_frames)<len(previews):
-            self.resize_frames.append(FocusFrame(topmost=True))
-        for frame,(display_id,rect) in zip(self.resize_frames,previews):
-            display=next((d for d in controller.displays if d.id==display_id),None)
-            device=getattr(controller.backend,'monitor_devices',{}).get(display_id,'')
-            screen=self._screen(display) if display else None
-            if not display or not screen:
-                frame.hide()
-                continue
-            native,logical=display.work_area,screen.availableGeometry()
-            scale=screen.devicePixelRatio() or 1
-            frame.move_preview(QRect(logical.x()+round((rect.x-native.x)/scale),logical.y()+round((rect.y-native.y)/scale),round(rect.width/scale),round(rect.height/scale)),controller.settings)
-            frame.color=controller.settings.accent
-            frame.width_px=2
-            frame.style='outline'
-            frame.update()
-            if not frame.isVisible():
-                frame.show()
+        self._refresh_resize_frames()
         hwnd=controller._last_border
         window=next((w for w in controller.windows if w.ref.hwnd==hwnd),None)
         if getattr(controller.backend,'is_fake',False):

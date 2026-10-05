@@ -5,6 +5,7 @@ from PySide6.QtCore import QObject, Signal, Slot, Qt
 
 class AppBridge(QObject):
     changed = Signal()
+    guides = Signal()
     error = Signal(str)
     status = Signal(str)
     busy_changed = Signal(bool)
@@ -19,6 +20,8 @@ class AppBridge(QObject):
         self.closed = False
         self._completed.connect(self._finish, Qt.ConnectionType.QueuedConnection)
         controller.subscribe(lambda *args: self.changed.emit() if not self.closed else None)
+        if hasattr(controller, 'subscribe_guides'):
+            controller.subscribe_guides(lambda: self.guides.emit() if not self.closed else None)
         if hasattr(controller, 'set_ui_action_handler'):
             controller.set_ui_action_handler(lambda action: self.ui_action.emit(action))
 

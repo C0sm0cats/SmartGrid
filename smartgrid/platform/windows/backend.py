@@ -10,7 +10,7 @@ import time
 from functools import wraps
 from smartgrid.core.models import Rect, Display, WindowRef, WindowRecord
 from smartgrid.core.exclusions import excluded_class
-from .api import Win32, RECT, DWORD, UINT, BOOL, MONITORINFOEX, DISPLAY_DEVICE, MONITORPROC, ENUMPROC, WINDOWPLACEMENT, MINMAXINFO, ULONG_PTR, WINEVENTPROC
+from .api import Win32, RECT, POINT, DWORD, UINT, BOOL, MONITORINFOEX, DISPLAY_DEVICE, MONITORPROC, ENUMPROC, WINDOWPLACEMENT, MINMAXINFO, ULONG_PTR, WINEVENTPROC
 from .apps import AppCatalogue
 from .messages import MessageThread
 from .virtual_desktops import VirtualDesktops,scoped_display
@@ -196,6 +196,24 @@ class WindowsBackend:
             if rect.right > rect.left and rect.bottom > rect.top:
                 return rect_from_native(rect)
         return self._raw_rect(hwnd)
+
+    @physical
+    def gesture_kind(self, hwnd):
+        """'move' or 'resize' for a gesture that has just started on hwnd.
+
+        Windows reports the start of a move or resize loop without saying which.
+        The cursor tells: on a visible edge or outside the frame (the invisible
+        resize border) it is a resize, anywhere else a move. A window resizing
+        itself during a move (applications enforcing a minimum size) is then not
+        mistaken for a resize."""
+        point = POINT()
+        rect = self.window_rect(hwnd)
+        if not rect or not self.api.GetCursorPos(C.byref(point)):
+            return None
+        margin = 4
+        inside = (rect.x + margin <= point.x < rect.right - margin and
+                  rect.y + margin <= point.y < rect.bottom - margin)
+        return 'move' if inside else 'resize'
 
     def _identity(self, hwnd, *, pid=None, scan_identities=None):
         if pid is None:

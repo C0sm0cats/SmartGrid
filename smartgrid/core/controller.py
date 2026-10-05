@@ -81,6 +81,13 @@ class Controller:
         self._placed_at = {}
         self._interacting = set()
         self._move_origins = {}
+        # 'move' or 'resize' per window being dragged, and its state at the start.
+        self._gesture_kinds = {}
+        self._gesture_states = {}
+        # Latest pending location event per window: a burst of moves is handled once.
+        self._pending_locations = {}
+        self._pending_lock = threading.Lock()
+        self._guide_callbacks = []
         self._minimize_snapshots = {}
         self._resize_snapshot = None
         self._swap_snapshot = None
@@ -158,6 +165,17 @@ class Controller:
 
     def subscribe(self, callback):
         self._callbacks.append(callback)
+
+    def subscribe_guides(self, callback):
+        """Called when only the drag guides changed (drop target, resize preview)."""
+        self._guide_callbacks.append(callback)
+
+    def _notify_guides(self):
+        for callback in list(self._guide_callbacks):
+            try:
+                callback()
+            except Exception:
+                log.exception("Guide subscriber failed")
 
     def set_ui_action_handler(self, callback):
         self._ui_action = callback
@@ -366,7 +384,7 @@ class Controller:
         if self._thread and self._thread.is_alive():
             return
         self._stop_event.clear()
-        self.backend.start_events(self._queue.put)
+        self.backend.start_events(self._enqueue_event)
         self._thread = threading.Thread(target=self._event_loop, name="SmartGrid-controller", daemon=True)
         self._thread.start()
         try:
@@ -380,6 +398,17 @@ class Controller:
             log.exception("Global hotkeys unavailable")
             self.last_error = "Global shortcuts are unavailable; the tray menu remains available."
 
+    def _enqueue_event(self, event):
+        """Queue a native event; location events are coalesced per window, so a
+        drag never waits behind a backlog of positions already out of date."""
+        if event.get("type") in ("location", "location_change") and event.get("hwnd"):
+            with self._pending_lock:
+                queued = event["hwnd"] in self._pending_locations
+                self._pending_locations[event["hwnd"]] = event
+            if queued:
+                return
+        self._queue.put(event)
+
     def _event_loop(self):
         while not self._stop_event.is_set():
             try:
@@ -387,6 +416,9 @@ class Controller:
             except queue.Empty:
                 event = {"type": "reconcile"}
             try:
+                if event.get("type") in ("location", "location_change") and event.get("hwnd"):
+                    with self._pending_lock:
+                        event = self._pending_locations.pop(event["hwnd"], event)
                 if event.get("type") == "hotkey":
                     self.handle_action(event["action"])
                 else:
@@ -400,7 +432,10 @@ class Controller:
         kind, hwnd = event.get("type", ""), event.get("hwnd")
         with self._lock:
             if kind in ("move_start", "resize_start", "movesize_start") and hwnd:
-                self.refresh(auto=False)
+                # Start following the gesture at once: no full rescan here.
+                # Only an unknown window needs one.
+                if self._window(hwnd) is None:
+                    self.refresh(auto=False)
                 # Moving a floating or unmanaged window is an ordinary move: no
                 # drop target, no snapping, and its reserved tile is kept.
                 if not self._is_tiled(hwnd):
@@ -411,25 +446,44 @@ class Controller:
                 self._interaction_minimums.clear()
                 w = self._window(hwnd)
                 if w:
-                    self._move_origins[hwnd] = (w.rect, w.display_id)
-                    self._resize_snapshot = self._snapshot()
+                    rect = getattr(self.backend, "window_rect", lambda h: None)(hwnd) or w.rect
+                    self._move_origins[hwnd] = (rect, w.display_id)
+                    # Windows reports every move or resize loop as move_start.
+                    kind = "resize" if kind == "resize_start" else \
+                        getattr(self.backend, "gesture_kind", lambda h: None)(hwnd)
+                    self._gesture_kinds[hwnd] = kind
+                    # Its own state for undo; the full snapshot is taken only for a resize.
+                    self._gesture_states[hwnd] = (w.ref, self.backend.snapshot(hwnd))
+                    log.info("Gesture %s on %s (%s) from %s", kind or "unknown", hwnd, w.app_id, rect)
                 return
             if kind in ("move_end", "resize_end", "movesize_end") and hwnd:
                 if hwnd not in self._interacting:
                     return
                 self._interacting.discard(hwnd)
                 original = self._move_origins.pop(hwnd, None)
+                gesture = self._gesture_kinds.pop(hwnd, None)
+                start_state = self._gesture_states.pop(hwnd, None)
                 # A size change made by SmartGrid itself during the gesture (an
                 # arrangement running meanwhile) is not a user resize or drop.
                 if self._placed_at.get(hwnd,0)>=self._interaction_started.pop(hwnd,time.monotonic()):
                     original=None
                 self.refresh(auto=False)
                 window = self._window(hwnd)
+                if original and window:
+                    log.info("Gesture %s on %s ended: %s -> %s", gesture or "unknown", hwnd, original[0], window.rect)
                 if self.running and not self.paused and original and original[1] in {d.id for d in self.displays} and window and window.state == "normal":
                     before, display_id = original
+                    resized = abs(window.rect.width - before.width) > 8 or abs(window.rect.height - before.height) > 8
+                    if window.rect != before or display_id != window.display_id:
+                        # Snapshot for undo, taken only now that the gesture
+                        # changes something: the current state, with this
+                        # window as it was before the gesture.
+                        self._resize_snapshot = self._snapshot()
+                        if start_state:
+                            self._resize_snapshot["windows"][hwnd] = start_state
                     if display_id!=window.display_id:
                         self._native_drop(hwnd,display_id,window.display_id)
-                    elif abs(window.rect.width - before.width) > 8 or abs(window.rect.height - before.height) > 8:
+                    elif resized and gesture != "move":
                         self._native_resize(hwnd, before, window.rect, self._resize_snapshot)
                     elif window.rect != before or display_id != window.display_id:
                         self._native_drop(hwnd, display_id, window.display_id)
@@ -439,11 +493,15 @@ class Controller:
                 return
             if kind in ("location", "location_change") and hwnd in self._interacting:
                 now=time.monotonic()
-                if now-self._last_preview>=.04:
+                if now-self._last_preview>=.015:
                     self._last_preview=now
                     self._preview_native_drag(hwnd)
                 return
             if time.monotonic() < self._suppress_events_until and kind not in ("foreground", "destroyed", "display_change"):
+                return
+            # While a window is dragged, other windows' moves and title changes
+            # wait: a rescan would delay the drag. Lifecycle events still count.
+            if self._interacting and kind in ("location", "location_change", "title", "changed"):
                 return
             if kind == "foreground":
                 self._update_border()
@@ -1461,7 +1519,8 @@ class Controller:
         profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
         rects = self._profile_rects(profile)
         original = self._move_origins.get(hwnd)
-        if original and original[1]==window.display_id and (abs(window.rect.width-original[0].width)>8 or abs(window.rect.height-original[0].height)>8):
+        resizing=self._gesture_kinds.get(hwnd)!="move"
+        if resizing and original and original[1]==window.display_id and (abs(window.rect.width-original[0].width)>8 or abs(window.rect.height-original[0].height)>8):
             index=next((i for i,a in enumerate(profile.assignments) if a and a.window_id==hwnd),None)
             if index is not None:
                 before,after=original[0],window.rect
@@ -1481,7 +1540,7 @@ class Controller:
                     if abs(delta)>5:
                         rects=linked_resize(rects,index,edge,delta,min_sizes=minimums)
                 self.preview_rectangles=[(window.display_id,r) for r in rects]
-                self._notify()
+                self._notify_guides()
                 return
         self.preview_rectangles=[]
         index = nearest_slot(rects, window.rect.x + window.rect.width / 2, window.rect.y + window.rect.height / 2)
@@ -1499,13 +1558,14 @@ class Controller:
             guide = (window.display_id, rects[index], label, window.app_id)
         if guide != self.drag_guide:
             self.drag_guide = guide
-            self._notify()
+            self._notify_guides()
 
     def _hide_overlay(self):
+        changed=bool(self.preview_rectangles) or self.drag_guide is not None
         self.preview_rectangles=[]
-        if self.drag_guide is not None:
-            self.drag_guide=None
-            self._notify()
+        self.drag_guide=None
+        if changed:
+            self._notify_guides()
 
     def swap_hints(self):
         """(display_id, window rect, [(direction, target, x, y, primary)]) for the window in swap mode.

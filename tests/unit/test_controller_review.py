@@ -706,6 +706,50 @@ class ForcedResizeTests(unittest.TestCase):
             self.assertGreater(tiles[0].width,.5)
 
 
+class SmoothDragTests(unittest.TestCase):
+    def make(self, directory):
+        display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+        backend=FakeBackend([display],[record(1),record(2,'other')],[])
+        controller=Controller(backend,Repository(directory));controller.start()
+        return controller,backend
+
+    def test_drag_start_does_not_rescan_the_desktop(self):
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend=self.make(directory)
+            backend.discover_windows=Mock(side_effect=AssertionError('No desktop scan at drag start'))
+            controller._handle_event({'type':'move_start','hwnd':1})
+            self.assertIn(1,controller._interacting)
+
+    def test_a_window_growing_during_a_move_is_still_a_move(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend=self.make(directory)
+            backend.gesture_kind=lambda hwnd:'move'
+            guides=[];changes=[]
+            controller.subscribe_guides(lambda:guides.append(1));controller.subscribe(lambda:changes.append(1))
+            controller._handle_event({'type':'move_start','hwnd':1})
+            # The application enforces its minimum size as the move starts.
+            target=backend.windows[2].rect
+            backend.windows[1]=replace(backend.windows[1],rect=Rect(target.x+20,target.y+10,target.width+300,target.height))
+            controller._preview_native_drag(1)
+            self.assertFalse(controller.preview_rectangles)
+            self.assertTrue(controller.drag_guide[2].startswith('Swap'))
+            self.assertTrue(guides);self.assertFalse(changes)
+            controller._handle_event({'type':'move_end','hwnd':1})
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[2,1])
+            self.assertFalse(controller.profile('d1',0).resize_tiles)
+
+    def test_location_events_are_coalesced_per_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend=self.make(directory)
+            while not controller._queue.empty(): controller._queue.get_nowait()
+            for i in range(50): controller._enqueue_event({'type':'location','hwnd':1,'n':i})
+            controller._enqueue_event({'type':'location','hwnd':2,'n':0})
+            self.assertEqual(controller._queue.qsize(),2)
+            self.assertEqual(controller._pending_locations[1]['n'],49)
+
+
 class FloatCenteringTests(unittest.TestCase):
     def test_a_window_made_floating_keeps_its_size_and_is_centred(self):
         with tempfile.TemporaryDirectory() as directory:
