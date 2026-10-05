@@ -1,4 +1,4 @@
-"""Small Adwaita-like controls for the system-themed Preferences window."""
+"""Small controls for the system-themed Preferences window."""
 from PySide6.QtCore import Qt, QRectF, QSize, QPropertyAnimation, Property
 from PySide6.QtGui import QColor, QPainter
 from PySide6.QtWidgets import QCheckBox, QWidget
@@ -7,7 +7,7 @@ from smartgrid.core.models import Rect
 
 
 class Switch(QCheckBox):
-    """Adw.SwitchRow toggle: rounded track, sliding knob, accent when on."""
+    """Toggle: rounded track, sliding knob, accent when on."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -86,17 +86,28 @@ class SpacePreview(QWidget):
 
 
 class KeyCaps(QWidget):
-    """Gtk.ShortcutLabel: each key in a rounded cap, or a dimmed "Off"."""
+    """Each key in a rounded cap, or a dimmed "Off"."""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.keys = []
 
     def set_keys(self, keys):
         self.keys = keys
+        self._fit()
+
+    def _fit(self):
+        # Sized from the current font: the theme is applied after construction.
         from PySide6.QtGui import QFontMetrics
         metrics = QFontMetrics(self.font())
+        keys = self.keys
         width = sum(metrics.horizontalAdvance(k) + 14 for k in keys) + 5 * max(0, len(keys) - 1) if keys else metrics.horizontalAdvance('Off')
         self.setFixedSize(width + 2, 26); self.update()
+
+    def changeEvent(self, event):
+        from PySide6.QtCore import QEvent
+        if event.type() in (QEvent.Type.FontChange, QEvent.Type.StyleChange, QEvent.Type.PolishRequest):
+            self._fit()
+        super().changeEvent(event)
 
     def paintEvent(self, event):
         painter = QPainter(self); painter.setRenderHint(QPainter.RenderHint.Antialiasing)

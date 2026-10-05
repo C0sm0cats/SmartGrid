@@ -639,6 +639,32 @@ class SwapArrowTests(unittest.TestCase):
                     if target is not None: self.assertIn(target,shown)
 
 
+class OverlayApplicationTests(unittest.TestCase):
+    def test_added_overlay_applications_float_while_the_overlay_list_is_on(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            window=controller._window(2)
+            controller.settings.overlay_apps_added=[window.app_id]
+            self.assertTrue(controller._ruled_out(window))
+            controller.settings.builtin_exclusions=False
+            self.assertFalse(controller._ruled_out(window))
+
+
+class FloatCenteringTests(unittest.TestCase):
+    def test_a_window_made_floating_keeps_its_size_and_is_centred(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            size=backend.windows[2].rect
+            controller=Controller(backend,Repository(directory));controller.start()
+            controller.toggle_float(2)
+            rect=backend.windows[2].rect
+            self.assertEqual((rect.width,rect.height),(size.width,size.height))
+            self.assertEqual((rect.x+rect.width//2,rect.y+rect.height//2),(960,540))
+
+
 class FloatingMoveTests(unittest.TestCase):
     def test_moving_a_floating_window_is_not_a_drop_and_it_returns_to_its_tile(self):
         with tempfile.TemporaryDirectory() as directory:

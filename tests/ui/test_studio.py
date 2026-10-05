@@ -110,6 +110,65 @@ class UITests(unittest.TestCase):
         settings=prefs.collect_settings()
         self.assertEqual(settings.gap,self.controller.settings.gap)
 
+    def test_common_overlays_are_listed_apart_and_can_be_restored(self):
+        from smartgrid.core.models import ApplicationRef
+        from PySide6.QtCore import Qt
+        self.controller.apps=[ApplicationRef('exe:spotify.exe','Spotify'),ApplicationRef('exe:code.exe','Code')]
+        prefs=Preferences(self.controller); self.widgets.append(prefs)
+        prefs._apps_loaded=True;prefs.refresh_rules()
+        def tree(app_id):
+            for i in range(prefs.rules.topLevelItemCount()):
+                group=prefs.rules.topLevelItem(i)
+                for j in range(group.childCount()):
+                    if group.child(j).data(0,Qt.ItemDataRole.UserRole)==app_id: return group.child(j).child(0)
+        overlay=lambda:prefs.overlay_apps.item(0)
+        self.assertIsNone(tree('exe:spotify.exe'))
+        self.assertEqual((overlay().text(),overlay().checkState()),('Spotify',Qt.CheckState.Checked))
+        self.assertFalse(prefs.apps_reset.isEnabled())
+        overlay().setCheckState(Qt.CheckState.Unchecked)
+        self.assertEqual(prefs.collect_settings().included_apps,['exe:spotify.exe'])
+        prefs.refresh_rules();self.assertTrue(prefs.apps_reset.isEnabled())
+        prefs._reset_overlay_apps();prefs.refresh_rules()
+        self.assertEqual(prefs.collect_settings().included_apps,[])
+        self.assertEqual(overlay().checkState(),Qt.CheckState.Checked)
+        tree('exe:code.exe').setCheckState(0,Qt.CheckState.Checked)
+        self.assertEqual(prefs.collect_settings().excluded_apps,['exe:code.exe'])
+
+    def test_applications_can_be_added_to_the_overlay_list(self):
+        from smartgrid.core.models import ApplicationRef
+        from PySide6.QtCore import Qt
+        self.controller.apps=[ApplicationRef('exe:spotify.exe','Spotify'),ApplicationRef('exe:code.exe','Code')]
+        prefs=Preferences(self.controller); self.widgets.append(prefs)
+        prefs._apps_loaded=True;prefs.refresh_rules()
+        names=lambda:[prefs.overlay_apps.item(i).text() for i in range(prefs.overlay_apps.count())]
+        prefs.app_input.setEditText('code');prefs._add_overlay_app()
+        self.assertEqual(names(),['Code (added)','Spotify'])
+        self.assertEqual(prefs.collect_settings().overlay_apps_added,['exe:code.exe'])
+        self.assertEqual(prefs.app_input.findText('Code'),-1)
+        prefs.overlay_apps.item(0).setCheckState(Qt.CheckState.Unchecked);prefs.refresh_rules()
+        self.assertEqual((names(),prefs.collect_settings().overlay_apps_added),(['Spotify'],[]))
+        prefs.app_input.setEditText('Code');prefs._add_overlay_app()
+        prefs._reset_overlay_apps();prefs.refresh_rules()
+        self.assertEqual((names(),prefs.collect_settings().overlay_apps_added),(['Spotify'],[]))
+
+    def test_overlay_keywords_save_only_changes_and_reset(self):
+        from smartgrid.core.models import ApplicationRef
+        from PySide6.QtCore import Qt
+        self.controller.apps=[ApplicationRef('exe:spotify.exe','Spotify'),ApplicationRef('exe:acme.exe','Acme Monitor')]
+        prefs=Preferences(self.controller); self.widgets.append(prefs)
+        prefs._apps_loaded=True
+        word=lambda w:next(prefs.words.item(i) for i in range(prefs.words.count()) if prefs.words.item(i).data(Qt.ItemDataRole.UserRole)==w)
+        word('spotify').setCheckState(Qt.CheckState.Unchecked)
+        prefs.word_input.setText('  Acme  ');prefs._add_word()
+        settings=prefs.collect_settings()
+        self.assertEqual((settings.overlay_words_added,settings.overlay_words_removed),(['acme'],['spotify']))
+        prefs.refresh_rules()
+        self.assertEqual([prefs.overlay_apps.item(i).text() for i in range(prefs.overlay_apps.count())],['Acme Monitor'])
+        prefs._reset_words()
+        settings=prefs.collect_settings()
+        self.assertEqual((settings.overlay_words_added,settings.overlay_words_removed),([],[]))
+        self.assertFalse(prefs.words_reset.isEnabled())
+
     def test_auto_five_windows_convert_to_full_custom_partition(self):
         studio=Studio(self.controller); self.widgets.append(studio)
         profile=self.controller.draft('demo-primary',0).profile

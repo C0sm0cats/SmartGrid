@@ -1,6 +1,6 @@
 """Built-in exclusions."""
 import unittest
-from smartgrid.core.exclusions import excluded_class, excluded_window
+from smartgrid.core.exclusions import TITLE_WORDS, excluded_app, excluded_class, excluded_window, overlay_words
 
 
 class ExclusionTests(unittest.TestCase):
@@ -23,6 +23,20 @@ class ExclusionTests(unittest.TestCase):
         self.assertTrue(excluded_class('#32770'))
         self.assertTrue(excluded_class('Progman'))
         self.assertFalse(excluded_class('MozillaWindowClass'))
+
+    def test_keyword_changes_apply_on_top_of_the_built_in_list(self):
+        words = overlay_words(['Acme Tool'], ['call'])
+        self.assertTrue(excluded_window('Acme tool - settings', words=words))
+        self.assertFalse(excluded_window('Team call', words=words))
+        self.assertTrue(excluded_window('Incoming call', words=words))
+        self.assertEqual(overlay_words(), TITLE_WORDS)
+        self.assertFalse(excluded_window('Spotify', words=()))
+
+    def test_application_names_in_the_list_float_by_default(self):
+        for name in ('Spotify', 'Steam', 'VLC media player', 'OBS Studio', 'Discord'):
+            self.assertTrue(excluded_app(name), name)
+        for name in ('Microsoft Teams', 'Visual Studio Code', 'Google Chrome', 'Notepad'):
+            self.assertFalse(excluded_app(name), name)
 
 
 if __name__ == '__main__':

@@ -44,6 +44,12 @@ class FakeBackend:
             return {}
         return {'hwnd':hwnd, 'pid':window.ref.pid, 'generation':window.ref.generation, 'rect':[window.rect.x, window.rect.y, window.rect.width, window.rect.height], 'state':window.state, 'display_id':window.display_id, 'style':self.styles.get(hwnd, 0), 'border_color':self.borders.get(hwnd)}
 
+    def restore_centered(self, hwnd, snapshot, area):
+        _, _, w, h = snapshot['rect']
+        w, h = min(w, area.width * 9 // 10), min(h, area.height * 9 // 10)
+        rect = [area.x + (area.width - w) // 2, area.y + (area.height - h) // 2, w, h]
+        return self.restore(hwnd, {**snapshot, 'rect': rect, 'state': 'normal'})
+
     def restore(self, hwnd, snapshot):
         window = self.windows.get(hwnd)
         if not window or hwnd in self.failures or window.ref.generation != snapshot.get('generation'):

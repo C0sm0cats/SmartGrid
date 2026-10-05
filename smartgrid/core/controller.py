@@ -16,7 +16,7 @@ import uuid
 from .models import app_display_name, Assignment, Draft, LayoutTemplate, Settings, SpaceProfile, Tile, Rect
 from .geometry import capacity, resolve_layout, auto_preset, effective_layout, directional_neighbor, edge_neighbors, swap_neighbor, nearest_slot, valid_tiles, linked_resize
 from .reconcile import compact_assignments
-from .exclusions import excluded_window
+from .exclusions import excluded_app, excluded_window, overlay_words
 from .history import History
 from .commands import ApplyResult
 from smartgrid.storage.archive import export_archive, import_archive
@@ -195,12 +195,21 @@ class Controller:
             raise ValueError('Cannot identify the current Windows desktop; arrangement is suspended.')
 
     def _ruled_out(self, window):
-        """Always floating, or a built-in exclusion, unless explicitly included."""
+        """Always floating, or a built-in exclusion whose Always floating box was not unticked."""
         if window.app_id in self.settings.included_apps:
             return False
-        return window.app_id in self.settings.excluded_apps or bool(
-            self.settings.builtin_exclusions and
-            excluded_window(window.title, window.app_id, window.rect.width, window.rect.height))
+        if window.app_id in self.settings.excluded_apps:
+            return True
+        if not self.settings.builtin_exclusions:
+            return False
+        if window.app_id in self.settings.overlay_apps_added:
+            return True
+        if getattr(self, '_app_names', (None,))[0] is not self.apps:
+            self._app_names = (self.apps, {a.id: a.name for a in self.apps})
+        name = self._app_names[1].get(window.app_id) or app_display_name(window.app_id)
+        words = overlay_words(self.settings.overlay_words_added, self.settings.overlay_words_removed)
+        return bool(excluded_app(name, words) or
+                    excluded_window(window.title, window.app_id, window.rect.width, window.rect.height, words))
 
     def _eligible(self, window):
         if not window.eligible or window.ref.hwnd in self._floating:
@@ -1181,7 +1190,13 @@ class Controller:
                 self.backend.border(hwnd, None)
                 state = self._originals.get(hwnd)
                 if state:
-                    self.backend.restore(hwnd, state[1])
+                    # Its size from before tiling, centred on its display.
+                    centered = getattr(self.backend, "restore_centered", None)
+                    display = next((d for d in self.displays if d.id == window.display_id), None)
+                    if centered and display:
+                        centered(hwnd, state[1], display.work_area)
+                    else:
+                        self.backend.restore(hwnd, state[1])
                 self._reflow_all(include_new=False)
             self._notify()
 
@@ -1571,7 +1586,7 @@ class Controller:
             return self._clear_border()
         focused = self._swap_hwnd or getattr(self.backend, "foreground", lambda: None)()
         # Opening the tray menu activates the taskbar and then SmartGrid's own
-        # menu. GNOME's panel menu keeps the focused window, so the outline stays.
+        # menu; the outline stays on the window that was focused.
         if focused and not self._swap_hwnd and getattr(self.backend, "is_shell_surface", lambda h: False)(focused):
             focused = self._last_border
         tiled = {a.window_id for d in self.displays for a in self.profile(d.id, self.active_spaces.get(d.id, 0)).assignments if a and a.window_id and a.window_id not in self._floating}

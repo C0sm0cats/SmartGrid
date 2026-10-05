@@ -14,7 +14,7 @@ SURFACE = QColor(27, 36, 45, 245)
 
 
 def _glyph(painter, kind, box, color):
-    """Monochrome 17 px glyphs standing in for GNOME's symbolic window icons."""
+    """Monochrome 17 px window action glyphs."""
     pen = QPen(color, 1.6); pen.setCapStyle(Qt.PenCapStyle.RoundCap); pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     painter.setPen(pen); painter.setBrush(Qt.BrushStyle.NoBrush)
     x, y, s = box.x(), box.y(), box.width()

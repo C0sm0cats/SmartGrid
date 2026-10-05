@@ -70,6 +70,18 @@ SHELL_DARK = """
 """
 
 
+def _arrow(color):
+    """A small down arrow for combo boxes, written once per colour."""
+    import tempfile
+    from pathlib import Path
+    path = Path(tempfile.gettempdir()) / f"smartgrid-arrow-{color.lstrip('#')}.svg"
+    if not path.exists():
+        path.write_text(f'<svg xmlns="http://www.w3.org/2000/svg" width="10" height="6" viewBox="0 0 10 6">'
+                        f'<path d="M1 1l4 4 4-4" fill="none" stroke="{color}" stroke-width="1.6" '
+                        f'stroke-linecap="round" stroke-linejoin="round"/></svg>', encoding='utf-8')
+    return path.as_posix()
+
+
 def apply_theme(settings,target=None):
     app = QApplication.instance()
     if not app:
@@ -91,9 +103,17 @@ def apply_theme(settings,target=None):
         QPushButton, QToolButton, QComboBox {{ background: {t['card']}; border: 1px solid {t['line']};
             border-radius: 8px; padding: 7px 10px; min-height: 18px; }}
         QPushButton:hover, QToolButton:hover {{ border-color: {t['accent']}; }}
+        QComboBox {{ padding-right: 26px; }}
+        QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right; width: 24px;
+            border: none; background: transparent; }}
+        QComboBox::down-arrow {{ image: url({_arrow(t['muted'])}); width: 10px; height: 6px; }}
         QPushButton:focus, QToolButton:focus, QComboBox:focus, QLineEdit:focus {{ border: 2px solid {t['accent']}; }}
         QPushButton:checked, QToolButton:checked {{ background: {'#28483f' if settings.theme=='dark' else t['canvas']}; border-color: #73cfa8; }}
         QPushButton:disabled {{ color: {t['muted']}; background: {t['canvas']}; }}
+        QPushButton[disclosure="true"], QPushButton[disclosure="true"]:checked {{ border: none; background: transparent;
+            text-align: left; padding: 4px 0; color: {t['text']}; font-weight: 600; }}
+        QPushButton[disclosure="true"]:hover {{ text-decoration: underline; }}
+        QPushButton[disclosure="true"]:disabled {{ color: {t['muted']}; background: transparent; }}
         QPushButton[unavailable=true] {{ color: #82939a; background: #1a232b; border-color: #303e45; }}
         QPushButton[primary=true] {{ background: {t['accent']}; color: {t['accent_text']}; font-weight: bold; }}
         QLineEdit, QSpinBox, QDoubleSpinBox, QListWidget, QTreeWidget, QTextEdit {{

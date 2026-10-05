@@ -162,6 +162,11 @@ class Settings(Serializable):
     animation_curve: str = 'ease-out'
     force_resize: bool = True
     builtin_exclusions: bool = True
+    # Changes to the built-in overlay keywords; the list itself stays in code.
+    overlay_words_added: list[str] = field(default_factory=list)
+    overlay_words_removed: list[str] = field(default_factory=list)
+    # Applications added to the overlay list (app IDs).
+    overlay_apps_added: list[str] = field(default_factory=list)
 
     def visual_duration(self, base=140):
         duration={'fast':90,'normal':140,'slow':220}.get(self.animation_speed,self.animation_duration)
@@ -344,10 +349,14 @@ def _validate_model(value):
             raise ValueError('Margins require top, right, bottom and left')
         if any(type(v) is not int or not 0 <= v <= 10000 for v in value.margins.values()):
             raise ValueError('Margins must contain nonnegative integer distances')
-        for name in ('excluded_apps', 'included_apps'):
+        for name in ('excluded_apps', 'included_apps', 'overlay_apps_added'):
             items = getattr(value, name)
             if not isinstance(items, list) or any(not isinstance(v, str) or not v.strip() or len(v) > 1024 for v in items):
                 raise ValueError(f'{name} must be a list of nonempty app identities')
+        for name in ('overlay_words_added', 'overlay_words_removed'):
+            items = getattr(value, name)
+            if not isinstance(items, list) or any(not isinstance(v, str) or not v.strip() or len(v) > 100 for v in items):
+                raise ValueError(f'{name} must be a list of nonempty words')
         if not isinstance(value.hotkeys, dict) or any(not isinstance(k, str) or not k or not isinstance(v, str)
                                                     for k, v in value.hotkeys.items()):
             raise ValueError('Hotkeys must map action strings to shortcut strings')

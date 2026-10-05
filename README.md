@@ -89,7 +89,7 @@ All shortcuts can be changed or disabled in Preferences. A shortcut must include
 - **Focus outline:** follow the Windows accent color or choose a custom color, set thickness from 1 to 6 pixels, and choose a plain outline or subtle halo.
 - **Animations:** Fast, Normal, Slow or a custom base duration (40–500 ms), with ease out, linear or ease in and out motion.
 - **Back up and share:** export or import named layouts and per-space profiles.
-- **Applications:** search an application and mark it **Always floating** or **Explicitly include** it. **Keep common overlays out of the grid** (on by default) lets media players, game launchers, streaming and monitoring tools, call windows and other window managers float.
+- **Applications:** every application is tiled unless you tick **Always floating**. **Keep common overlays out of the grid** (on by default) lets media players, game launchers, streaming and monitoring tools, call windows and other window managers float. **Customize the list** opens its two lists, side by side: **Overlay keywords** (untick a built-in word or add your own) and **Overlay applications** (the installed or open apps those words catch, plus any you add; untick one to tile it). Each list can be restored to its defaults.
 - **Windows tools and advanced settings:** force windows into their tiles, native window animation, reconciliation delay, placement retries and time budget.
 
 ## How spaces and profiles work

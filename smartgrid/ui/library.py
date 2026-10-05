@@ -52,7 +52,7 @@ class ApplicationLibrary(QWidget):
         self.hint.setWordWrap(True);layout.addWidget(self.hint)
         actions=QHBoxLayout();self.assign=QPushButton('Assign to selected tile');self.assign.clicked.connect(self.assign_current)
         actions.addWidget(self.assign);self.assign.hide();self.include=QPushButton('Include');self.include.clicked.connect(self.include_current)
-        self.include.setToolTip('Explicitly include this excluded application');actions.addWidget(self.include);layout.addLayout(actions)
+        self.include.setToolTip('Tile this application: untick its Always floating box');actions.addWidget(self.include);layout.addLayout(actions)
         self.timer=QTimer(self);self.timer.setSingleShot(True);self.timer.setInterval(120);self.timer.timeout.connect(self.refresh_from_controller)
         self.tabs.currentChanged.connect(self._tab_changed)
         bridge.changed.connect(self.refresh_from_controller,Qt.ConnectionType.QueuedConnection)

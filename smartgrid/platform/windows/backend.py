@@ -301,6 +301,24 @@ class WindowsBackend:
                 'placement': {'flags': placement.flags, 'showCmd': placement.showCmd, 'min': [placement.ptMinPosition.x, placement.ptMinPosition.y], 'max': [placement.ptMaxPosition.x, placement.ptMaxPosition.y], 'normal': [placement.rcNormalPosition.left, placement.rcNormalPosition.top, placement.rcNormalPosition.right, placement.rcNormalPosition.bottom]},
                 'style': self.api.GetWindowLong(hwnd, -16), 'exstyle': self.api.GetWindowLong(hwnd, -20), 'border_color': self._attribute(hwnd, 34, 0xffffffff)}
 
+    def restore_centered(self, hwnd, snapshot, area):
+        """Restore a window as it was before tiling (styles, normal size), but
+        centred on area and not maximized. Used when a tiled window floats."""
+        placement = snapshot.get('placement') or {}
+        if not placement:
+            return self.restore(hwnd, snapshot)
+        l, t, r, b = placement['normal']
+        # The visible frame (DWM bounds) when the window was normal; otherwise
+        # its normal rectangle, which also includes the invisible resize border.
+        x, y, w, h = snapshot['rect'] if snapshot.get('rect') and placement.get('showCmd') == 1 else (l, t, r - l, b - t)
+        nw, nh = min(w, area.width * 9 // 10), min(h, area.height * 9 // 10)
+        nx, ny = area.x + (area.width - nw) // 2, area.y + (area.height - nh) // 2
+        # rcNormalPosition uses workspace coordinates: move and shrink it by the
+        # same amounts as the visible frame, whatever the coordinate origin.
+        normal = [l + nx - x, t + ny - y, r + (nx + nw) - (x + w), b + (ny + nh) - (y + h)]
+        return self.restore(hwnd, {**snapshot, 'rect': [nx, ny, nw, nh],
+                                   'placement': {**placement, 'normal': normal, 'showCmd': 1}})
+
     @physical
     def restore(self, hwnd, snapshot):
         if not self.alive(hwnd) or not snapshot:
