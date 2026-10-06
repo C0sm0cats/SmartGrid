@@ -88,6 +88,7 @@ class Controller:
         self._pending_locations = {}
         self._pending_lock = threading.Lock()
         self._guide_callbacks = []
+        self._follow_callbacks = []
         self._minimize_snapshots = {}
         self._resize_snapshot = None
         self._swap_snapshot = None
@@ -176,6 +177,18 @@ class Controller:
                 callback()
             except Exception:
                 log.exception("Guide subscriber failed")
+
+    def subscribe_follow(self, callback):
+        """Called with the window of every native move, straight from the
+        event thread: the palette follows its edge without waiting for a rescan."""
+        self._follow_callbacks.append(callback)
+
+    def _notify_follow(self, hwnd):
+        for callback in list(self._follow_callbacks):
+            try:
+                callback(hwnd)
+            except Exception:
+                log.exception("Follow subscriber failed")
 
     def set_ui_action_handler(self, callback):
         self._ui_action = callback
@@ -402,6 +415,7 @@ class Controller:
         """Queue a native event; location events are coalesced per window, so a
         drag never waits behind a backlog of positions already out of date."""
         if event.get("type") in ("location", "location_change") and event.get("hwnd"):
+            self._notify_follow(event["hwnd"])
             with self._pending_lock:
                 queued = event["hwnd"] in self._pending_locations
                 self._pending_locations[event["hwnd"]] = event

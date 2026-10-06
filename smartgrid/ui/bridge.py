@@ -6,6 +6,7 @@ from PySide6.QtCore import QObject, Signal, Slot, Qt
 class AppBridge(QObject):
     changed = Signal()
     guides = Signal()
+    follow = Signal(int)
     error = Signal(str)
     status = Signal(str)
     busy_changed = Signal(bool)
@@ -18,12 +19,22 @@ class AppBridge(QObject):
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="smartgrid-command")
         self.pending = 0
         self.closed = False
+        # A palette move already queued for the UI: later positions are read
+        # live when it runs, so a fast drag never piles up stale moves.
+        self.follow_queued = False
         self._completed.connect(self._finish, Qt.ConnectionType.QueuedConnection)
         controller.subscribe(lambda *args: self.changed.emit() if not self.closed else None)
         if hasattr(controller, 'subscribe_guides'):
             controller.subscribe_guides(lambda: self.guides.emit() if not self.closed else None)
+        if hasattr(controller, 'subscribe_follow'):
+            controller.subscribe_follow(self._follow)
         if hasattr(controller, 'set_ui_action_handler'):
             controller.set_ui_action_handler(lambda action: self.ui_action.emit(action))
+
+    def _follow(self, hwnd):
+        if not self.closed and not self.follow_queued:
+            self.follow_queued = True
+            self.follow.emit(hwnd)
 
     def submit(self, action, *args, on_success=None, message="", **kwargs):
         if self.closed:

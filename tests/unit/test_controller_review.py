@@ -749,6 +749,14 @@ class SmoothDragTests(unittest.TestCase):
             self.assertEqual(controller._queue.qsize(),2)
             self.assertEqual(controller._pending_locations[1]['n'],49)
 
+    def test_every_move_reaches_the_palette_before_the_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend=self.make(directory)
+            moved=[];controller.subscribe_follow(moved.append)
+            for i in range(3): controller._enqueue_event({'type':'location','hwnd':1,'n':i})
+            controller._enqueue_event({'type':'title','hwnd':1})
+            self.assertEqual(moved,[1,1,1])
+
 
 class FloatCenteringTests(unittest.TestCase):
     def test_a_window_made_floating_keeps_its_size_and_is_centred(self):

@@ -76,6 +76,7 @@ class DesktopUI:
         self.bridge.ui_action.connect(self.open, Qt.ConnectionType.QueuedConnection)
         self.bridge.changed.connect(self.refresh, Qt.ConnectionType.QueuedConnection)
         self.bridge.guides.connect(self.refresh_drag, Qt.ConnectionType.QueuedConnection)
+        self.bridge.follow.connect(self.follow_window, Qt.ConnectionType.QueuedConnection)
         self.bridge.error.connect(self.error)
         self.tray.show()
         self.refresh()
@@ -412,6 +413,40 @@ class DesktopUI:
                     self._guide_error=text
                     log.error('Guides could not be drawn:\n%s',text)
 
+    def _place_window_actions(self, rect, area):
+        def position(size):
+            # windowActionPosition: 4 px inside the left edge, vertically centred, clamped.
+            x=min(max(rect.x()+4,area.x()+6),max(area.x()+6,area.right()-size.width()-6))
+            y=min(max(rect.y()+(rect.height()-size.height())//2,area.y()+8),max(area.y()+8,area.bottom()-size.height()-8))
+            return x,y
+        self.window_actions.move(*position(self.window_actions.size()))
+        self.window_actions.handle.move(*position(self.window_actions.handle.size()))
+
+    def follow_window(self, hwnd):
+        """Native move of a window: only the palette of that window follows
+        its edge; everything else waits for the regular refresh."""
+        self.bridge.follow_queued=False
+        controller=self.controller
+        reference=self.action_reference
+        if (not reference or reference.hwnd!=hwnd or controller._interacting
+                or not (self.window_actions.isVisible() or self.window_actions.handle.isVisible())):
+            return
+        try:
+            window=next((w for w in controller.windows if w.ref.hwnd==hwnd),None)
+            live=getattr(controller.backend,'window_rect',lambda h: None)(hwnd)
+            display=next((d for d in controller.displays if window and d.id==window.display_id),None)
+            screen=self._screen(display) if display else None
+            if not live or not screen:
+                return
+            centre_x,centre_y=live.x+live.width/2,live.y+live.height/2
+            area=display.work_area
+            if not (area.x<=centre_x<area.x+area.width and area.y<=centre_y<area.y+area.height):
+                # Moved to another display: the full refresh maps it to its screen.
+                return self.refresh_focus()
+            self._place_window_actions(self._logical(display.id,live),screen.availableGeometry())
+        except Exception:
+            log.exception('Window actions could not follow the window')
+
     def _refresh_focus(self):
         controller=self.controller
         hwnd=controller.backend.foreground()
@@ -430,14 +465,7 @@ class DesktopUI:
                 self._handle_due=time.monotonic()+.14
             live=getattr(controller.backend,'window_rect',None)
             rect=self._logical(display.id,(live(selected.ref.hwnd) if live else None) or selected.rect)
-            area=screen.availableGeometry()
-            def position(size):
-                # windowActionPosition: 4 px inside the left edge, vertically centred, clamped.
-                x=min(max(rect.x()+4,area.x()+6),max(area.x()+6,area.right()-size.width()-6))
-                y=min(max(rect.y()+(rect.height()-size.height())//2,area.y()+8),max(area.y()+8,area.bottom()-size.height()-8))
-                return x,y
-            self.window_actions.move(*position(self.window_actions.size()))
-            self.window_actions.handle.move(*position(self.window_actions.handle.size()))
+            self._place_window_actions(rect,screen.availableGeometry())
             self.window_actions.set_state(selected.floating,selected.state=='maximized')
             self.window_actions.set_accent(controller.focus_color)
             self.window_actions.duration=controller.settings.visual_duration(140)
