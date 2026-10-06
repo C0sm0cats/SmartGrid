@@ -82,7 +82,7 @@ class FocusFrame(QWidget):
         if not self.isVisible() or not duration:
             self.setGeometry(rect);return
         self.motion.setDuration(duration);self.motion.setStartValue(self.geometry());self.motion.setEndValue(rect)
-        self.motion.setEasingCurve({'ease-out':QEasingCurve.Type.OutCubic,'linear':QEasingCurve.Type.Linear,'ease-in-out':QEasingCurve.Type.InOutCubic}[settings.animation_curve])
+        self.motion.setEasingCurve({'ease-out':QEasingCurve.Type.OutCubic,'linear':QEasingCurve.Type.Linear,'ease-in-out':QEasingCurve.Type.InOutCubic,'spring':QEasingCurve.Type.OutBack}[settings.animation_curve])
         self.motion.start()
 
     def paintEvent(self,event):

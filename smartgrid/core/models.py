@@ -139,6 +139,8 @@ class Settings(Serializable):
     animations: bool = True
     window_animations: bool = False
     animation_duration: int = 140
+    # No longer offered (native movement follows animation_curve and the
+    # display refresh rate); kept so that existing settings files still load.
     animation_effect: str = 'crit_damped'
     animation_fps: int = 60
     sounds: bool = False  # no longer offered; kept so that existing settings files still load
@@ -339,7 +341,7 @@ def _validate_model(value):
         for color in (value.accent,value.border_color):
             if not isinstance(color, str) or not re.fullmatch(r'#[0-9a-fA-F]{6}', color):
                 raise ValueError('Color must be a #RRGGBB color')
-        if value.animation_speed not in ('fast','normal','slow','custom') or value.animation_curve not in ('ease-out','linear','ease-in-out'):
+        if value.animation_speed not in ('fast','normal','slow','custom') or value.animation_curve not in ('ease-out','linear','ease-in-out','spring'):
             raise ValueError('Unknown visual animation setting')
         if value.animation_effect not in ('crit_damped', 'spring', 'curved', 'curve', 'linear'):
             raise ValueError('Unknown animation effect')

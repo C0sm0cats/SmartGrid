@@ -824,3 +824,18 @@ class FreeMoveTests(unittest.TestCase):
             self.assertFalse(scans)
             controller._handle_event({'type':'move_end','hwnd':2})
             self.assertTrue(scans);self.assertFalse(controller._free_moving)
+
+
+class NativeMovementTests(unittest.TestCase):
+    def test_native_movement_follows_the_animation_curve_and_refresh_rate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            controller.settings.window_animations=True;controller.settings.animation_curve='spring'
+            controller.refresh_rate=144
+            calls=[];place=backend.place
+            backend.place=lambda hwnd,rect,**kwargs: calls.append(kwargs) or place(hwnd,rect,**kwargs)
+            controller.arrange('d1')
+            self.assertTrue(calls)
+            self.assertTrue(all(c['animate'] and c['effect']=='spring' and c['fps']==144 for c in calls))

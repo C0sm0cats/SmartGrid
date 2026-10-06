@@ -21,5 +21,5 @@ def animate_open(widget):
     animation=QPropertyAnimation(widget,b'windowOpacity',widget)
     animation.setDuration(duration);animation.setStartValue(.15);animation.setEndValue(1)
     curve={'ease-out':QEasingCurve.Type.OutCubic,'linear':QEasingCurve.Type.Linear,
-           'ease-in-out':QEasingCurve.Type.InOutCubic}[settings.animation_curve]
+           'ease-in-out':QEasingCurve.Type.InOutCubic,'spring':QEasingCurve.Type.OutBack}[settings.animation_curve]
     animation.setEasingCurve(curve);widget._open_animation=animation;animation.start()

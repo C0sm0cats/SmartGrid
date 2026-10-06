@@ -139,6 +139,7 @@ def apply_theme(settings,target=None):
         QLabel[eyebrow=true] {{ color: {t['accent']}; font-size: 9px; font-weight: 800; }}
         QGroupBox[preferences=true] {{ background: {t['card']}; border-color: {t['line']}; padding: 12px; margin-top: 18px; }}
         QGroupBox[collapsed=true] {{ border: none; background: transparent; }}
+        QLabel[pref_heading=true] {{ color: {t['muted']}; font-size: 8pt; font-weight: bold; letter-spacing: 1px; padding-top: 8px; }}
         QGroupBox::indicator {{ width: 14px; height: 14px; border: 1px solid {t['line']}; border-radius: 3px; background: {t['canvas']}; }}
         QGroupBox::indicator:checked {{ background: {t['accent']}; border-color: {t['accent']}; }}
         QToolTip {{ background: {t['card']}; color: {t['text']}; border: 1px solid {t['accent']}; padding: 7px; }}

@@ -34,6 +34,10 @@ class DesktopUI:
         self.swap_timer=QTimer(app);self.swap_timer.setSingleShot(True)
         self.swap_timer.timeout.connect(lambda:(self.swap_from.hide(),self.swap_to.hide()))
         controller.native_border=False
+        # Native window movement runs at the display refresh rate.
+        def refresh_rate(*args):
+            controller.refresh_rate=max(30,min(240,round(max((s.refreshRate() for s in app.screens()),default=60))))
+        refresh_rate();app.screenAdded.connect(refresh_rate);app.screenRemoved.connect(refresh_rate)
         self._frame_rect=None
         self.window_actions=WindowActions()
         self.action_reference=None
@@ -316,7 +320,7 @@ class DesktopUI:
         # Placement ghosts from the previous tile to the new one.
         from PySide6.QtCore import QEasingCurve
         curve=QEasingCurve({'ease-out':QEasingCurve.Type.OutCubic,'linear':QEasingCurve.Type.Linear,
-                            'ease-in-out':QEasingCurve.Type.InOutCubic}[controller.settings.animation_curve])
+                            'ease-in-out':QEasingCurve.Type.InOutCubic,'spring':QEasingCurve.Type.OutBack}[controller.settings.animation_curve])
         for display_id,start,end,app_id,stamp in list(controller.motion_events):
             if stamp<=self._seen_motion: continue
             self._seen_motion=stamp

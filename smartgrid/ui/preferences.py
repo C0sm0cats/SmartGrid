@@ -110,11 +110,14 @@ class Preferences(QDialog):
         self._row(self.focus_group,'border_color','Focus color',self.color_button)
         self._spin(self.focus_group,'border_width','Outline thickness',1,6,subtitle='Pixels')
         self._combo(self.focus_group,'border_style','Outline style',[('outline','Outline'),('glow','Subtle halo')])
-        self.animation_group=self._group(main,'Animations','Adjust guides, focus effects and space transitions. Window placement stays immediate.')
+        self.animation_group=self._group(main,'Animations','Adjust guides, focus effects and space transitions. Window placement is immediate unless window movement is animated.')
         self._combo(self.animation_group,'animation_speed','Animation speed',[('fast','Fast'),('normal','Normal'),('slow','Slow'),('custom','Custom')])
         self._spin(self.animation_group,'animation_duration','Animation duration',40,500,
             subtitle='Base duration in milliseconds; longer transitions scale proportionally')
-        self._combo(self.animation_group,'animation_curve','Animation curve',[('ease-out','Ease out'),('linear','Linear'),('ease-in-out','Ease in and out')])
+        self._combo(self.animation_group,'animation_curve','Animation curve',[('ease-out','Ease out'),('linear','Linear'),('ease-in-out','Ease in and out'),('spring','Spring')])
+        self._heading(self.animation_group,'Window movement')
+        self._check(self.animation_group,'window_animations','Animate native window movement',
+                    'Windows slide into their tiles with the speed and curve above')
         archive=self._group(main,'Back up and share','Export named layouts and per-space profiles to a JSON file. Import adds new items without replacing your existing ones.')
         self.export_button=QPushButton('Export…');self.export_button.clicked.connect(self.export_archive)
         self.import_button=QPushButton('Import…');self.import_button.clicked.connect(self.import_archive)
@@ -154,15 +157,14 @@ class Preferences(QDialog):
         rules.addRow(self.rules)
         note=QLabel('Windows that cannot shrink to their tile are handled by Force windows into their tiles, in Windows tools and advanced settings.')
         note.setWordWrap(True);note.setProperty('muted',True);rules.addRow(note)
-        advanced=self._group(main,'Windows tools and advanced settings','Placement and native animation options for Windows.')
+        advanced=self._group(main,'Windows tools and advanced settings','Placement options for Windows.')
         # Collapsed by default: the checkbox expands the group.
         box=advanced.parentWidget();box.setCheckable(True);box.setChecked(False)
         box.setFlat(True)
+        self._heading(advanced,'Window size')
         self._check(advanced,'force_resize','Force windows into their tiles',
                     'Resize windows below their minimum size and give fixed-size windows a resizable frame')
-        self._check(advanced,'window_animations','Animate native window movement')
-        self._spin(advanced,'animation_fps','Native animation rate',1,240)
-        self._combo(advanced,'animation_effect','Native movement curve',[('crit_damped','Damped'),('spring','Spring'),('curved','Curved'),('linear','Linear')])
+        self._heading(advanced,'Responsiveness and reliability')
         self._spin(advanced,'debounce_ms','Reconciliation delay',0,10000)
         self._spin(advanced,'tile_retries','Placement retries',0,20)
         timeout=QDoubleSpinBox();timeout.setRange(.01,120);timeout.setValue(self.settings.tile_timeout)
@@ -225,6 +227,11 @@ class Preferences(QDialog):
             label=QLabel(description);label.setWordWrap(True);label.setProperty('muted',True);form.addRow(label)
         page.addWidget(group)
         return form
+
+    @staticmethod
+    def _heading(form,title):
+        """Subsection title inside a group."""
+        label=QLabel(title.upper());label.setProperty('pref_heading',True);form.addRow(label)
 
     @staticmethod
     def _title(title,subtitle='',cap=300):

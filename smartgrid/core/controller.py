@@ -24,6 +24,8 @@ from smartgrid.storage.archive import export_archive, import_archive
 log = logging.getLogger(__name__)
 # Smallest tile a linked resize leaves when windows are forced into their tiles.
 FORCED_MINIMUM = (160, 120)
+# Native window movement uses the visual animation curve.
+NATIVE_CURVES = {"ease-out": "crit_damped", "ease-in-out": "curved", "linear": "linear", "spring": "spring"}
 
 DEFAULT_HOTKEYS = {
     "toggle": "Ctrl+Alt+T", "arrange": "Ctrl+Alt+R", "studio": "Ctrl+Alt+P",
@@ -91,6 +93,9 @@ class Controller:
         self._pending_lock = threading.Lock()
         self._guide_callbacks = []
         self._follow_callbacks = []
+        # Frames per second of native window movement: the display refresh
+        # rate, set by the UI.
+        self.refresh_rate = 60
         self._minimize_snapshots = {}
         self._resize_snapshot = None
         self._swap_snapshot = None
@@ -824,7 +829,7 @@ class Controller:
             self._tile_rects[hwnd] = (profile.display_id, rectangle)
             if self.backend.place(hwnd, rectangle, animate=self.settings.window_animations and self.settings.animations,
                                   duration=self.settings.visual_duration() / 1000,
-                                  fps=self.settings.animation_fps, effect=self.settings.animation_effect,
+                                  fps=self.refresh_rate, effect=NATIVE_CURVES[self.settings.animation_curve],
                                   timeout=self.settings.tile_timeout, retries=self.settings.tile_retries,
                                   force=self.settings.force_resize):
                 result.placed.append(hwnd)
