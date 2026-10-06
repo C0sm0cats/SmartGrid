@@ -537,6 +537,12 @@ class WindowsBackend:
     def alive(self, hwnd):
         return bool(self.api.IsWindow(hwnd))
 
+    def is_maximized(self, hwnd):
+        return bool(self.api.IsZoomed(hwnd))
+
+    def is_minimized(self, hwnd):
+        return bool(self.api.IsIconic(hwnd))
+
     def minimize(self, hwnd):
         if not self.alive(hwnd):
             return False

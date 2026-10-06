@@ -839,3 +839,38 @@ class NativeMovementTests(unittest.TestCase):
             controller.arrange('d1')
             self.assertTrue(calls)
             self.assertTrue(all(c['animate'] and c['effect']=='spring' and c['fps']==144 for c in calls))
+
+
+class LiveMaximizeTests(unittest.TestCase):
+    def test_a_window_maximized_since_the_last_scan_is_not_restored(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            backend.windows[1]=replace(backend.windows[1],state='maximized')
+            backend.operations.clear()
+            controller._reflow_all(include_new=True)
+            self.assertEqual(backend.windows[1].state,'maximized')
+            self.assertFalse(backend.operations)
+
+    def test_a_window_maximized_during_an_arrangement_is_not_restored(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2),record(3)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            place=backend.place_result
+            def placing(hwnd,rect,*args,**kwargs):
+                # The user maximizes window 3 and minimizes window 2 while 1 is placed.
+                if hwnd==1:
+                    backend.windows[3]=replace(backend.windows[3],state='maximized')
+                    backend.windows[2]=replace(backend.windows[2],state='minimized')
+                return place(hwnd,rect,*args,**kwargs)
+            backend.place_result=placing
+            controller.profile('d1',0).resize_tiles=[]
+            for hwnd in (1,2,3): backend.windows[hwnd]=replace(backend.windows[hwnd],rect=Rect(0,0,10,10))
+            controller.refresh(auto=False)
+            controller._reflow_all(include_new=True)
+            self.assertEqual(backend.windows[3].state,'maximized')
+            self.assertEqual(backend.windows[2].state,'minimized')

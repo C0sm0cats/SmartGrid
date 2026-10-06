@@ -371,11 +371,13 @@ class Controller:
                             if not assignment.pinned and self.settings.compact_close:
                                 profile.assignments[index] = None
             changed |= bool(closed or created or replaced)
+            states = {}
             layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or bool((closed|replaced) & assigned) or any(self._eligible(live[h]) for h in created|replaced)
             for hwnd, window in live.items():
                 old = previous.get(hwnd)
                 if old and window.state != old.state:
                     changed = True
+                    states[hwnd] = (old.state, window.state)
                     layout_changed |= self._eligible(window) or self._eligible(old)
                     if window.state == "minimized" and hwnd not in self._parked and hwnd not in self._hidden_by_template:
                         context = (window.display_id, self.active_spaces.get(window.display_id, 0))
@@ -398,6 +400,8 @@ class Controller:
                             profile.assignments.append(Assignment(window.app_id, hwnd))
             self._bind_pending()
             if auto and self.running and not self.paused and layout_changed and not self._interacting and self._swap_snapshot is None:
+                log.info('Automatic arrangement: closed %s, created %s, replaced %s, states %s',
+                         sorted(closed), sorted(created), sorted(replaced), states)
                 self._reflow_all(include_new=True, compact=bool(closed and self.settings.compact_close))
             self._update_border()
             if changed or previous!=live or previous_profiles!=self.profiles or previous_error!=self.last_error:
@@ -729,8 +733,11 @@ class Controller:
         if not getattr(self.backend,'desktop_known',True):
             raise ValueError('Cannot identify the current Windows desktop; arrangement is suspended.')
         result = ApplyResult()
+        # The live state too: a window maximized since the last scan must not
+        # be restored by an automatic arrangement.
+        maximized=getattr(self.backend,'is_maximized',lambda h: False)
         blockers=[w for w in self.windows if w.display_id==profile.display_id and
-                  (w.state=="fullscreen" or (not explicit and w.state=="maximized" and self._eligible(w)))]
+                  (w.state=="fullscreen" or (not explicit and self._eligible(w) and (w.state=="maximized" or maximized(w.ref.hwnd))))]
         if not hide_surplus and blockers:
             if explicit:
                 result.failures={w.ref.hwnd:"A fullscreen window occupies this display. Leave fullscreen before arranging." for w in blockers}
@@ -799,6 +806,11 @@ class Controller:
                 continue
             if window.state == "fullscreen":
                 result.failures[hwnd] = "Fullscreen window: placement skipped."
+                continue
+            # Placing many windows takes a moment: one the user maximizes or
+            # minimizes meanwhile is left as it is, not restored and tiled.
+            if (not explicit and not hide_surplus and window.state == "normal"
+                    and (maximized(hwnd) or getattr(self.backend, "is_minimized", lambda h: False)(hwnd))):
                 continue
             if hwnd in self._floating:
                 continue

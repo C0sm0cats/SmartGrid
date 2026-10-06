@@ -93,6 +93,12 @@ class FakeBackend:
     def alive(self, hwnd):
         return hwnd in self.windows
 
+    def is_maximized(self, hwnd):
+        return hwnd in self.windows and self.windows[hwnd].state == 'maximized'
+
+    def is_minimized(self, hwnd):
+        return hwnd in self.windows and self.windows[hwnd].state == 'minimized'
+
     def minimize(self, hwnd):
         if not self.alive(hwnd) or hwnd in self.failures:
             return False
