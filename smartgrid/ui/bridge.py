@@ -7,6 +7,7 @@ class AppBridge(QObject):
     changed = Signal()
     guides = Signal()
     follow = Signal(int)
+    layout = Signal()
     error = Signal(str)
     status = Signal(str)
     busy_changed = Signal(bool)
@@ -26,6 +27,8 @@ class AppBridge(QObject):
         controller.subscribe(lambda *args: self.changed.emit() if not self.closed else None)
         if hasattr(controller, 'subscribe_guides'):
             controller.subscribe_guides(lambda: self.guides.emit() if not self.closed else None)
+        if hasattr(controller, 'subscribe_layout'):
+            controller.subscribe_layout(lambda: self.layout.emit() if not self.closed else None)
         if hasattr(controller, 'subscribe_follow'):
             controller.subscribe_follow(self._follow)
         if hasattr(controller, 'set_ui_action_handler'):

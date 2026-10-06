@@ -93,6 +93,7 @@ class Controller:
         self._pending_lock = threading.Lock()
         self._guide_callbacks = []
         self._follow_callbacks = []
+        self._layout_callbacks = []
         # Frames per second of native window movement: the display refresh
         # rate, set by the UI.
         self.refresh_rate = 60
@@ -196,6 +197,11 @@ class Controller:
                 callback(hwnd)
             except Exception:
                 log.exception("Follow subscriber failed")
+
+    def subscribe_layout(self, callback):
+        """Called when an arrangement has decided its tiles, before it places
+        the windows: pinned-tile cards appear at once."""
+        self._layout_callbacks.append(callback)
 
     def set_ui_action_handler(self, callback):
         self._ui_action = callback
@@ -781,6 +787,12 @@ class Controller:
                         self._hidden_by_template.add(hwnd)
                         result.hidden.append(hwnd)
         self._suppress_events_until = time.monotonic() + .6
+        profile.assignments = assignments
+        for callback in list(self._layout_callbacks):
+            try:
+                callback()
+            except Exception:
+                log.exception("Layout subscriber failed")
         for index, assignment in enumerate(assignments):
             if assignment is None:
                 continue

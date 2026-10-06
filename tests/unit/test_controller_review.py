@@ -874,3 +874,18 @@ class LiveMaximizeTests(unittest.TestCase):
             controller._reflow_all(include_new=True)
             self.assertEqual(backend.windows[3].state,'maximized')
             self.assertEqual(backend.windows[2].state,'minimized')
+
+
+class EarlyCardTests(unittest.TestCase):
+    def test_pinned_cards_are_known_before_the_windows_are_placed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(h,f'app{h}') for h in (1,2,3)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            for assignment in controller.profile('d1',0).assignments:
+                assignment.pinned=True
+            seen=[];place=backend.place_result
+            controller.subscribe_layout(lambda: seen.append([s['state'] for s in controller.reserved_slots()]))
+            backend.place_result=lambda *a,**k: (seen.append('place'),place(*a,**k))[1]
+            backend.minimize(2);controller.refresh(auto=True)
+            self.assertEqual(seen[0],['MINIMIZED'])

@@ -81,6 +81,7 @@ class DesktopUI:
         self.bridge.changed.connect(self.refresh, Qt.ConnectionType.QueuedConnection)
         self.bridge.guides.connect(self.refresh_drag, Qt.ConnectionType.QueuedConnection)
         self.bridge.follow.connect(self.follow_window, Qt.ConnectionType.QueuedConnection)
+        self.bridge.layout.connect(self.refresh_cards, Qt.ConnectionType.QueuedConnection)
         self.bridge.error.connect(self.error)
         self.tray.show()
         self.refresh()
@@ -233,6 +234,12 @@ class DesktopUI:
         self.stop_action.setEnabled(controller.running)
         if controller.last_error and controller.last_error != self.last_error:
             self.error(controller.last_error)
+        self.refresh_cards()
+
+    def refresh_cards(self):
+        """Pinned-tile cards; also called as soon as an arrangement has decided
+        its tiles, before its windows are placed."""
+        controller=self.controller
         slots = {(s['display_id'],s['space'],s['index']):s for s in controller.reserved_slots()}
         # Hidden while the Studio, the switcher or a window drag is active.
         hide_cards=bool(controller._interacting) or any(w.isVisible() for k,w in self.windows.items() if k in ('studio','quick_switcher'))
