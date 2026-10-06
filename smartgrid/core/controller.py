@@ -24,8 +24,6 @@ from smartgrid.storage.archive import export_archive, import_archive
 log = logging.getLogger(__name__)
 # Smallest tile a linked resize leaves when windows are forced into their tiles.
 FORCED_MINIMUM = (160, 120)
-# Native window movement uses the visual animation curve.
-NATIVE_CURVES = {"ease-out": "crit_damped", "ease-in-out": "curved", "linear": "linear", "spring": "spring"}
 
 DEFAULT_HOTKEYS = {
     "toggle": "Ctrl+Alt+T", "arrange": "Ctrl+Alt+R", "studio": "Ctrl+Alt+P",
@@ -94,9 +92,6 @@ class Controller:
         self._guide_callbacks = []
         self._follow_callbacks = []
         self._layout_callbacks = []
-        # Frames per second of native window movement: the display refresh
-        # rate, set by the UI.
-        self.refresh_rate = 60
         self._minimize_snapshots = {}
         self._resize_snapshot = None
         self._swap_snapshot = None
@@ -847,13 +842,18 @@ class Controller:
             previous_tile = self._tile_rects.get(hwnd)
             if previous_tile and previous_tile[0] == profile.display_id and self.settings.animations and \
                     any(abs(a - b) > 2 for a, b in zip(asdict(previous_tile[1]).values(), asdict(rectangle).values())):
-                # A ghost travels from the old tile to the new one.
-                self.motion_events = (self.motion_events + [(profile.display_id, previous_tile[1], rectangle,
-                                                              window.app_id, time.monotonic())])[-16:]
+                # A ghost travels from the old tile to the new one; for a window
+                # the user dropped, from where it was released.
+                start = previous_tile[1]
+                if window.display_id == profile.display_id and any(
+                        abs(a - b) > 8 for a, b in zip(asdict(window.rect).values(), asdict(start).values())):
+                    start = window.rect
+                self.motion_events = (self.motion_events + [(profile.display_id, start, rectangle,
+                                                              window.app_id, time.monotonic(), hwnd)])[-16:]
+                self._notify_guides()
             self._tile_rects[hwnd] = (profile.display_id, rectangle)
-            if self.backend.place(hwnd, rectangle, animate=self.settings.window_animations and self.settings.animations,
-                                  duration=self.settings.visual_duration() / 1000,
-                                  fps=self.refresh_rate, effect=NATIVE_CURVES[self.settings.animation_curve],
+            # Windows jump to their tile; the placement ghost animates the move.
+            if self.backend.place(hwnd, rectangle,
                                   timeout=self.settings.tile_timeout, retries=self.settings.tile_retries,
                                   force=self.settings.force_resize):
                 result.placed.append(hwnd)

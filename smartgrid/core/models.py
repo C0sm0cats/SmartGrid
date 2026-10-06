@@ -137,10 +137,11 @@ class Settings(Serializable):
     theme: str = 'system'
     accent: str = '#8ce8c3'
     animations: bool = True
+    # No longer offered (moving the real windows slowed every arrangement);
+    # kept so that existing settings files still load.
     window_animations: bool = False
     animation_duration: int = 140
-    # No longer offered (native movement follows animation_curve and the
-    # display refresh rate); kept so that existing settings files still load.
+    # No longer offered; kept so that existing settings files still load.
     animation_effect: str = 'crit_damped'
     animation_fps: int = 60
     sounds: bool = False  # no longer offered; kept so that existing settings files still load

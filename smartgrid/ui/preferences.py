@@ -110,14 +110,11 @@ class Preferences(QDialog):
         self._row(self.focus_group,'border_color','Focus color',self.color_button)
         self._spin(self.focus_group,'border_width','Outline thickness',1,6,subtitle='Pixels')
         self._combo(self.focus_group,'border_style','Outline style',[('outline','Outline'),('glow','Subtle halo')])
-        self.animation_group=self._group(main,'Animations','Adjust guides, focus effects and space transitions. Window placement is immediate unless window movement is animated.')
+        self.animation_group=self._group(main,'Animations','Adjust guides, focus effects and space transitions. Window placement stays immediate.')
         self._combo(self.animation_group,'animation_speed','Animation speed',[('fast','Fast'),('normal','Normal'),('slow','Slow'),('custom','Custom')])
         self._spin(self.animation_group,'animation_duration','Animation duration',40,500,
             subtitle='Base duration in milliseconds; longer transitions scale proportionally')
         self._combo(self.animation_group,'animation_curve','Animation curve',[('ease-out','Ease out'),('linear','Linear'),('ease-in-out','Ease in and out'),('spring','Spring')])
-        self._heading(self.animation_group,'Window movement')
-        self._check(self.animation_group,'window_animations','Animate native window movement',
-                    'Windows slide into their tiles with the speed and curve above')
         archive=self._group(main,'Back up and share','Export named layouts and per-space profiles to a JSON file. Import adds new items without replacing your existing ones.')
         self.export_button=QPushButton('Export…');self.export_button.clicked.connect(self.export_archive)
         self.import_button=QPushButton('Import…');self.import_button.clicked.connect(self.import_archive)

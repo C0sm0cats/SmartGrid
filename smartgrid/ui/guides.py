@@ -184,6 +184,75 @@ class PlacementGhost(Overlay):
         painter.drawText(QRectF(x + 32, y, self.width(), 24), Qt.AlignmentFlag.AlignVCenter, self.name)
 
 
+class WindowGhost(QWidget):
+    """Live image of a window travelling from its old tile to the new one.
+    Windows draws the image (a DWM thumbnail), so the move is
+    smooth however heavy the application. It lands exactly on the window,
+    which is already in place: the end is seamless."""
+    def __init__(self, api, source, frame, start, end, duration, curve):
+        from PySide6.QtCore import QVariantAnimation
+        super().__init__()
+        # Opaque and not click-through: Windows does not draw a thumbnail in a
+        # layered window. It only lives for the animation.
+        self.setWindowFlags(FLAGS)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.api, self.source, self.frame = api, source, frame
+        self.start_rect, self.end_rect, self.handle = start, end, None
+        self.animation = QVariantAnimation(self)
+        self.animation.setStartValue(0.0); self.animation.setEndValue(1.0)
+        self.animation.setDuration(duration); self.animation.setEasingCurve(curve)
+        self.animation.valueChanged.connect(self._step)
+        self.animation.finished.connect(self._finish)
+
+    def start(self):
+        """False when Windows has no image for the window: the caller falls back."""
+        import ctypes as C
+        from smartgrid.platform.windows.api import HANDLE
+        handle = HANDLE()
+        self.setGeometry(self.start_rect)
+        # The thumbnail is registered before the window shows: no empty frame.
+        if self.api.DwmRegisterThumbnail(int(self.winId()), self.source, C.byref(handle)) != 0 or not handle.value:
+            self.deleteLater()
+            return False
+        self.handle = handle.value
+        # Rounded corners like the window it shows (Windows 11; ignored elsewhere).
+        corner = C.c_int(2)
+        self.api.DwmSetWindowAttribute(int(self.winId()), 33, C.byref(corner), C.sizeof(corner))
+        if not self._step(0.0):
+            self._finish()
+            return False
+        self.show(); self.animation.start()
+        return True
+
+    def _step(self, value):
+        import ctypes as C
+        from PySide6.QtCore import QRect
+        from smartgrid.platform.windows.api import RECT, DWM_THUMBNAIL_PROPERTIES
+        if not self.handle:
+            return False
+        t, a, b = float(value), self.start_rect, self.end_rect
+        rect = QRect(round(a.x() + (b.x() - a.x()) * t), round(a.y() + (b.y() - a.y()) * t),
+                     max(1, round(a.width() + (b.width() - a.width()) * t)),
+                     max(1, round(a.height() + (b.height() - a.height()) * t)))
+        self.setGeometry(rect)
+        scale = self.devicePixelRatioF()
+        properties = DWM_THUMBNAIL_PROPERTIES()
+        # Destination, source, opacity, visibility, whole window.
+        properties.dwFlags = 0x01 | 0x02 | 0x04 | 0x08 | 0x10
+        properties.rcDestination = RECT(0, 0, round(rect.width() * scale), round(rect.height() * scale))
+        properties.rcSource = RECT(*self.frame)
+        properties.opacity = 255
+        properties.fVisible = True
+        properties.fSourceClientAreaOnly = False
+        return self.api.DwmUpdateThumbnailProperties(self.handle, C.byref(properties)) == 0
+
+    def _finish(self):
+        if self.handle:
+            self.api.DwmUnregisterThumbnail(self.handle)
+            self.handle = None
+        self.close(); self.deleteLater()
+
+
 class SourceGuide(Overlay):
     """Faint outline of the slot a swapped window leaves."""
     def paintEvent(self, event):

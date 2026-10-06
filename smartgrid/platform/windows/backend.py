@@ -190,6 +190,15 @@ class WindowsBackend:
         return rect_from_native(rect)
 
     @physical
+    def visible_frame(self, hwnd):
+        """The visible frame inside the window rectangle, without the invisible
+        resize borders: left, top, right, bottom relative to the window."""
+        raw, frame = self._raw_rect(hwnd), self.window_rect(hwnd)
+        if not raw or not frame:
+            return None
+        return (frame.x - raw.x, frame.y - raw.y, frame.right - raw.x, frame.bottom - raw.y)
+
+    @physical
     def window_rect(self, hwnd):
         rect = RECT()
         if not self.api.IsIconic(hwnd) and self.api.DwmGetWindowAttribute(hwnd, 9, C.byref(rect), C.sizeof(rect)) == 0:

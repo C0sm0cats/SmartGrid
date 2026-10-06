@@ -827,18 +827,17 @@ class FreeMoveTests(unittest.TestCase):
 
 
 class NativeMovementTests(unittest.TestCase):
-    def test_native_movement_follows_the_animation_curve_and_refresh_rate(self):
+    def test_windows_jump_to_their_tile_even_with_a_retired_animation_setting(self):
         with tempfile.TemporaryDirectory() as directory:
             display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
             backend=FakeBackend([display],[record(1),record(2)],[])
             controller=Controller(backend,Repository(directory));controller.start()
-            controller.settings.window_animations=True;controller.settings.animation_curve='spring'
-            controller.refresh_rate=144
+            controller.settings.window_animations=True
             calls=[];place=backend.place
             backend.place=lambda hwnd,rect,**kwargs: calls.append(kwargs) or place(hwnd,rect,**kwargs)
             controller.arrange('d1')
             self.assertTrue(calls)
-            self.assertTrue(all(c['animate'] and c['effect']=='spring' and c['fps']==144 for c in calls))
+            self.assertFalse(any(c.get('animate') for c in calls))
 
 
 class LiveMaximizeTests(unittest.TestCase):
@@ -889,3 +888,23 @@ class EarlyCardTests(unittest.TestCase):
             backend.place_result=lambda *a,**k: (seen.append('place'),place(*a,**k))[1]
             backend.minimize(2);controller.refresh(auto=True)
             self.assertEqual(seen[0],['MINIMIZED'])
+
+
+class PlacementGhostTests(unittest.TestCase):
+    def test_a_dropped_window_glides_from_where_it_was_released(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            profile=controller.profile('d1',0)
+            tiles={a.window_id:r for a,r in zip(profile.assignments,controller.resolved_rects('d1',0))}
+            released=Rect(1200,300,640,480)
+            backend.windows[1]=replace(backend.windows[1],rect=released)
+            controller.refresh(auto=False)
+            guides=[];controller.subscribe_guides(lambda: guides.append(1))
+            profile.assignments.reverse();controller._apply_profile(profile)
+            starts={event[5]:event[1] for event in controller.motion_events}
+            self.assertEqual(starts[1],released)
+            self.assertEqual(starts[2],tiles[2])
+            self.assertTrue(guides)
