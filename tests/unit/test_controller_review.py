@@ -788,3 +788,22 @@ class FloatingMoveTests(unittest.TestCase):
             self.assertEqual([a.window_id if a else None for a in controller.profile('d1',0).assignments],[1,None,3,4,5,6])
             controller.toggle_float(2)
             self.assertEqual(backend.windows[2].rect,tile)
+
+
+class HiddenCloseTests(unittest.TestCase):
+    def test_a_window_hidden_before_it_closes_shrinks_the_grid(self):
+        # Electron apps (Bruno) hide their window, then destroy it.
+        from dataclasses import replace
+        from smartgrid.core.geometry import effective_layout
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(h,f'app{h}') for h in range(1,16)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            for assignment in controller.profile('d1',0).assignments:
+                assignment.pinned=True
+            backend.add_window('bruno',hwnd=99);controller.refresh(auto=True)
+            self.assertEqual(effective_layout(controller.profile('d1',0),runtime=True)[0],'4x4')
+            backend.windows[99]=replace(backend.windows[99],eligible=False);controller.refresh(auto=True)
+            backend.remove_window(99);controller.refresh(auto=True)
+            self.assertEqual(effective_layout(controller.profile('d1',0),runtime=True)[0],'5x3')
+            self.assertEqual(backend.windows[15].rect,controller.resolved_rects('d1',0)[14])

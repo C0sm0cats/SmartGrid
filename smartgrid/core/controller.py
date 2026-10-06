@@ -346,6 +346,9 @@ class Controller:
             created = set(live) - set(previous)
             # HWND reuse must never restore a different application/process generation.
             replaced = {h for h in previous.keys() & live.keys() if previous[h].ref != live[h].ref}
+            # A window hidden before it is destroyed (Electron apps such as Bruno)
+            # is already ineligible when it closes: its tile still counts.
+            assigned = {a.window_id for p in self.profiles.values() for a in p.assignments if a and a.window_id}
             for hwnd in closed | replaced:
                 self._originals.pop(hwnd, None)
                 self._floating.discard(hwnd)
@@ -360,7 +363,7 @@ class Controller:
                             if not assignment.pinned and self.settings.compact_close:
                                 profile.assignments[index] = None
             changed |= bool(closed or created or replaced)
-            layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or any(self._eligible(live[h]) for h in created|replaced)
+            layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or bool((closed|replaced) & assigned) or any(self._eligible(live[h]) for h in created|replaced)
             for hwnd, window in live.items():
                 old = previous.get(hwnd)
                 if old and window.state != old.state:
