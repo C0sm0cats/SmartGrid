@@ -80,6 +80,8 @@ class Controller:
         self._interaction_started = {}
         self._placed_at = {}
         self._interacting = set()
+        # Floating or unmanaged windows moved by the user: no rescan until released.
+        self._free_moving = set()
         self._move_origins = {}
         # 'move' or 'resize' per window being dragged, and its state at the start.
         self._gesture_kinds = {}
@@ -315,7 +317,7 @@ class Controller:
                 self._desktop_id=desktop
                 self.history.clear();self._hide_overlay();self._clear_border()
                 self._last_tiled_selection=None
-                self._interacting.clear();self._move_origins.clear();self._resize_snapshot=None
+                self._interacting.clear();self._free_moving.clear();self._move_origins.clear();self._resize_snapshot=None
                 if self._swap_snapshot is not None:
                     # Never roll an old-desktop snapshot onto the new desktop.
                     self._swap_snapshot=None;self._swap_hwnd=None
@@ -351,6 +353,7 @@ class Controller:
             assigned = {a.window_id for p in self.profiles.values() for a in p.assignments if a and a.window_id}
             for hwnd in closed | replaced:
                 self._originals.pop(hwnd, None)
+                self._free_moving.discard(hwnd)
                 self._floating.discard(hwnd)
                 self._late_unmanaged.discard(hwnd)
                 self._parked.discard(hwnd)
@@ -456,6 +459,7 @@ class Controller:
                 # Moving a floating or unmanaged window is an ordinary move: no
                 # drop target, no snapping, and its reserved tile is kept.
                 if not self._is_tiled(hwnd):
+                    self._free_moving.add(hwnd)
                     return
                 self._interacting.add(hwnd)
                 self._interaction_started[hwnd]=time.monotonic()
@@ -474,6 +478,11 @@ class Controller:
                     log.info("Gesture %s on %s (%s) from %s", kind or "unknown", hwnd, w.app_id, rect)
                 return
             if kind in ("move_end", "resize_end", "movesize_end") and hwnd:
+                if hwnd in self._free_moving:
+                    # One rescan at release: display and size of the moved window.
+                    self._free_moving.discard(hwnd)
+                    self.refresh(auto=True)
+                    return
                 if hwnd not in self._interacting:
                     return
                 self._interacting.discard(hwnd)
@@ -513,6 +522,10 @@ class Controller:
                 if now-self._last_preview>=.015:
                     self._last_preview=now
                     self._preview_native_drag(hwnd)
+                return
+            if kind in ("location", "location_change") and hwnd in self._free_moving:
+                # The palette follows from the event thread; a full rescan here
+                # would hold Python and make it stutter.
                 return
             if time.monotonic() < self._suppress_events_until and kind not in ("foreground", "destroyed", "display_change"):
                 return

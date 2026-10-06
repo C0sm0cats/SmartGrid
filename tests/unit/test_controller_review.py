@@ -807,3 +807,20 @@ class HiddenCloseTests(unittest.TestCase):
             backend.remove_window(99);controller.refresh(auto=True)
             self.assertEqual(effective_layout(controller.profile('d1',0),runtime=True)[0],'5x3')
             self.assertEqual(backend.windows[15].rect,controller.resolved_rects('d1',0)[14])
+
+
+class FreeMoveTests(unittest.TestCase):
+    def test_moving_a_floating_window_rescans_only_at_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1),record(2)],[])
+            controller=Controller(backend,Repository(directory));controller.start()
+            controller.toggle_float(2)
+            scans=[];discover=backend.discover_windows
+            backend.discover_windows=lambda: scans.append(1) or discover()
+            controller._handle_event({'type':'move_start','hwnd':2})
+            controller._last_reconcile=0.0
+            controller._handle_event({'type':'location','hwnd':2})
+            self.assertFalse(scans)
+            controller._handle_event({'type':'move_end','hwnd':2})
+            self.assertTrue(scans);self.assertFalse(controller._free_moving)
