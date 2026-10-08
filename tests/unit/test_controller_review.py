@@ -908,3 +908,21 @@ class PlacementGhostTests(unittest.TestCase):
             self.assertEqual(starts[1],released)
             self.assertEqual(starts[2],tiles[2])
             self.assertTrue(guides)
+
+
+class AtomicSaveTests(unittest.TestCase):
+    def test_a_briefly_locked_file_is_saved_after_a_retry(self):
+        from unittest import mock
+        from smartgrid.storage import repository
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'layouts.json'
+            replace=repository.os.replace;calls=[]
+            def locked(source,target):
+                calls.append(1)
+                if len(calls)<3: raise PermissionError(5,'Access is denied')
+                replace(source,target)
+            with mock.patch.object(repository.os,'replace',locked):
+                repository.atomic_json(path,{'a':1})
+            self.assertEqual(json.loads(path.read_text()),{'a':1})
+            self.assertEqual(len(calls),3)
+            self.assertEqual([p.name for p in Path(directory).iterdir()],['layouts.json'])

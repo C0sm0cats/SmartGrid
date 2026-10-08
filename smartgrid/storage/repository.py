@@ -6,6 +6,7 @@ import logging
 import os
 from pathlib import Path
 import tempfile
+import time
 from datetime import datetime, timezone
 
 from smartgrid.core.models import Settings, SpaceProfile, LayoutTemplate
@@ -42,7 +43,16 @@ def atomic_json(path: Path, data: dict) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        # Windows refuses the swap while another process (antivirus, search
+        # indexer, sync client) briefly holds the file open: retry a moment.
+        for attempt in range(10):
+            try:
+                os.replace(temporary, path)
+                break
+            except PermissionError:
+                if attempt == 9:
+                    raise
+                time.sleep(.05)
     finally:
         Path(temporary).unlink(missing_ok=True)
 
