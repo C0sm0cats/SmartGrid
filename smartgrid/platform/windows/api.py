@@ -83,7 +83,7 @@ class Win32:
                 'DestroyWindow': (BOOL, [HWND]), 'DefWindowProcW': (LRESULT, [HWND, UINT, WPARAM, LPARAM]),
                 'SetLayeredWindowAttributes': (BOOL, [HWND, DWORD, BYTE, DWORD]), 'GetDC': (HDC, [HWND]), 'ReleaseDC': (C.c_int, [HWND, HDC]),
                 'DestroyIcon': (BOOL, [HANDLE]), 'GetIconInfo': (BOOL, [HANDLE, p(ICONINFO)]),
-                'GetCursorPos': (BOOL, [p(POINT)]),
+                'GetCursorPos': (BOOL, [p(POINT)]), 'GetAsyncKeyState': (C.c_short, [C.c_int]),
             },
             'kernel32': {
                 'OpenProcess': (HANDLE, [DWORD, BOOL, DWORD]), 'CloseHandle': (BOOL, [HANDLE]),

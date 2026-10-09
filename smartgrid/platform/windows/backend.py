@@ -535,6 +535,32 @@ class WindowsBackend:
             log.info('Forced fit of %s ended at %sx%s for a %sx%s tile', hwnd, visible.width, visible.height, rect.width, rect.height)
         return visible
 
+    def is_visible(self, hwnd):
+        return bool(self.api.IsWindowVisible(hwnd))
+
+    def mouse_down(self):
+        """Left (primary) mouse button held, read live."""
+        state = getattr(self.api, 'GetAsyncKeyState', None)
+        return bool(state and state(0x01) & 0x8000)
+
+    @physical
+    def window_monitor(self, hwnd):
+        """Live monitor and work area of the monitor holding the window."""
+        info = MONITORINFOEX()
+        info.cbSize = C.sizeof(info)
+        monitor = self.api.MonitorFromWindow(hwnd, 2)
+        if not monitor or not self.api.GetMonitorInfoW(monitor, C.byref(info)):
+            return None
+        return rect_from_native(info.rcMonitor), rect_from_native(info.rcWork)
+
+    @physical
+    def clamp(self, hwnd, rect):
+        """Put a tiled window back in its tile at once, below its minimum size
+        if need be; no waiting for it to settle (the slot guard)."""
+        self._place_once(hwnd, rect, force=True)
+        if not self._close_rect(self.window_rect(hwnd), rect):
+            self._force_fit(hwnd, rect)
+
     def place(self, hwnd, rect, animate=False, **kwargs):
         self.last_result = self.place_result(hwnd, rect, animate, **kwargs)
         if not self.last_result.success:

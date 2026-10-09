@@ -86,6 +86,19 @@ class FakeBackend:
         self.emit('location', hwnd)
         return PlacementResult(True, rect, rect, 1)
 
+    mouse_pressed = False
+
+    def mouse_down(self):
+        return self.mouse_pressed
+
+    def window_monitor(self, hwnd):
+        window = self.windows.get(hwnd)
+        display = next((d for d in self.displays if window and d.id == window.display_id), None)
+        return (display.work_area, display.work_area) if display else None
+
+    def clamp(self, hwnd, rect):
+        self.place(hwnd, rect, force=True)
+
     def place(self, hwnd, rect, animate=False, **kwargs):
         self.last_result = self.place_result(hwnd, rect, animate, **kwargs)
         return self.last_result.success

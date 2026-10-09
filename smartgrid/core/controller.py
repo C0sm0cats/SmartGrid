@@ -107,6 +107,19 @@ class Controller:
         self.motion_events = []
         self.swap_event = None
         self._tile_rects = {}
+        # Slot guard: apps that grow back out of their tile after placement
+        # (GTK, Qt, Electron) are clamped again. Correction times per window;
+        # a window that never stays in its tile is left alone until placed again.
+        self._guard_fixed = {}
+        self._guard_released = set()
+        # Windows in a native move or resize (start time), known as soon as
+        # Windows reports it: the guard never clamps a window the user has
+        # just grabbed, even before the runtime has handled the gesture.
+        self._native_gestures = {}
+        self._last_guard = 0.0
+        # A move seen during a window's cooldown is checked again at its end.
+        self._guard_recheck = None
+        self._last_display_change = 0.0
         self._closed = False
         self._last_reconcile = 0.0
         self._last_preview = 0.0
@@ -359,6 +372,8 @@ class Controller:
             assigned = {a.window_id for p in self.profiles.values() for a in p.assignments if a and a.window_id}
             for hwnd in closed | replaced:
                 self._originals.pop(hwnd, None)
+                self._tile_rects.pop(hwnd, None)
+                self._guard_fixed.pop(hwnd, None);self._guard_released.discard(hwnd)
                 self._free_moving.discard(hwnd)
                 self._floating.discard(hwnd)
                 self._late_unmanaged.discard(hwnd)
@@ -430,8 +445,25 @@ class Controller:
     def _enqueue_event(self, event):
         """Queue a native event; location events are coalesced per window, so a
         drag never waits behind a backlog of positions already out of date."""
+        kind = event.get("type")
+        if kind == "display_change":
+            self._last_display_change = time.monotonic()
+        if kind in ("move_start", "resize_start", "movesize_start") and event.get("hwnd"):
+            self._native_gestures[event["hwnd"]] = time.monotonic()
+        elif kind in ("move_end", "resize_end", "movesize_end", "destroyed"):
+            self._native_gestures.pop(event.get("hwnd"), None)
         if event.get("type") in ("location", "location_change") and event.get("hwnd"):
             self._notify_follow(event["hwnd"])
+            # A tiled window resizing itself is clamped from here, before the
+            # queue, when nothing else holds the runtime (no arrangement, rescan
+            # or gesture handling); otherwise the queued event clamps it.
+            if event["hwnd"] in self._tile_rects and self._lock.acquire(blocking=False):
+                try:
+                    self._guard_slots(only=event["hwnd"])
+                except Exception:
+                    log.exception("Slot guard failed")
+                finally:
+                    self._lock.release()
             with self._pending_lock:
                 queued = event["hwnd"] in self._pending_locations
                 self._pending_locations[event["hwnd"]] = event
@@ -440,10 +472,25 @@ class Controller:
         self._queue.put(event)
 
     def _event_loop(self):
+        last_event = time.monotonic()
         while not self._stop_event.is_set():
+            recheck = self._guard_recheck
+            wait = .2 if recheck is None else min(.2, max(0.0, recheck - time.monotonic()))
             try:
-                event = self._queue.get(timeout=1.0)
+                event = self._queue.get(timeout=wait)
+                last_event = time.monotonic()
             except queue.Empty:
+                event = None
+            if time.monotonic() - self._last_guard >= .2 or (recheck is not None and time.monotonic() >= recheck):
+                self._guard_recheck = None
+                try:
+                    self._guard_slots()
+                except Exception:
+                    log.exception("Slot guard failed")
+            if event is None:
+                if time.monotonic() - last_event < 1.0:
+                    continue
+                last_event = time.monotonic()
                 event = {"type": "reconcile"}
             try:
                 if event.get("type") in ("location", "location_change") and event.get("hwnd"):
@@ -458,8 +505,101 @@ class Controller:
                 self.last_error = str(error)
                 self._notify()
 
+    def _guard_slots(self, only=None):
+        """Clamp tiled windows that grew or moved out of their tile on their
+        own: no window can be stopped from resizing itself, but it goes back
+        at once. Runs on each move of a tiled window (only) and every 0.2 s
+        as a safety net. Only with Force windows into their tiles: a window
+        kept at its minimum size is meant to overflow."""
+        with self._lock:
+            now = time.monotonic()
+            if only is None:
+                self._last_guard = now
+                # A gesture whose end was never reported (window destroyed
+                # meanwhile) does not disable the guard for good.
+                for hwnd, started in list(self._native_gestures.items()):
+                    if now - started > 120 or not self.backend.alive(hwnd):
+                        self._native_gestures.pop(hwnd, None)
+            if (not self.running or self.paused or not self.settings.force_resize or self._interacting
+                    or self._native_gestures
+                    or self._swap_snapshot is not None or now - self._last_display_change < 1.0
+                    or not getattr(self.backend, 'desktop_known', True)):
+                return
+            maximized = getattr(self.backend, "is_maximized", lambda h: False)
+            minimized = getattr(self.backend, "is_minimized", lambda h: False)
+            for display in self.displays:
+                profile = self.profile(display.id, self.active_spaces.get(display.id, 0))
+                for assignment in profile.assignments:
+                    hwnd = assignment.window_id if assignment else None
+                    if only is not None and hwnd != only:
+                        continue
+                    tile = self._tile_rects.get(hwnd)
+                    window = self._window(hwnd)
+                    if (not tile or tile[0] != display.id or not window or window.state != "normal"
+                            or hwnd in self._floating or hwnd in self._manual_minimized or not self._eligible(window)
+                            or hwnd in self._guard_released):
+                        continue
+                    due = self._guard_fixed.get(hwnd, (0.0,))[-1] + self._guard_cooldown(hwnd, now)
+                    if now < due:
+                        if only is not None:
+                            # Moved again during its cooldown: checked at its end,
+                            # not up to 0.2 s later.
+                            self._guard_recheck = min(due, self._guard_recheck or due)
+                        continue
+                    rect = self.backend.window_rect(hwnd)
+                    if not rect or (abs(rect.x - tile[1].x) <= 8 and abs(rect.y - tile[1].y) <= 8 and
+                                    abs(rect.width - tile[1].width) <= 8 and abs(rect.height - tile[1].height) <= 8):
+                        continue
+                    if (maximized(hwnd) or minimized(hwnd) or not self.backend.alive(hwnd)
+                            or not getattr(self.backend, "is_visible", lambda h: True)(hwnd)):
+                        # Hidden (an app going to the tray) is left alone too.
+                        continue
+                    moved = abs(rect.x - tile[1].x) > 8 or abs(rect.y - tile[1].y) > 8
+                    if moved and getattr(self.backend, "mouse_down", lambda: False)():
+                        # Moved while the mouse button is held: a window dragged
+                        # by the application's own code (no native move
+                        # reported) is never pulled back under the cursor; it is
+                        # checked again once released. Growing in place is
+                        # clamped at once.
+                        continue
+                    monitor = getattr(self.backend, "window_monitor", lambda h: None)(hwnd)
+                    if monitor and (monitor[1] != display.work_area or (
+                            abs(rect.width - monitor[0].width) <= 2 and abs(rect.height - monitor[0].height) <= 2)):
+                        # Displays changing (not rescanned yet: the tile may be
+                        # stale or off screen), or a video or game going
+                        # fullscreen: never pulled back into the tile.
+                        continue
+                    self._guard_fixed[hwnd] = tuple(t for t in self._guard_fixed.get(hwnd, ()) if now - t < 3) + (now,)
+                    # Growing back right after each clamp (10 times in 3 s), not
+                    # now and then like an app reacting to clicks: let it be.
+                    if len(self._guard_fixed[hwnd]) >= 10:
+                        # It grows back whatever we do: no endless flicker; it
+                        # overflows as before until an arrangement places it.
+                        self._guard_released.add(hwnd)
+                        log.info("Slot guard released %s (%s): it keeps resizing itself", hwnd, window.app_id)
+                        continue
+                    log.info("Re-clamp %s (%s) to its tile: %s -> %s", hwnd, window.app_id, rect, tile[1])
+                    # Direct clamp, no wait for stability: if the window grows
+                    # back, its next move event clamps it again.
+                    clamp = getattr(self.backend, "clamp", None)
+                    if clamp:
+                        clamp(hwnd, tile[1])
+                    else:
+                        self.backend.place(hwnd, tile[1], timeout=min(self.settings.tile_timeout, .5),
+                                           retries=1, force=True)
+            for hwnd in [h for h in self._guard_fixed if now - self._guard_fixed[h][-1] > 3]:
+                self._guard_fixed.pop(hwnd)
+
+    def _guard_cooldown(self, hwnd, now):
+        """Corrected again at once, unless the window keeps growing back
+        (5 corrections in 1 s): then at most every 0.22 s, no fight."""
+        recent = [t for t in self._guard_fixed.get(hwnd, ()) if now - t < 1]
+        return .22 if len(recent) >= 5 else .03
+
     def _handle_event(self, event):
         kind, hwnd = event.get("type", ""), event.get("hwnd")
+        if kind == "display_change":
+            self._last_display_change = time.monotonic()
         with self._lock:
             if kind in ("move_start", "resize_start", "movesize_start") and hwnd:
                 # Start following the gesture at once: no full rescan here.
@@ -537,6 +677,9 @@ class Controller:
                 # The palette follows from the event thread; a full rescan here
                 # would hold Python and make it stutter.
                 return
+            if kind in ("location", "location_change") and hwnd in self._tile_rects:
+                # A tiled window resizing itself goes back before anything else.
+                self._guard_slots(only=hwnd)
             if time.monotonic() < self._suppress_events_until and kind not in ("foreground", "destroyed", "display_change"):
                 return
             # While a window is dragged, other windows' moves and title changes
@@ -594,6 +737,12 @@ class Controller:
             if window and window.ref == reference and self.backend.alive(hwnd):
                 if not self.backend.restore(hwnd, state):
                     failures.append(hwnd)
+                elif hwnd in self._tile_rects:
+                    # Undo and redo put windows back without an arrangement:
+                    # their tile is where they now are, for the slot guard.
+                    rect = self.backend.window_rect(hwnd)
+                    if rect:
+                        self._tile_rects[hwnd] = (self._tile_rects[hwnd][0], rect)
         if snapshot["focus"] and self.backend.alive(snapshot["focus"]):
             self.backend.focus(snapshot["focus"])
         current_displays={display.id for display in self.displays}
@@ -852,6 +1001,7 @@ class Controller:
                                                               window.app_id, time.monotonic(), hwnd)])[-16:]
                 self._notify_guides()
             self._tile_rects[hwnd] = (profile.display_id, rectangle)
+            self._guard_released.discard(hwnd);self._guard_fixed.pop(hwnd, None)
             # Windows jump to their tile; the placement ghost animates the move.
             if self.backend.place(hwnd, rectangle,
                                   timeout=self.settings.tile_timeout, retries=self.settings.tile_retries,

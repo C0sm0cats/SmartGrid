@@ -926,3 +926,175 @@ class AtomicSaveTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text()),{'a':1})
             self.assertEqual(len(calls),3)
             self.assertEqual([p.name for p in Path(directory).iterdir()],['layouts.json'])
+
+
+class SlotGuardTests(unittest.TestCase):
+    def make(self, directory):
+        from dataclasses import replace
+        display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+        backend=FakeBackend([display],[record(1),record(2),record(3)],[])
+        controller=Controller(backend,Repository(directory));controller.start()
+        tile=controller._tile_rects[1][1]
+        grow=lambda: backend.windows.__setitem__(1,replace(backend.windows[1],rect=Rect(tile.x,tile.y,tile.width+93,tile.height)))
+        return controller,backend,tile,grow
+
+    def test_a_window_growing_out_of_its_tile_is_clamped_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            grow();controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,tile)
+            # At most every 0.22 s per window: no fight with a stubborn app.
+            grow();controller._guard_slots()
+            self.assertNotEqual(backend.windows[1].rect,tile)
+
+    def test_the_guard_leaves_windows_alone_when_it_must(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            cases=[('settings','force_resize',False),('interacting',None,None),('floating',None,None),('maximized',None,None)]
+            for case,_,_ in cases:
+                controller._guard_fixed.clear();grow()
+                if case=='settings': controller.settings.force_resize=False
+                if case=='interacting': controller._interacting.add(2)
+                if case=='floating': controller._floating.add(1)
+                if case=='maximized': backend.windows[1]=replace(backend.windows[1],state='maximized')
+                controller._guard_slots()
+                self.assertNotEqual(backend.windows[1].rect,tile,case)
+                controller.settings.force_resize=True;controller._interacting.clear();controller._floating.discard(1)
+                backend.windows[1]=replace(backend.windows[1],state='normal')
+
+    def test_small_differences_are_tolerated(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            nearly=Rect(tile.x,tile.y,tile.width+6,tile.height)
+            backend.windows[1]=replace(backend.windows[1],rect=nearly)
+            controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,nearly)
+
+    def test_a_move_event_clamps_at_once_and_a_stubborn_window_is_not_fought(self):
+        import time as clock
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            grow();controller._handle_event({'type':'location','hwnd':1})
+            self.assertEqual(backend.windows[1].rect,tile)
+            # A window that keeps growing back is then corrected at most every 0.22 s.
+            now=clock.monotonic()
+            controller._guard_fixed[1]=tuple(now-.1*i for i in range(8,0,-1))
+            grow();controller._handle_event({'type':'location','hwnd':1})
+            self.assertNotEqual(backend.windows[1].rect,tile)
+
+    def test_a_move_is_clamped_before_the_queue_unless_the_runtime_is_busy(self):
+        import threading
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            grow();controller._enqueue_event({'type':'location','hwnd':1})
+            self.assertEqual(backend.windows[1].rect,tile)
+            # An arrangement (another thread holding the runtime) is never interrupted.
+            controller._guard_fixed.clear();grow()
+            held,release=threading.Event(),threading.Event()
+            def arrangement():
+                with controller._lock:
+                    held.set();release.wait(5)
+            worker=threading.Thread(target=arrangement);worker.start();held.wait(5)
+            controller._enqueue_event({'type':'location','hwnd':2})
+            controller._enqueue_event({'type':'location','hwnd':1})
+            self.assertNotEqual(backend.windows[1].rect,tile)
+            release.set();worker.join(5)
+            self.assertIn(1,controller._pending_locations)
+
+    def test_a_grabbed_window_is_never_clamped_before_its_gesture_is_handled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            # Windows reports the start of the drag, then moves; the runtime
+            # has not handled the start yet.
+            controller._enqueue_event({'type':'move_start','hwnd':1})
+            grow();controller._enqueue_event({'type':'location','hwnd':1})
+            controller._guard_slots()
+            self.assertNotEqual(backend.windows[1].rect,tile)
+            # Drag and drop and swap still work as before.
+            controller._handle_event({'type':'move_start','hwnd':1})
+            controller._enqueue_event({'type':'move_end','hwnd':1})
+            self.assertTrue(controller._interacting)
+            controller._guard_slots()
+            self.assertNotEqual(backend.windows[1].rect,tile)
+
+    def test_undo_is_not_reverted_by_the_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            before={h:backend.windows[h].rect for h in (1,2)}
+            controller.history.push(controller._snapshot())
+            profile=controller.profile('d1',0)
+            profile.assignments[0],profile.assignments[1]=profile.assignments[1],profile.assignments[0]
+            controller._apply_profile(profile)
+            self.assertNotEqual(backend.windows[1].rect,before[1])
+            controller.undo();controller._guard_fixed.clear();controller._guard_slots()
+            self.assertEqual({h:backend.windows[h].rect for h in (1,2)},before)
+
+    def test_a_window_that_never_stays_in_its_tile_is_released(self):
+        import time as clock
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            now=clock.monotonic()
+            controller._guard_fixed[1]=tuple(now-2.9+.3*i for i in range(9))
+            grow();controller._guard_slots()
+            self.assertIn(1,controller._guard_released)
+            self.assertNotEqual(backend.windows[1].rect,tile)
+            # Placed again by an arrangement: guarded again.
+            controller._apply_profile(controller.profile('d1',0))
+            self.assertNotIn(1,controller._guard_released)
+
+    def test_a_gesture_without_an_end_does_not_disable_the_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            controller._enqueue_event({'type':'move_start','hwnd':999})
+            grow();controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,tile)
+
+    def test_fullscreen_and_changing_displays_are_left_alone(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            # A video going fullscreen in a tiled browser.
+            backend.windows[1]=replace(backend.windows[1],rect=Rect(0,0,1920,1080))
+            controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,Rect(0,0,1920,1080))
+            # Resolution changed, not rescanned yet: the tile may be stale.
+            controller._guard_fixed.clear();grow()
+            backend.displays=[Display('d1','D',Rect(0,0,2560,1440),primary=True)]
+            controller._guard_slots()
+            self.assertNotEqual(backend.windows[1].rect,tile)
+
+    def test_a_window_moved_under_the_held_mouse_is_not_pulled_back(self):
+        from dataclasses import replace
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            # An application dragging its own window (no native move reported).
+            backend.mouse_pressed=True
+            dragged=Rect(tile.x+300,tile.y+40,tile.width,tile.height)
+            backend.windows[1]=replace(backend.windows[1],rect=dragged)
+            controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,dragged)
+            # Growing in place is clamped at once, even with the button held.
+            controller._guard_fixed.clear();grow();controller._guard_slots()
+            self.assertEqual(backend.windows[1].rect,tile)
+
+    def test_an_app_growing_now_and_then_stays_guarded(self):
+        import time as clock
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            # Ten corrections spread over 9 s: clicks, not a stubborn app.
+            now=clock.monotonic()
+            controller._guard_fixed[1]=tuple(now-9+i for i in range(9))
+            grow();controller._guard_slots()
+            self.assertNotIn(1,controller._guard_released)
+            self.assertEqual(backend.windows[1].rect,tile)
+
+    def test_a_move_during_the_cooldown_is_checked_at_its_end(self):
+        with tempfile.TemporaryDirectory() as directory:
+            controller,backend,tile,grow=self.make(directory)
+            grow();controller._guard_slots(only=1)
+            self.assertEqual(backend.windows[1].rect,tile)
+            grow();controller._guard_slots(only=1)
+            fixed=controller._guard_fixed[1][-1]
+            self.assertAlmostEqual(controller._guard_recheck,fixed+.03,places=3)
