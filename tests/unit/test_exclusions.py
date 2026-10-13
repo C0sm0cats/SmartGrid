@@ -19,6 +19,11 @@ class ExclusionTests(unittest.TestCase):
         self.assertTrue(excluded_window('Microsoft Teams', teams, 400, 150))
         self.assertFalse(excluded_window('Chat | Microsoft Teams', teams, 1200, 800))
 
+    def test_packaged_teams_sharing_bar_is_not_tiled(self):
+        teams = 'aumid:msteams_8wekyb3d8bbwe!msteams'
+        self.assertTrue(excluded_window('Microsoft Teams', teams, 600, 60))
+        self.assertFalse(excluded_window('Chat | Microsoft Teams', teams, 1200, 800))
+
     def test_shell_and_dialog_classes(self):
         self.assertTrue(excluded_class('#32770'))
         self.assertTrue(excluded_class('Progman'))

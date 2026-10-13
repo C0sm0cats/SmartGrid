@@ -88,7 +88,9 @@ def excluded_app(name, words=TITLE_WORDS):
 def excluded_window(title, app_id='', width=0, height=0, words=TITLE_WORDS):
     """Return the reason a window is excluded by default, or ''."""
     executable = ntpath.basename(app_id.partition(':')[2]) if app_id.startswith('exe:') else ''
-    if executable == 'ms-teams.exe' and (height < 200 or (width < TEAMS_TOAST[0] and height < TEAMS_TOAST[1])):
+    # New Teams is a packaged app, identified by its AUMID rather than its executable.
+    teams = executable == 'ms-teams.exe' or app_id.startswith('aumid:msteams_')
+    if teams and (height < 200 or (width < TEAMS_TOAST[0] and height < TEAMS_TOAST[1])):
         return 'Microsoft Teams notification'
     text = ' '.join((title or '').casefold().split())
     if not text:
