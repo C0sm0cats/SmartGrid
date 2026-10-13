@@ -36,6 +36,8 @@ CLASSES = frozenset(name.casefold() for name in (
     'Microsoft.UI.Content.PopupWindowSiteBridge', 'NotepadShellExperienceHost', 'TRectangleCapture',
 ))
 TEAMS_TOAST = (520, 300)
+# Windows this small (either side, in pixels) are overlays or helpers, never tiled.
+SMALL_WINDOW = 180
 
 
 

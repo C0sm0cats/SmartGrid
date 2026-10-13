@@ -1,6 +1,6 @@
 """Desktop behavior regressions discovered while integrating the pure core."""
 from copy import deepcopy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import tempfile
@@ -180,6 +180,50 @@ class ControllerReviewTests(unittest.TestCase):
         controller.start()
         self.assertEqual(controller.profile('d1',0).assignments[3],Assignment('missing',None,True))
         self.assertEqual(controller.profile('d1',0).assignments[0].window_id,1)
+
+    def test_hidden_windows_leave_no_empty_reserved_tiles(self):
+        controller,backend = self.make([record(h,f'app{h}') for h in range(1,4)])
+        controller.start()
+        for hwnd in (4,5):
+            backend.windows[hwnd]=record(hwnd,'teams')
+        controller.refresh()
+        self.assertEqual(len(controller.profile('d1',0).assignments),5)
+        # Teams hides its call windows instead of closing them.
+        for hwnd in (4,5):
+            backend.windows[hwnd]=replace(backend.windows[hwnd],eligible=False,exclusion_reason='Not visible')
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1,2,3])
+        backend.windows[6]=record(6,'other')
+        controller.refresh()
+        del backend.windows[6],backend.windows[4],backend.windows[5]
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1,2,3])
+
+    def test_window_excluded_by_its_new_title_frees_its_tile(self):
+        controller,backend = self.make([record(1),record(2,'teams')])
+        controller.start()
+        backend.windows[2]=replace(backend.windows[2],title='Meeting with Alex | Microsoft Teams')
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1])
+        backend.windows[2]=replace(backend.windows[2],title='Chat | Microsoft Teams')
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1,2])
+
+    def test_small_windows_are_not_tiled_until_they_grow(self):
+        controller,backend = self.make([record(1)])
+        backend.windows[2]=replace(record(2,'bar'),rect=Rect(800,0,600,60))
+        controller.start()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1])
+        backend.windows[2]=replace(backend.windows[2],rect=Rect(800,0,600,400))
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1,2])
+
+    def test_window_in_a_small_tile_stays_tiled(self):
+        controller,backend = self.make([record(h,f'app{h}') for h in range(1,4)])
+        controller.start()
+        backend.windows[1]=replace(backend.windows[1],rect=Rect(0,0,170,170))
+        controller.refresh()
+        self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[1,2,3])
 
     def test_duplicate_app_reservation_cannot_steal_explicit_binding(self):
         controller,backend = self.make([record(1),record(2)])

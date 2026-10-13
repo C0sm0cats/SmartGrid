@@ -16,7 +16,7 @@ import uuid
 from .models import app_display_name, Assignment, Draft, LayoutTemplate, Settings, SpaceProfile, Tile, Rect
 from .geometry import capacity, resolve_layout, auto_preset, effective_layout, directional_neighbor, edge_neighbors, swap_neighbor, nearest_slot, valid_tiles, linked_resize
 from .reconcile import compact_assignments
-from .exclusions import excluded_app, excluded_window, overlay_words
+from .exclusions import SMALL_WINDOW, excluded_app, excluded_window, overlay_words
 from .history import History
 from .commands import ApplyResult
 from smartgrid.storage.archive import export_archive, import_archive
@@ -268,6 +268,11 @@ class Controller:
     def _eligible(self, window):
         if not window.eligible or window.ref.hwnd in self._floating:
             return False
+        # A small window is not taken into the grid; one already placed in a
+        # small tile stays there.
+        if (window.state == "normal" and window.ref.hwnd not in self._tile_rects
+                and min(window.rect.width, window.rect.height) <= SMALL_WINDOW):
+            return False
         return not self._ruled_out(window)
 
     def current_display_id(self):
@@ -389,6 +394,9 @@ class Controller:
             changed |= bool(closed or created or replaced)
             states = {}
             layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or bool((closed|replaced) & assigned) or any(self._eligible(live[h]) for h in created|replaced)
+            # Hidden, shown, cloaked or excluded by a new title: the window
+            # leaves or joins the grid without being closed or created.
+            layout_changed |= any(self._eligible(previous[h]) != self._eligible(live[h]) for h in previous.keys() & live.keys())
             for hwnd, window in live.items():
                 old = previous.get(hwnd)
                 if old and window.state != old.state:
@@ -824,7 +832,7 @@ class Controller:
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=3)
 
-    def _resolve_assignments(self, profile, include_new=False, allow_cross_display=False, allow_maximized=False):
+    def _resolve_assignments(self, profile, include_new=False, allow_cross_display=False, allow_maximized=False, keep_reservations=False):
         used = set()
         assignments = deepcopy(profile.assignments)
         protected = {a.window_id for a in assignments if a and a.window_id
@@ -850,6 +858,10 @@ class Controller:
             assignment.window_id = candidate.ref.hwnd if candidate else None
             if candidate:
                 used.add(candidate.ref.hwnd)
+            elif not (assignment.pinned or keep_reservations or (profile.display_id, profile.space, slot_index) in self._pending):
+                # A window hidden, cloaked or excluded (Teams call windows) is
+                # not closed: its tile must not stay reserved as an empty slot.
+                assignments[slot_index] = None
         if include_new:
             inactive = {a.window_id for (d, s), p in self.profiles.items()
                         if d == profile.display_id and s != self.active_spaces.get(d, 0)
@@ -893,7 +905,7 @@ class Controller:
                 result.failures={w.ref.hwnd:"A fullscreen window occupies this display. Leave fullscreen before arranging." for w in blockers}
             self.last_result=result
             return result
-        assignments = self._resolve_assignments(profile, include_new=include_new, allow_cross_display=hide_surplus, allow_maximized=explicit)
+        assignments = self._resolve_assignments(profile, include_new=include_new, allow_cross_display=hide_surplus, allow_maximized=explicit, keep_reservations=launch_missing)
         # Custom layouts keep tile positions (no compaction) while their tiles can
         # hold the windows; an overflowing custom layout falls back to Auto, which
         # grows, shrinks and compacts like any classic layout.
@@ -1317,7 +1329,7 @@ class Controller:
     def preview_template(self, template_id, display_id, space):
         with self._lock:
             profile = self.load_template_draft(template_id, display_id, space)
-            assignments = self._resolve_assignments(profile, allow_cross_display=True)
+            assignments = self._resolve_assignments(profile, allow_cross_display=True, keep_reservations=True)
             selected = {a.window_id for a in assignments if a and a.window_id}
             known = {a.id for a in self.apps}
             missing = [a.app_id for a in assignments if a and not a.window_id]
