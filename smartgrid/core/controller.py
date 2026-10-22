@@ -24,6 +24,9 @@ from smartgrid.storage.archive import export_archive, import_archive
 log = logging.getLogger(__name__)
 # Smallest tile a linked resize leaves when windows are forced into their tiles.
 FORCED_MINIMUM = (160, 120)
+# Beat of a native gesture previewed by the runtime itself (no UI driving
+# it), and of the wait for windows landing at the release.
+PREVIEW_INTERVAL = .008
 
 DEFAULT_HOTKEYS = {
     "toggle": "Ctrl+Alt+T", "arrange": "Ctrl+Alt+R", "studio": "Ctrl+Alt+P",
@@ -99,7 +102,35 @@ class Controller:
         self._deleted_template = None
         self._last_border = None
         self._last_tiled_selection = None
+        # Linked resize in progress: (display_id, future tile, neighbour hwnd
+        # or None) per tile; the UI shows each neighbour's live image there.
         self.preview_rectangles = []
+        # Areas of the old tiles the images and the held window leave
+        # uncovered, where windows not yet placed would show through.
+        self.preview_covers = []
+        # A gap between two tiles as they are: the covers take its colour.
+        self.preview_gap = None
+        # A linked resize being released: windows already in their tiles are
+        # left alone, no placement ghosts over the images.
+        self._live_release = False
+        # The gesture previewed on a beat: the window held, the pointer when
+        # it started, the edges of the held window it has moved, the last
+        # sample (held rect, pointer) and the rect last previewed. The UI
+        # drives the beat itself, a frame at a time, when it says so.
+        self.preview_driven = False
+        self._driving = False
+        self._preview_dirty = False
+        self._preview_hwnd = None
+        self._pointer_origin = None
+        self._held_edges = set()
+        self._preview_sample = None
+        self._preview_after = None
+        # The pointer confined (ClipCursor) to where the held edges can go,
+        # so the held window stops at the limit of the linked resize: the
+        # rectangle applied, the edges it was computed for and since when.
+        self._cursor_clip = None
+        self._clip_edges = None
+        self._clip_since = 0.0
         # UI guides drawn by Qt: drag target with its
         # Swap/Move label, the last space switch for the OSD, swap arrows.
         self.drag_guide = None
@@ -342,6 +373,7 @@ class Controller:
                 self.history.clear();self._hide_overlay();self._clear_border()
                 self._last_tiled_selection=None
                 self._interacting.clear();self._free_moving.clear();self._move_origins.clear();self._resize_snapshot=None
+                self._free_cursor()
                 if self._swap_snapshot is not None:
                     # Never roll an old-desktop snapshot onto the new desktop.
                     self._swap_snapshot=None;self._swap_hwnd=None
@@ -484,6 +516,8 @@ class Controller:
         while not self._stop_event.is_set():
             recheck = self._guard_recheck
             wait = .2 if recheck is None else min(.2, max(0.0, recheck - time.monotonic()))
+            if self._preview_hwnd is not None and not self.preview_driven:
+                wait = min(wait, max(0.0, self._last_preview + PREVIEW_INTERVAL - time.monotonic()))
             try:
                 event = self._queue.get(timeout=wait)
                 last_event = time.monotonic()
@@ -495,6 +529,17 @@ class Controller:
                     self._guard_slots()
                 except Exception:
                     log.exception("Slot guard failed")
+            if self._cursor_clip is not None and (not self._interacting or time.monotonic() - self._clip_since > 120):
+                # Never a pointer trapped without a gesture.
+                with self._lock:
+                    self._free_cursor()
+            if self._preview_hwnd is not None and not self.preview_driven and time.monotonic() - self._last_preview >= PREVIEW_INTERVAL:
+                # The gesture goes on between events (a slow application, the
+                # pointer past its minimum size): previewed from the pointer.
+                try:
+                    self._tick_preview()
+                except Exception:
+                    log.exception("Gesture preview failed")
             if event is None:
                 if time.monotonic() - last_event < 1.0:
                     continue
@@ -622,18 +667,42 @@ class Controller:
                 self._interacting.add(hwnd)
                 self._interaction_started[hwnd]=time.monotonic()
                 self._last_preview=0.0
+                self._preview_sample=self._preview_after=None
+                self._held_edges=set()
                 self._interaction_minimums.clear()
                 w = self._window(hwnd)
                 if w:
                     rect = getattr(self.backend, "window_rect", lambda h: None)(hwnd) or w.rect
                     self._move_origins[hwnd] = (rect, w.display_id)
+                    self._pointer_origin = self._pointer()
+                    self._preview_hwnd = hwnd
                     # Windows reports every move or resize loop as move_start.
                     kind = "resize" if kind == "resize_start" else \
                         getattr(self.backend, "gesture_kind", lambda h: None)(hwnd)
+                    # The edges held, as the window tells (an edge inside the
+                    # frame of an application drawing its own, too): the
+                    # neighbours follow from the first pixel, before it moved.
+                    edges = getattr(self.backend, "grab_edges", lambda h: None)(hwnd)
+                    if edges:
+                        kind = "resize"
+                        self._held_edges = set(edges)
                     self._gesture_kinds[hwnd] = kind
                     # Its own state for undo; the full snapshot is taken only for a resize.
                     self._gesture_states[hwnd] = (w.ref, self.backend.snapshot(hwnd))
                     log.info("Gesture %s on %s (%s) from %s", kind or "unknown", hwnd, w.app_id, rect)
+                    if kind != "move":
+                        # Minimum sizes asked here, not on the UI's beat: a
+                        # busy application takes up to 100 ms to answer.
+                        profile = self.profile(w.display_id, self.active_spaces.get(w.display_id, 0))
+                        for assignment in profile.assignments:
+                            if assignment and assignment.window_id and assignment.window_id not in self._interaction_minimums:
+                                self._interaction_minimums[assignment.window_id] = self.backend.min_size(assignment.window_id)
+                        index = next((i for i, a in enumerate(profile.assignments) if a and a.window_id == hwnd), None)
+                        if edges and index is not None:
+                            rects = self._profile_rects(profile)
+                            self._confine_pointer(rects, index, self._gesture_minimums(profile, rects))
+                    # The UI starts its own beat for the gesture.
+                    self._notify_guides()
                 return
             if kind in ("move_end", "resize_end", "movesize_end") and hwnd:
                 if hwnd in self._free_moving:
@@ -644,6 +713,7 @@ class Controller:
                 if hwnd not in self._interacting:
                     return
                 self._interacting.discard(hwnd)
+                self._preview_hwnd = None
                 original = self._move_origins.pop(hwnd, None)
                 gesture = self._gesture_kinds.pop(hwnd, None)
                 start_state = self._gesture_states.pop(hwnd, None)
@@ -651,33 +721,51 @@ class Controller:
                 # arrangement running meanwhile) is not a user resize or drop.
                 if self._placed_at.get(hwnd,0)>=self._interaction_started.pop(hwnd,time.monotonic()):
                     original=None
-                self.refresh(auto=False)
-                window = self._window(hwnd)
-                if original and window:
-                    log.info("Gesture %s on %s ended: %s -> %s", gesture or "unknown", hwnd, original[0], window.rect)
-                if self.running and not self.paused and original and original[1] in {d.id for d in self.displays} and window and window.state == "normal":
-                    before, display_id = original
-                    resized = abs(window.rect.width - before.width) > 8 or abs(window.rect.height - before.height) > 8
-                    if window.rect != before or display_id != window.display_id:
-                        # Snapshot for undo, taken only now that the gesture
-                        # changes something: the current state, with this
-                        # window as it was before the gesture.
-                        self._resize_snapshot = self._snapshot()
-                        if start_state:
-                            self._resize_snapshot["windows"][hwnd] = start_state
-                    if display_id!=window.display_id:
-                        self._native_drop(hwnd,display_id,window.display_id)
-                    elif resized and gesture != "move":
-                        self._native_resize(hwnd, before, window.rect, self._resize_snapshot)
-                    elif window.rect != before or display_id != window.display_id:
-                        self._native_drop(hwnd, display_id, window.display_id)
-                self._resize_snapshot = None
-                self._interaction_minimums.clear()
-                self._hide_overlay()
+                # Whatever the arrangement does (or fails to do), the live
+                # images go.
+                try:
+                    self.refresh(auto=False)
+                    window = self._window(hwnd)
+                    if original and window:
+                        log.info("Gesture %s on %s ended: %s -> %s", gesture or "unknown", hwnd, original[0], window.rect)
+                    if self.running and not self.paused and original and original[1] in {d.id for d in self.displays} and window and window.state == "normal":
+                        before, display_id = original
+                        after = self._released_rect(window.rect, before) if self.preview_rectangles else window.rect
+                        threshold = self._resize_thresholds(gesture)[0]
+                        resized = abs(after.width - before.width) > threshold or abs(after.height - before.height) > threshold
+                        if window.rect != before or display_id != window.display_id:
+                            # Snapshot for undo, taken only now that the gesture
+                            # changes something: the current state, with this
+                            # window as it was before the gesture.
+                            self._resize_snapshot = self._snapshot()
+                            if start_state:
+                                self._resize_snapshot["windows"][hwnd] = start_state
+                        if display_id!=window.display_id:
+                            self._native_drop(hwnd,display_id,window.display_id)
+                        elif resized and gesture != "move":
+                            self._native_resize(hwnd, before, after, self._resize_snapshot, kind=gesture)
+                        elif window.rect != before or display_id != window.display_id:
+                            self._native_drop(hwnd, display_id, window.display_id)
+                finally:
+                    self._resize_snapshot = None
+                    self._interaction_minimums.clear()
+                    self._pointer_origin = self._preview_after = None
+                    self._free_cursor()
+                    self._hide_overlay()
                 return
+            if kind == "destroyed" and hwnd in self._interacting:
+                # Closed while held: its gesture never ends.
+                self._interacting.discard(hwnd)
+                self._preview_hwnd = None
+                for state in (self._move_origins, self._gesture_kinds, self._gesture_states, self._interaction_started):
+                    state.pop(hwnd, None)
+                self._interaction_minimums.clear()
+                self._pointer_origin = self._preview_after = None
+                self._free_cursor()
+                self._hide_overlay()
             if kind in ("location", "location_change") and hwnd in self._interacting:
                 now=time.monotonic()
-                if now-self._last_preview>=.015:
+                if not self.preview_driven and now-self._last_preview>=PREVIEW_INTERVAL:
                     self._last_preview=now
                     self._preview_native_drag(hwnd)
                 return
@@ -796,6 +884,7 @@ class Controller:
         with self._lock:
             self._generation += 1
             self._cancel_pending()
+            self._free_cursor()
             self._hide_overlay()
             if self._swap_snapshot is not None:
                 self.finish_swap(False)
@@ -949,6 +1038,8 @@ class Controller:
                 callback()
             except Exception:
                 log.exception("Layout subscriber failed")
+        if self._live_release:
+            self._land_live(assignments, rectangles)
         for index, assignment in enumerate(assignments):
             if assignment is None:
                 continue
@@ -1001,7 +1092,7 @@ class Controller:
             rectangle = rectangles[index]
             self._placed_at[hwnd] = time.monotonic()
             previous_tile = self._tile_rects.get(hwnd)
-            if previous_tile and previous_tile[0] == profile.display_id and self.settings.animations and \
+            if previous_tile and previous_tile[0] == profile.display_id and self.settings.animations and not self._live_release and \
                     any(abs(a - b) > 2 for a, b in zip(asdict(previous_tile[1]).values(), asdict(rectangle).values())):
                 # A ghost travels from the old tile to the new one; for a window
                 # the user dropped, from where it was released.
@@ -1014,10 +1105,14 @@ class Controller:
                 self._notify_guides()
             self._tile_rects[hwnd] = (profile.display_id, rectangle)
             self._guard_released.discard(hwnd);self._guard_fixed.pop(hwnd, None)
+            if self._live_release and self._close(self.backend.window_rect(hwnd), rectangle):
+                # Already in its tile (unchanged, the held window, or landed
+                # at the release): nothing to wait for.
+                result.placed.append(hwnd)
             # Windows jump to their tile; the placement ghost animates the move.
-            if self.backend.place(hwnd, rectangle,
-                                  timeout=self.settings.tile_timeout, retries=self.settings.tile_retries,
-                                  force=self.settings.force_resize):
+            elif self.backend.place(hwnd, rectangle,
+                                    timeout=self.settings.tile_timeout, retries=self.settings.tile_retries,
+                                    force=self.settings.force_resize):
                 result.placed.append(hwnd)
             else:
                 last=getattr(self.backend,'last_result',None)
@@ -1639,13 +1734,37 @@ class Controller:
         """Minimum tile sizes for a linked resize.
 
         With forced tiling, application minimum sizes do not apply: tiles keep
-        a small usable size. Otherwise a tile already below its application
-        minimum never shrinks further, instead of refusing the whole gesture."""
+        a small usable size. Otherwise the application minimum, and 40 px at
+        least (below which the arrangement drops the resize); a tile already
+        smaller never shrinks further, instead of refusing the whole gesture."""
         if self.settings.force_resize:
             minimums = [FORCED_MINIMUM] * len(minimums)
-        return [(min(m[0], r.width), min(m[1], r.height)) for r, m in zip(rects, minimums)]
+        else:
+            minimums = [(max(m[0], 40), max(m[1], 40)) for m in minimums]
+        # The Studio's 3 % of the inner area too: a smaller tile is never stored.
+        floor = (-(-3 * (max(r.right for r in rects) - min(r.x for r in rects)) // 100),
+                 -(-3 * (max(r.bottom for r in rects) - min(r.y for r in rects)) // 100))
+        return [(min(max(m[0], floor[0]), r.width), min(max(m[1], floor[1]), r.height)) for r, m in zip(rects, minimums)]
 
-    def _native_resize(self, hwnd, before, after, snapshot):
+    @staticmethod
+    def _resize_thresholds(kind):
+        """Size change that makes a gesture a resize, and movement of an edge
+        that counts: from the first pixels when the cursor was on an edge; a
+        gesture of unknown kind must not be a window adjusting itself."""
+        return (2, 2) if kind == "resize" else (8, 5)
+
+    @staticmethod
+    def _edge_moves(before, after, threshold):
+        return [(edge, delta) for edge, delta in (("left", after.x - before.x), ("right", after.right - before.right),
+                                                  ("top", after.y - before.y), ("bottom", after.bottom - before.bottom))
+                if abs(delta) > threshold]
+
+    @staticmethod
+    def _close(actual, expected, tolerance=2):
+        return actual is not None and all(abs(a - b) <= tolerance for a, b in zip(
+            (actual.x, actual.y, actual.width, actual.height), (expected.x, expected.y, expected.width, expected.height)))
+
+    def _native_resize(self, hwnd, before, after, snapshot, kind=None):
         window = self._window(hwnd)
         if not window:
             return
@@ -1658,10 +1777,8 @@ class Controller:
         min_sizes += [(3, 3)] * (len(rects) - len(min_sizes))
         min_sizes = self._reachable_minimums(rects, min_sizes)
         changed = rects
-        for edge, delta in (("left", after.x - before.x), ("right", after.right - before.right),
-                            ("top", after.y - before.y), ("bottom", after.bottom - before.bottom)):
-            if abs(delta) > 5:
-                changed = linked_resize(changed, index, edge, delta, min_sizes=min_sizes)
+        for edge, delta in self._edge_moves(before, after, self._resize_thresholds(kind)[1]):
+            changed = linked_resize(changed, index, edge, delta, min_sizes=min_sizes)
         if snapshot:
             self.history.push(snapshot)
         # Normalize shared virtual edges including gaps against the actual inner bounds.
@@ -1682,7 +1799,13 @@ class Controller:
         # produced a 3 px tile): the Studio's 3 % minimum applies here too.
         if valid_tiles(tiles) and all(t.width >= .03 and t.height >= .03 for t in tiles):
             profile.resize_tiles = tiles
-        self._apply_profile(profile)
+        # The live images already show the windows in their new tiles: no
+        # placement ghosts on top of them, and no waiting for windows there.
+        self._live_release = True
+        try:
+            self._apply_profile(profile)
+        finally:
+            self._live_release = False
         self._save()
         self._notify()
 
@@ -1706,7 +1829,7 @@ class Controller:
             self._apply_profile(target, include_new=True, compact=True)
         else:
             rects = self._profile_rects(target)
-            x, y = window.rect.x + window.rect.width / 2, window.rect.y + window.rect.height / 2
+            x, y = self._drop_point(window, self._pointer())
             index = nearest_slot(rects, x, y)
             if index is not None and index != source_index:
                 target.assignments += [None] * max(0, len(rects) - len(target.assignments))
@@ -1724,6 +1847,193 @@ class Controller:
         profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
         return any(a and a.window_id == hwnd for a in profile.assignments)
 
+    def _pointer(self):
+        return getattr(self.backend, "cursor_position", lambda: None)()
+
+    def _drop_point(self, window, pointer):
+        """Where a dragged window is dropped: under the pointer, as SnapTess
+        (the window's centre can be far from it, and stay in a wide tile of
+        its own while the pointer is well into a narrow one); its centre when
+        the pointer is unknown or on another display."""
+        display = self._display(window.display_id)
+        if pointer and display.work_area.contains(pointer[0], pointer[1]):
+            return pointer
+        return window.rect.x + window.rect.width / 2, window.rect.y + window.rect.height / 2
+
+    def _tick_preview(self):
+        with self._lock:
+            hwnd = self._preview_hwnd
+            if hwnd not in self._interacting:
+                self._preview_hwnd = None
+            elif hwnd is not None:
+                self._last_preview = time.monotonic()
+                self._preview_native_drag(hwnd)
+
+    def drive_preview(self):
+        """The UI's beat, a frame at a time: the gesture in progress is
+        previewed from the pointer now, on the UI thread, with no signal to
+        wait for. True when the guides changed and are to be drawn; False
+        too when the runtime is busy (a rescan): the next frame will do."""
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            hwnd = self._preview_hwnd
+            if hwnd not in self._interacting:
+                self._preview_hwnd = None
+                return False
+            self._preview_dirty, self._driving = False, True
+            try:
+                self._preview_native_drag(hwnd)
+            finally:
+                self._driving = False
+            return self._preview_dirty
+        finally:
+            self._lock.release()
+
+    def _guides_changed(self):
+        if self._driving:
+            self._preview_dirty = True
+        else:
+            self._notify_guides()
+
+    def _pointer_rect(self, rect, before, pointer):
+        """The held window where the pointer has taken it. Windows moves its
+        edges with the pointer, late for a slow application and not past its
+        minimum size: the edges the gesture has moved (told from the rect)
+        follow the pointer from where they started, as SnapTess reads the
+        pointer each frame; the images lead a late window, never trail it."""
+        origin = self._pointer_origin
+        for edge, actual, start in (("left", rect.x, before.x), ("right", rect.right, before.right),
+                                    ("top", rect.y, before.y), ("bottom", rect.bottom, before.bottom)):
+            if abs(actual - start) > 2:
+                self._held_edges.add(edge)
+        if pointer is None or origin is None or not self._held_edges:
+            return rect
+        dx, dy = pointer[0] - origin[0], pointer[1] - origin[1]
+        edges = self._held_edges
+        x = before.x + dx if "left" in edges else rect.x
+        right = before.right + dx if "right" in edges else rect.right
+        y = before.y + dy if "top" in edges else rect.y
+        bottom = before.bottom + dy if "bottom" in edges else rect.bottom
+        if right - x < 1 or bottom - y < 1:
+            return rect
+        return Rect(x, y, right - x, bottom - y)
+
+    def _released_rect(self, actual, before):
+        """Where a linked resize ends: the held window where Windows left it
+        (back at its start: cancelled), or where the pointer took an edge the
+        application stopped following (its minimum size, with forced
+        tiling), as the images showed."""
+        if self._close(actual, before):
+            return actual
+        wanted = self._pointer_rect(actual, before, self._pointer())
+        x, y, right, bottom = [a if abs(a - w) <= 8 else w for a, w in zip(
+            (actual.x, actual.y, actual.right, actual.bottom), (wanted.x, wanted.y, wanted.right, wanted.bottom))]
+        return Rect(x, y, right - x, bottom - y)
+
+    def _gesture_minimums(self, profile, rects):
+        """Minimum tile sizes of a linked resize, from the application
+        minimums asked once per gesture."""
+        minimums = []
+        for assignment in profile.assignments:
+            if assignment and assignment.window_id:
+                handle = assignment.window_id
+                if handle not in self._interaction_minimums:
+                    self._interaction_minimums[handle] = self.backend.min_size(handle)
+                minimums.append(self._interaction_minimums[handle])
+            else:
+                minimums.append((3, 3))
+        minimums += [(3, 3)] * (len(rects) - len(minimums))
+        return self._reachable_minimums(rects, minimums)
+
+    def _confine_pointer(self, rects, index, minimums):
+        """Confine the pointer to where the held edges can go. Windows moves
+        the held window with the pointer whatever the layout allows; the
+        linked resize stops at the neighbours' minimum sizes (or its own),
+        and the window would go on under their images. With the pointer
+        stopped there, the window stops exactly at the limit, as the grabbed
+        window of SnapTess is fitted to its tile. Each axis on its own: a
+        corner keeps following the pointer along the free axis."""
+        edges, origin = self._held_edges, self._pointer_origin
+        if not edges or origin is None or edges == self._clip_edges:
+            return
+        tile = rects[index]
+        far = 10 ** 5
+        low, high = (-far, far), (-far, far)
+        for edge in edges:
+            try:
+                least = linked_resize(rects, index, edge, -far, min_sizes=minimums)[index]
+                most = linked_resize(rects, index, edge, far, min_sizes=minimums)[index]
+            except ValueError:
+                # A layout the resize cannot work with: nothing to confine to.
+                return
+            # Where the pointer takes the edge: its start plus the edge's travel.
+            if edge == "left":
+                low = (origin[0] + least.x - tile.x, origin[0] + most.x - tile.x)
+            elif edge == "right":
+                low = (origin[0] + least.right - tile.right, origin[0] + most.right - tile.right)
+            elif edge == "top":
+                high = (origin[1] + least.y - tile.y, origin[1] + most.y - tile.y)
+            else:
+                high = (origin[1] + least.bottom - tile.bottom, origin[1] + most.bottom - tile.bottom)
+        self._clip_edges = set(edges)
+        self._clip_cursor(Rect(low[0], high[0], low[1] - low[0] + 1, high[1] - high[0] + 1))
+
+    def _clip_cursor(self, rect):
+        if rect == self._cursor_clip:
+            return
+        clip = getattr(self.backend, "clip_cursor", None)
+        if clip:
+            clip(rect)
+        self._cursor_clip = rect
+        self._clip_since = time.monotonic()
+
+    def _free_cursor(self):
+        self._clip_cursor(None)
+        self._clip_edges = None
+
+    def _gap_sample(self, display_id, rects, index):
+        """A gap between two tiles as they are, away from the held one when
+        there is one: the UI takes the colour of its covers from there."""
+        gap = self.settings.gap
+        if gap <= 0:
+            return None
+        nearby = None
+        for i, a in enumerate(rects):
+            for j, b in enumerate(rects):
+                if i != j and b.x - a.right == gap and min(a.bottom, b.bottom) - max(a.y, b.y) > 0:
+                    strip = Rect(a.right, max(a.y, b.y), gap, min(a.bottom, b.bottom) - max(a.y, b.y))
+                elif i != j and b.y - a.bottom == gap and min(a.right, b.right) - max(a.x, b.x) > 0:
+                    strip = Rect(max(a.x, b.x), a.bottom, min(a.right, b.right) - max(a.x, b.x), gap)
+                else:
+                    continue
+                if index not in (i, j):
+                    return display_id, strip
+                nearby = nearby or (display_id, strip)
+        return nearby
+
+    @staticmethod
+    def _subtract(rect, holes):
+        """rect minus holes, as rectangles."""
+        pieces = [rect]
+        for hole in holes:
+            remaining = []
+            for piece in pieces:
+                if (hole.x >= piece.right or hole.right <= piece.x or hole.y >= piece.bottom or hole.bottom <= piece.y):
+                    remaining.append(piece)
+                    continue
+                if hole.y > piece.y:
+                    remaining.append(Rect(piece.x, piece.y, piece.width, hole.y - piece.y))
+                if hole.bottom < piece.bottom:
+                    remaining.append(Rect(piece.x, hole.bottom, piece.width, piece.bottom - hole.bottom))
+                top, bottom = max(piece.y, hole.y), min(piece.bottom, hole.bottom)
+                if hole.x > piece.x:
+                    remaining.append(Rect(piece.x, top, hole.x - piece.x, bottom - top))
+                if hole.right < piece.right:
+                    remaining.append(Rect(hole.right, top, piece.right - hole.right, bottom - top))
+            pieces = remaining
+        return [p for p in pieces if p.width > 0 and p.height > 0]
+
     def _preview_native_drag(self, hwnd):
         if not self.running or self.paused:
             return
@@ -1733,6 +2043,11 @@ class Controller:
         rect=self.backend.window_rect(hwnd)
         if not rect:
             return
+        pointer=self._pointer()
+        # Nothing moved since the last beat: nothing to compute or redraw.
+        if (rect,pointer)==self._preview_sample:
+            return
+        self._preview_sample=(rect,pointer)
         x,y=rect.x+rect.width/2,rect.y+rect.height/2
         display=next((d for d in self.displays if d.work_area.x<=x<d.work_area.right and d.work_area.y<=y<d.work_area.bottom),None)
         window=replace(window,rect=rect,display_id=display.id if display else window.display_id)
@@ -1740,31 +2055,54 @@ class Controller:
         profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
         rects = self._profile_rects(profile)
         original = self._move_origins.get(hwnd)
-        resizing=self._gesture_kinds.get(hwnd)!="move"
-        if resizing and original and original[1]==window.display_id and (abs(window.rect.width-original[0].width)>8 or abs(window.rect.height-original[0].height)>8):
+        kind=self._gesture_kinds.get(hwnd)
+        resizing=kind!="move"
+        threshold,edge_threshold=self._resize_thresholds(kind)
+        after=self._pointer_rect(rect,original[0],pointer) if resizing and original else rect
+        # Once neighbours follow, they keep following back to the start size.
+        if resizing and original and original[1]==window.display_id and (self.preview_rectangles or abs(after.width-original[0].width)>threshold or abs(after.height-original[0].height)>threshold):
             index=next((i for i,a in enumerate(profile.assignments) if a and a.window_id==hwnd),None)
             if index is not None:
-                before,after=original[0],window.rect
-                minimums=[]
-                for assignment in profile.assignments:
-                    if assignment and assignment.window_id:
-                        handle=assignment.window_id
-                        if handle not in self._interaction_minimums:
-                            self._interaction_minimums[handle]=self.backend.min_size(handle)
-                        minimums.append(self._interaction_minimums[handle])
-                    else:
-                        minimums.append((3,3))
-                minimums += [(3,3)]*(len(rects)-len(minimums))
-                minimums=self._reachable_minimums(rects,minimums)
-                for edge,delta in (("left",after.x-before.x),("right",after.right-before.right),
-                                   ("top",after.y-before.y),("bottom",after.bottom-before.bottom)):
-                    if abs(delta)>5:
-                        rects=linked_resize(rects,index,edge,delta,min_sizes=minimums)
-                self.preview_rectangles=[(window.display_id,r) for r in rects]
-                self._notify_guides()
+                if after==self._preview_after:
+                    return
+                self._preview_after=after
+                before,base=original[0],rects
+                minimums=self._gesture_minimums(profile,rects)
+                self._confine_pointer(rects,index,minimums)
+                for edge,delta in self._edge_moves(before,after,edge_threshold):
+                    rects=linked_resize(rects,index,edge,delta,min_sizes=minimums)
+                previews=[]
+                for i,rect in enumerate(rects):
+                    assignment=profile.assignments[i] if i<len(profile.assignments) else None
+                    other=assignment.window_id if assignment and assignment.window_id!=hwnd else None
+                    neighbour=self._window(other) if other else None
+                    if (not neighbour or neighbour.state!="normal" or other in self._floating
+                            or other in self._manual_minimized or not self.backend.alive(other)):
+                        other=None
+                    previews.append((window.display_id,rect,other if i!=index else None))
+                self.preview_rectangles=previews
+                # What the images and the held window leave uncovered of the
+                # old tiles is covered too: the windows there, not placed
+                # before the release, would show through at their old size
+                # (in the new gaps, behind a late held window). The held window
+                # is clipped to its future tile, as SnapTess scales it.
+                images=[p[1] for p in previews if p[2]]
+                covers=[]
+                for i,(old,new) in enumerate(zip(base,rects)):
+                    if old==new or (i!=index and not previews[i][2]):
+                        continue
+                    holes=[new]+images+([] if i==index else [window.rect])
+                    covers+=[(window.display_id,piece) for piece in self._subtract(old,holes)]
+                self.preview_covers=covers
+                if self.preview_gap is None:
+                    self.preview_gap=self._gap_sample(window.display_id,base,index)
+                # The drop target of the first pixels (before the resize was
+                # told from a move) would stay drawn on the start tile.
+                self.drag_guide=None
+                self._guides_changed()
                 return
-        self.preview_rectangles=[]
-        index = nearest_slot(rects, window.rect.x + window.rect.width / 2, window.rect.y + window.rect.height / 2)
+        self.preview_rectangles=[];self.preview_covers=[];self.preview_gap=None
+        index = nearest_slot(rects, *self._drop_point(window, pointer))
         if index is None:
             guide = None
         else:
@@ -1779,11 +2117,49 @@ class Controller:
             guide = (window.display_id, rects[index], label, window.app_id)
         if guide != self.drag_guide:
             self.drag_guide = guide
+            self._guides_changed()
+
+    def _land_live(self, assignments, rectangles):
+        """Release of a linked resize: every window is asked for its tile at
+        once, asynchronously, and each image goes as its window arrives. The
+        arrangement then waits only for the windows still missing, as usual."""
+        place_live = getattr(self.backend, "place_live", None)
+        pending = {}
+        for index, assignment in enumerate(assignments):
+            hwnd = assignment.window_id if assignment else None
+            window = self._window(hwnd) if hwnd else None
+            if (not window or window.state != "normal" or hwnd in self._floating or hwnd in self._manual_minimized
+                    or index >= len(rectangles) or not self.backend.alive(hwnd)):
+                continue
+            if self._close(self.backend.window_rect(hwnd), rectangles[index]):
+                self._drop_image(hwnd)
+            elif place_live and place_live(hwnd, rectangles[index]):
+                pending[hwnd] = rectangles[index]
+        deadline = time.monotonic() + .25
+        landed = set()
+        while pending:
+            for hwnd, rect in list(pending.items()):
+                if not self._close(self.backend.window_rect(hwnd), rect):
+                    landed.discard(hwnd)
+                elif hwnd in landed:
+                    # Seen there twice, a beat apart: time to paint the new size.
+                    pending.pop(hwnd)
+                    self._drop_image(hwnd)
+                else:
+                    landed.add(hwnd)
+            if not pending or time.monotonic() >= deadline:
+                break
+            time.sleep(PREVIEW_INTERVAL)
+
+    def _drop_image(self, hwnd):
+        kept = [p for p in self.preview_rectangles if p[2] != hwnd]
+        if len(kept) != len(self.preview_rectangles):
+            self.preview_rectangles = kept
             self._notify_guides()
 
     def _hide_overlay(self):
-        changed=bool(self.preview_rectangles) or self.drag_guide is not None
-        self.preview_rectangles=[]
+        changed=bool(self.preview_rectangles) or bool(self.preview_covers) or self.drag_guide is not None
+        self.preview_rectangles=[];self.preview_covers=[];self.preview_gap=None
         self.drag_guide=None
         if changed:
             self._notify_guides()

@@ -87,9 +87,20 @@ class FakeBackend:
         return PlacementResult(True, rect, rect, 1)
 
     mouse_pressed = False
+    cursor = None
 
     def mouse_down(self):
         return self.mouse_pressed
+
+    def cursor_position(self):
+        return self.cursor
+
+    cursor_clip = None
+
+    def clip_cursor(self, rect):
+        self.cursor_clip = rect
+        self.operations.append(('clip_cursor', rect))
+        return True
 
     def window_monitor(self, hwnd):
         window = self.windows.get(hwnd)
@@ -98,6 +109,14 @@ class FakeBackend:
 
     def clamp(self, hwnd, rect):
         self.place(hwnd, rect, force=True)
+
+    def place_live(self, hwnd, rect):
+        window = self.windows.get(hwnd)
+        if not window or window.state != 'normal':
+            return False
+        self.windows[hwnd] = replace(window, rect=rect)
+        self.operations.append(('place_live', hwnd, rect))
+        return True
 
     def place(self, hwnd, rect, animate=False, **kwargs):
         self.last_result = self.place_result(hwnd, rect, animate, **kwargs)

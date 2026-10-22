@@ -74,7 +74,8 @@ def main(argv=None):
         handler=RotatingFileHandler(directory/'smartgrid.log',maxBytes=1024*1024,backupCount=3,encoding='utf-8')
         handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
         logging.getLogger('smartgrid').addHandler(handler)
-        logging.getLogger('smartgrid').setLevel(logging.INFO)
+        # SMARTGRID_DEBUG=1: frame timings of native gestures, among others.
+        logging.getLogger('smartgrid').setLevel(logging.DEBUG if os.environ.get('SMARTGRID_DEBUG') else logging.INFO)
         from .ui.app import run_ui
         code=run_ui(controller,[sys.argv[0]])
         if args.demo:

@@ -59,19 +59,21 @@ def effective_layout(profile, runtime=False, assignments=None):
     if runtime:
         while requested and slots[requested - 1] is None:
             requested -= 1
-    # A native linked resize applies to the window count it was made for.
-    # With fewer or more windows
-    # (minimize, close, new window) the normal layout is used and the resized
-    # geometry returns when the count matches again.
-    resized = bool(profile.resize_tiles) and requested == len(profile.resize_tiles)
-    tiles = profile.resize_tiles if resized else profile.tiles
-    preset = 'custom' if resized else profile.preset
+    preset, tiles = profile.preset, profile.tiles
     if preset == 'custom' and requested <= len(tiles):
-        return preset, tiles, len(tiles)
-    if runtime or preset == 'auto' or requested > capacity(preset, tiles):
+        total = len(tiles)
+    elif runtime or preset == 'auto' or requested > capacity(preset, tiles):
         preset, tiles = auto_preset(requested), []
-        return preset, tiles, capacity(preset) if requested or not runtime else 0
-    return preset, tiles, max(requested, capacity(preset, tiles))
+        total = capacity(preset) if requested or not runtime else 0
+    else:
+        total = max(requested, capacity(preset, tiles))
+    # A native linked resize applies to the layout it was made for: the one
+    # with as many tiles (a grid partly filled keeps it). With fewer or more
+    # windows (minimize, close, new window) the normal layout is used and the
+    # resized geometry returns when the layout matches again.
+    if profile.resize_tiles and len(profile.resize_tiles) == total:
+        return 'custom', profile.resize_tiles, total
+    return preset, tiles, total
 
 
 def _count(count):

@@ -39,6 +39,19 @@ class UITests(unittest.TestCase):
         self.controller.quit()
         self.temp.cleanup()
 
+    def test_guide_updates_are_coalesced_until_drawn(self):
+        bridge=bridge_for(self.controller)
+        drawn=[]
+        bridge.guides.connect(lambda:drawn.append(1))
+        for _ in range(20):
+            self.controller._notify_guides()
+        self.app.processEvents()
+        self.assertEqual(len(drawn),1)
+        bridge.guides_queued=False
+        self.controller._notify_guides()
+        self.app.processEvents()
+        self.assertEqual(len(drawn),2)
+
     def settle(self):
         deadline=time.monotonic()+5
         while bridge_for(self.controller).pending and time.monotonic()<deadline:
@@ -221,6 +234,60 @@ class UITests(unittest.TestCase):
         ui.focus_frame.close()
         ui.window_actions.close()
         ui.tray.hide()
+
+    def test_gesture_beat_runs_only_while_a_window_is_held(self):
+        from smartgrid.ui.app import DesktopUI
+        ui=DesktopUI(self.controller,self.app);self.settle()
+        self.assertFalse(ui.drive_timer.isActive())
+        self.controller.start();self.settle()
+        hwnd=self.controller.profile('demo-primary',0).assignments[0].window_id
+        self.controller.preview_driven=True
+        self.controller._handle_event({'type':'move_start','hwnd':hwnd})
+        self.settle()
+        self.assertTrue(ui.drive_timer.isActive())
+        self.controller._handle_event({'type':'move_end','hwnd':hwnd})
+        deadline=time.monotonic()+2
+        while ui.drive_timer.isActive() and time.monotonic()<deadline:
+            self.app.processEvents();time.sleep(.005)
+        self.assertFalse(ui.drive_timer.isActive())
+        self.assertIsNone(ui.drive_stats)
+        ui.timer.stop();ui.focus_frame.close();ui.window_actions.close();ui.tray.hide()
+
+    def test_resize_then_drop_swap_through_the_ui_beat(self):
+        from dataclasses import replace
+        from smartgrid.core.models import Rect
+        from smartgrid.ui.app import DesktopUI
+        ui=DesktopUI(self.controller,self.app);self.settle()
+        self.controller.start();self.settle()
+        controller,backend=self.controller,self.controller.backend
+        controller.preview_driven=True
+        profile=controller.profile('demo-primary',0)
+        h1,h2=profile.assignments[0].window_id,profile.assignments[1].window_id
+        def pump(seconds):
+            end=time.monotonic()+seconds
+            while time.monotonic()<end:
+                self.app.processEvents();time.sleep(.005)
+        kind={'k':'resize'};backend.gesture_kind=lambda h:kind['k']
+        r1=backend.windows[h1].rect;backend.cursor=(r1.right,r1.y+100)
+        controller._enqueue_event({'type':'move_start','hwnd':h1});pump(.1)
+        self.assertTrue(ui.drive_timer.isActive())
+        backend.cursor=(r1.right-150,r1.y+100)
+        backend.windows[h1]=replace(backend.windows[h1],rect=replace(r1,width=r1.width-150));pump(.1)
+        self.assertTrue(controller.preview_rectangles)
+        controller._enqueue_event({'type':'move_end','hwnd':h1});pump(.3)
+        self.assertTrue(profile.resize_tiles);self.assertFalse(ui.drive_timer.isActive())
+        kind['k']='move'
+        r1,r2=backend.windows[h1].rect,backend.windows[h2].rect
+        backend.cursor=(r1.x+50,r1.y+10)
+        controller._enqueue_event({'type':'move_start','hwnd':h1});pump(.1)
+        self.assertTrue(ui.drive_timer.isActive())
+        backend.cursor=(r2.x+r2.width//2,r2.y+10)
+        backend.windows[h1]=replace(backend.windows[h1],rect=Rect(r2.x+r2.width//2-50,r2.y,r1.width,r1.height));pump(.1)
+        self.assertTrue(controller.drag_guide and controller.drag_guide[2].startswith('Swap'))
+        controller._enqueue_event({'type':'move_end','hwnd':h1});pump(.3)
+        self.assertEqual([a.window_id for a in profile.assignments][:2],[h2,h1])
+        self.assertFalse(ui.drive_timer.isActive())
+        ui.timer.stop();ui.focus_frame.close();ui.window_actions.close();ui.tray.hide()
 
     def test_screen_mapping_does_not_depend_on_monitor_names(self):
         from smartgrid.ui.app import DesktopUI

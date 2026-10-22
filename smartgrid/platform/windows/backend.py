@@ -207,6 +207,34 @@ class WindowsBackend:
         return self._raw_rect(hwnd)
 
     @physical
+    def cursor_position(self):
+        """The pointer, in physical coordinates."""
+        point = POINT()
+        return (point.x, point.y) if self.api.GetCursorPos(C.byref(point)) else None
+
+    @physical
+    def clip_cursor(self, rect):
+        """Confine the pointer to rect (physical coordinates); None frees it."""
+        if rect is None:
+            return bool(self.api.ClipCursor(None))
+        return bool(self.api.ClipCursor(C.byref(RECT(rect.x, rect.y, rect.right, rect.bottom))))
+
+    @physical
+    def grab_edges(self, hwnd):
+        """The edges of hwnd under the cursor as the window itself tells
+        (WM_NCHITTEST, what Windows asked to start its sizing loop): a set
+        among left, right, top and bottom, or None when the cursor is not on
+        an edge or the window does not answer."""
+        point, result = POINT(), ULONG_PTR()
+        if not self.api.GetCursorPos(C.byref(point)):
+            return None
+        # SMTO_ABORTIFHUNG|SMTO_BLOCK, maximum 100 ms.
+        if not self.api.SendMessageTimeoutW(hwnd, 0x84, 0, ((point.y & 0xffff) << 16) | (point.x & 0xffff), 3, 100, C.byref(result)):
+            return None
+        return {10: {'left'}, 11: {'right'}, 12: {'top'}, 13: {'left', 'top'}, 14: {'right', 'top'},
+                15: {'bottom'}, 16: {'left', 'bottom'}, 17: {'right', 'bottom'}}.get(result.value)
+
+    @physical
     def gesture_kind(self, hwnd):
         """'move' or 'resize' for a gesture that has just started on hwnd.
 
@@ -561,6 +589,19 @@ class WindowsBackend:
         if not self._close_rect(self.window_rect(hwnd), rect):
             self._force_fit(hwnd, rect)
 
+    @physical
+    def place_live(self, hwnd, rect):
+        """One asynchronous request, no waiting and no retry: a neighbour
+        growing during a linked resize. A busy application catches up on its
+        own; the gesture never waits for it."""
+        raw, visible = self._raw_rect(hwnd), self.window_rect(hwnd)
+        if not raw or not visible or self.api.IsIconic(hwnd) or self.api.IsZoomed(hwnd):
+            return False
+        # SWP_ASYNCWINDOWPOS|SWP_NOZORDER|SWP_NOACTIVATE
+        return bool(self.api.SetWindowPos(hwnd, None, rect.x + raw.x - visible.x, rect.y + raw.y - visible.y,
+                                         rect.width + raw.width - visible.width, rect.height + raw.height - visible.height,
+                                         0x4000 | 0x14))
+
     def place(self, hwnd, rect, animate=False, **kwargs):
         self.last_result = self.place_result(hwnd, rect, animate, **kwargs)
         if not self.last_result.success:
@@ -704,6 +745,10 @@ class WindowsBackend:
                 event_types = {0x8000:'created', 0x8001:'destroyed', 0x8002:'shown', 0x8003:'hidden', 0x800b:'location', 0x800c:'title', 3:'foreground', 0xa:'move_start', 0xb:'move_end', 0x16:'minimized', 0x17:'restored'}
                 def event_proc(hook, event, hwnd, object_id, child_id, thread_id, event_time):
                     if not hwnd or (event >= 0x8000 and (object_id != 0 or child_id != 0)):
+                        return
+                    if event == 0x800b and (self.api.GetAncestor(hwnd, 2) or 0) != int(hwnd):
+                        # Child windows laid out again inside a window being
+                        # resized (dozens per step): nothing to follow there.
                         return
                     self._enqueue({'type':event_types.get(event, 'changed'), 'hwnd':int(hwnd), 'native_time':event_time})
                 self._winevent_proc = WINEVENTPROC(event_proc)

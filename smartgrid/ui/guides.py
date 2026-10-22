@@ -253,6 +253,136 @@ class WindowGhost(QWidget):
         self.close(); self.deleteLater()
 
 
+class LiveImage(QWidget):
+    """Live image of a neighbour on its future tile while a window edge is
+    dragged. Windows draws it (a DWM thumbnail), so it follows the pointer
+    however heavy the application; the real window takes the tile at the
+    release, then the image goes. Qt never paints it: moving it costs only
+    the native move, batched with the other images by place_images."""
+    def __init__(self, api):
+        super().__init__()
+        # Opaque and not click-through: Windows does not draw a thumbnail in a
+        # layered window.
+        self.setWindowFlags(FLAGS)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.api, self.source, self.handle = api, None, None
+        # The thumbnail as drawn (source frame, size) and as wanted; the
+        # rectangle the window was last moved to.
+        self.shown = self.wanted = self.placed = None
+
+    def paintEngine(self):
+        return None
+
+    def paintEvent(self, event):
+        pass
+
+    def show_window(self, source, frame, logical, physical):
+        """Show source's visible frame stretched over the tile (physical
+        rectangle; logical for Qt's first placement). False when Windows has
+        no image for it. The move itself is done by place_images; the
+        thumbnail is never smaller than the window meanwhile (a growing
+        window would show a strip of nothing for a frame): it is grown here,
+        before the move, and shrunk by settle after it."""
+        if source != self.source and not self.prepare(source):
+            return False
+        size = (physical.width, physical.height)
+        self.wanted = (frame, size)
+        if self.shown is None or frame != self.shown[0] or size[0] > self.shown[1][0] or size[1] > self.shown[1][1]:
+            grown = size if self.shown is None else (max(size[0], self.shown[1][0]), max(size[1], self.shown[1][1]))
+            if not self._draw(frame, grown):
+                self.release()
+                return False
+        if not self.isVisible():
+            self.setGeometry(logical)
+            self.show()
+        return True
+
+    def prepare(self, source):
+        """Register source's thumbnail, the window still hidden: done for the
+        neighbours when a gesture starts, so the first frame has only to show
+        them. False when Windows has no image for it."""
+        import ctypes as C
+        from smartgrid.platform.windows.api import HANDLE
+        self.release()
+        handle = HANDLE()
+        if self.api.DwmRegisterThumbnail(int(self.winId()), source, C.byref(handle)) != 0 or not handle.value:
+            return False
+        self.source, self.handle = source, handle.value
+        # Rounded corners like the window it shows (Windows 11; ignored elsewhere).
+        corner = C.c_int(2)
+        self.api.DwmSetWindowAttribute(int(self.winId()), 33, C.byref(corner), C.sizeof(corner))
+        return True
+
+    def settle(self):
+        """After the move: the thumbnail at the exact size of the tile."""
+        if self.handle and self.wanted and self.wanted != self.shown:
+            self._draw(*self.wanted)
+
+    def _draw(self, frame, size):
+        import ctypes as C
+        from smartgrid.platform.windows.api import RECT, DWM_THUMBNAIL_PROPERTIES
+        properties = DWM_THUMBNAIL_PROPERTIES()
+        # Destination, source, opacity, visibility, whole window.
+        properties.dwFlags = 0x01 | 0x02 | 0x04 | 0x08 | 0x10
+        properties.rcDestination = RECT(0, 0, size[0], size[1])
+        properties.rcSource = RECT(*frame)
+        properties.opacity = 255
+        properties.fVisible = True
+        properties.fSourceClientAreaOnly = False
+        if self.api.DwmUpdateThumbnailProperties(self.handle, C.byref(properties)) != 0:
+            return False
+        self.shown = (frame, size)
+        return True
+
+    def release(self):
+        if self.handle:
+            self.api.DwmUnregisterThumbnail(self.handle)
+        self.source = self.handle = self.shown = self.wanted = self.placed = None
+        self.hide()
+
+
+class TileCover(QWidget):
+    """Flat cover of what a linked resize leaves uncovered of the old tiles
+    (a new gap over a window not placed yet, the old size of a late held
+    window), in the colour of the gaps around: nothing shows at its old
+    size. Opaque, painted by Qt; moved natively with the images."""
+    def __init__(self):
+        super().__init__()
+        self.setWindowFlags(FLAGS | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.color = QColor(32, 32, 32)
+        self.placed = None
+
+    def paintEvent(self, event):
+        QPainter(self).fillRect(self.rect(), self.color)
+
+
+def place_images(api, placements):
+    """Move every image (and cover) to its place in one native batch: the
+    neighbours move together, in the same frame. placements: [(QWidget,
+    physical Rect)]."""
+    if not placements:
+        return
+    # SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOCOPYBITS: Windows draws
+    # the thumbnail; there is nothing of our own to repaint or copy.
+    flags = 0x0004 | 0x0010 | 0x0008 | 0x0100
+    batch = api.BeginDeferWindowPos(len(placements))
+    for image, rect in placements:
+        if not batch:
+            break
+        batch = api.DeferWindowPos(batch, int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags)
+    if batch and api.EndDeferWindowPos(batch):
+        return
+    # A failed batch moves nothing: one by one instead.
+    for image, rect in placements:
+        api.SetWindowPos(int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags)
+
+
 class SourceGuide(Overlay):
     """Faint outline of the slot a swapped window leaves."""
     def paintEvent(self, event):

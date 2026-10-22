@@ -71,6 +71,8 @@ class Win32:
                 'SetWindowTextW': (BOOL, [HWND, C.c_wchar_p]), 'GetWindowTextW': (C.c_int, [HWND, C.c_wchar_p, C.c_int]), 'GetClassNameW': (C.c_int, [HWND, C.c_wchar_p, C.c_int]),
                 'GetWindowPlacement': (BOOL, [HWND, p(WINDOWPLACEMENT)]), 'SetWindowPlacement': (BOOL, [HWND, p(WINDOWPLACEMENT)]),
                 'SetWindowPos': (BOOL, [HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
+                'BeginDeferWindowPos': (HANDLE, [C.c_int]), 'EndDeferWindowPos': (BOOL, [HANDLE]),
+                'DeferWindowPos': (HANDLE, [HANDLE, HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
                 'ShowWindowAsync': (BOOL, [HWND, C.c_int]), 'SetForegroundWindow': (BOOL, [HWND]), 'GetForegroundWindow': (HWND, []),
                 'PostMessageW': (BOOL, [HWND, UINT, WPARAM, LPARAM]),
                 'SendMessageTimeoutW': (LRESULT, [HWND, UINT, WPARAM, LPARAM, UINT, UINT, p(ULONG_PTR)]),
@@ -83,7 +85,7 @@ class Win32:
                 'DestroyWindow': (BOOL, [HWND]), 'DefWindowProcW': (LRESULT, [HWND, UINT, WPARAM, LPARAM]),
                 'SetLayeredWindowAttributes': (BOOL, [HWND, DWORD, BYTE, DWORD]), 'GetDC': (HDC, [HWND]), 'ReleaseDC': (C.c_int, [HWND, HDC]),
                 'DestroyIcon': (BOOL, [HANDLE]), 'GetIconInfo': (BOOL, [HANDLE, p(ICONINFO)]),
-                'GetCursorPos': (BOOL, [p(POINT)]), 'GetAsyncKeyState': (C.c_short, [C.c_int]),
+                'GetCursorPos': (BOOL, [p(POINT)]), 'ClipCursor': (BOOL, [p(RECT)]), 'GetAsyncKeyState': (C.c_short, [C.c_int]),
             },
             'kernel32': {
                 'OpenProcess': (HANDLE, [DWORD, BOOL, DWORD]), 'CloseHandle': (BOOL, [HANDLE]),

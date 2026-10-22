@@ -23,16 +23,24 @@ class AppBridge(QObject):
         # A palette move already queued for the UI: later positions are read
         # live when it runs, so a fast drag never piles up stale moves.
         self.follow_queued = False
+        self.guides_queued = False
         self._completed.connect(self._finish, Qt.ConnectionType.QueuedConnection)
         controller.subscribe(lambda *args: self.changed.emit() if not self.closed else None)
         if hasattr(controller, 'subscribe_guides'):
-            controller.subscribe_guides(lambda: self.guides.emit() if not self.closed else None)
+            controller.subscribe_guides(self._guides)
         if hasattr(controller, 'subscribe_layout'):
             controller.subscribe_layout(lambda: self.layout.emit() if not self.closed else None)
         if hasattr(controller, 'subscribe_follow'):
             controller.subscribe_follow(self._follow)
         if hasattr(controller, 'set_ui_action_handler'):
             controller.set_ui_action_handler(lambda action: self.ui_action.emit(action))
+
+    def _guides(self):
+        # One redraw queued at a time: a fast resize never piles up guide
+        # updates the UI would draw late, one after the other.
+        if not self.closed and not self.guides_queued:
+            self.guides_queued = True
+            self.guides.emit()
 
     def _follow(self, hwnd):
         if not self.closed and not self.follow_queued:

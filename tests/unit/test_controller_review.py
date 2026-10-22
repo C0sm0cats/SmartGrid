@@ -4,6 +4,7 @@ from dataclasses import asdict, replace
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 
 from smartgrid.core.controller import Controller
@@ -117,14 +118,487 @@ class ControllerReviewTests(unittest.TestCase):
         from unittest.mock import Mock
         controller,backend=self.make([record(1),record(2)])
         controller.start()
+        backend.min_size=Mock(return_value=(80,80))
         controller._handle_event({'type':'move_start','hwnd':1})
+        # Asked once per window when the gesture starts, never on its beats.
+        self.assertEqual(backend.min_size.call_count,2)
         backend.windows[1]=replace(backend.windows[1],rect=Rect(8,8,1000,1064))
         backend.discover_windows=Mock(side_effect=AssertionError('No desktop scan during preview'))
-        backend.min_size=Mock(return_value=(80,80))
         for _ in range(5):
             controller._preview_native_drag(1)
         self.assertEqual(backend.min_size.call_count,2)
         self.assertTrue(controller.preview_rectangles)
+
+    def resize_gesture(self, width_change):
+        """Two side-by-side windows; window 1's right edge dragged by width_change."""
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        controller._handle_event({'type':'move_start','hwnd':1})
+        held=tiles[1]
+        backend.windows[1]=replace(backend.windows[1],rect=Rect(held.x,held.y,held.width+width_change,held.height))
+        controller._preview_native_drag(1)
+        return controller,backend,tiles
+
+    def live_requests(self, backend):
+        return [op for op in backend.operations if op[0]=='place_live']
+
+    def test_linked_resize_shows_neighbours_and_asks_nothing_of_them(self):
+        controller,backend,tiles=self.resize_gesture(200)
+        # Window 2 shrinks: shown on its future tile, nothing asked of it
+        # before the release; the new gap, over its old size, is covered.
+        self.assertEqual([p[2] for p in controller.preview_rectangles],[None,2])
+        self.assertLess(controller.preview_rectangles[1][1].width,tiles[2].width)
+        self.assertEqual(self.live_requests(backend),[])
+        held=backend.windows[1].rect
+        self.assertEqual(controller.preview_covers,[('d1',Rect(held.right,tiles[2].y,controller.settings.gap,tiles[2].height))])
+        controller,backend,tiles=self.resize_gesture(-200)
+        # Window 2 grows: shown larger, resized at the release; the held
+        # window is clipped to its future tile: the new gap is covered.
+        self.assertGreater(controller.preview_rectangles[1][1].width,tiles[2].width)
+        self.assertEqual(self.live_requests(backend),[])
+        held=controller.preview_rectangles[0][1]
+        self.assertEqual(controller.preview_covers,[('d1',Rect(held.right,tiles[1].y,controller.settings.gap,tiles[1].height))])
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(controller.preview_covers,[])
+        self.assertEqual(backend.windows[2].rect.x,tiles[2].x-200)
+
+    def drag_gesture(self, controller, backend, hwnd, target, kind='move', driven=False):
+        """Window hwnd dragged by its title bar until the pointer is over the
+        tile target; the window itself has moved less (its centre may still
+        be in its own tile). Returns the drop target shown."""
+        backend.gesture_kind=lambda h:kind
+        rect=backend.windows[hwnd].rect
+        backend.cursor=(rect.right-40,rect.y+10)
+        controller._handle_event({'type':'move_start','hwnd':hwnd})
+        dx,dy=target.x+target.width//2-backend.cursor[0],target.y+20-backend.cursor[1]
+        backend.cursor=(backend.cursor[0]+dx,backend.cursor[1]+dy)
+        backend.windows[hwnd]=replace(backend.windows[hwnd],rect=Rect(rect.x+dx,rect.y+dy,rect.width,rect.height))
+        if driven:
+            self.assertTrue(controller.drive_preview())
+        else:
+            controller._handle_event({'type':'location','hwnd':hwnd})
+        guide=controller.drag_guide
+        controller._handle_event({'type':'move_end','hwnd':hwnd})
+        return guide
+
+    def test_drop_target_is_under_the_pointer(self):
+        for driven in (False,True):
+            controller,backend=self.make([record(1),record(2)])
+            controller.preview_driven=driven
+            controller.start()
+            # Window 1 is made wide, window 2 narrow.
+            backend.windows[1]=replace(backend.windows[1],rect=replace(backend.windows[1].rect,width=1500))
+            controller._native_resize(1,controller._tile_rects[1][1],backend.windows[1].rect,None,kind='resize')
+            wide,narrow=controller._tile_rects[1][1],controller._tile_rects[2][1]
+            self.assertGreater(wide.width,narrow.width*2)
+            # Dragged by its title bar onto the narrow tile: its centre is
+            # still in the wide one, the pointer decides.
+            guide=self.drag_gesture(controller,backend,1,narrow,driven=driven)
+            self.assertEqual(guide[1],narrow)
+            self.assertTrue(guide[2].startswith('Swap'))
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[2,1])
+            self.assertEqual(backend.windows[2].rect,wide)
+
+    def test_gestures_follow_one_another(self):
+        for driven in (False,True):
+            controller,backend=self.make([record(1),record(2)])
+            controller.preview_driven=driven
+            controller.start()
+            def resize(hwnd,change):
+                rect=backend.windows[hwnd].rect
+                backend.gesture_kind=lambda h:'resize'
+                backend.cursor=(rect.right,rect.y+100)
+                controller._handle_event({'type':'move_start','hwnd':hwnd})
+                backend.cursor=(rect.right+change,rect.y+100)
+                backend.windows[hwnd]=replace(backend.windows[hwnd],rect=replace(rect,width=rect.width+change))
+                self.assertTrue(controller.drive_preview() if driven else controller._preview_native_drag(hwnd) is None)
+                self.assertTrue(controller.preview_rectangles)
+                controller._handle_event({'type':'move_end','hwnd':hwnd})
+                self.assertEqual(controller.preview_rectangles,[])
+                self.assertIsNone(controller._preview_hwnd)
+            # Resize, resize again, move, resize.
+            resize(1,-200)
+            self.assertEqual(backend.windows[2].rect,controller._tile_rects[2][1])
+            resize(1,-100)
+            self.assertEqual(backend.windows[1].rect.width,backend.windows[1].rect.width)
+            self.assertEqual(backend.windows[2].rect.x,backend.windows[1].rect.right+controller.settings.gap)
+            guide=self.drag_gesture(controller,backend,1,controller._tile_rects[2][1],driven=driven)
+            self.assertTrue(guide and guide[2].startswith('Swap'))
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments],[2,1])
+            self.assertEqual(controller.drag_guide,None)
+            resize(2,150)
+            self.assertEqual(backend.windows[1].rect.x,backend.windows[2].rect.right+controller.settings.gap)
+
+    def test_edges_told_by_the_window_follow_the_pointer_from_the_first_pixel(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        backend.gesture_kind=lambda h:'move'
+        backend.grab_edges=lambda h:{'right'}
+        backend.cursor=(tiles[1].right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        self.assertEqual(controller._gesture_kinds[1],'resize')
+        # The pointer moved 30 px, the window not yet: the neighbour follows.
+        backend.cursor=(tiles[1].right-30,500)
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-30)
+        self.assertEqual(controller.preview_rectangles[0][1].height,tiles[1].height)
+
+    def limits(self, controller, hwnd, edge):
+        """Where the linked resize lets hwnd's edge go: (least, most) positions."""
+        from smartgrid.core.geometry import linked_resize
+        profile=controller.profile('d1',0)
+        index=next(i for i,a in enumerate(profile.assignments) if a and a.window_id==hwnd)
+        rects=controller._profile_rects(profile)
+        minimums=controller._gesture_minimums(profile,rects)
+        position={'left':'x','right':'right','top':'y','bottom':'bottom'}[edge]
+        return tuple(getattr(linked_resize(rects,index,edge,delta,min_sizes=minimums)[index],position) for delta in (-10**5,10**5))
+
+    def held_edge_gesture(self, controller, backend, hwnd, edges, pointer_travel):
+        """hwnd held by edges (as the window tells), the pointer going
+        pointer_travel=(dx,dy) from the edge's corner; the window follows the
+        pointer only as far as the clip allows."""
+        rect=backend.windows[hwnd].rect
+        backend.gesture_kind=lambda h:'resize'
+        backend.grab_edges=lambda h:set(edges)
+        px=rect.right if 'right' in edges else rect.x
+        py=rect.bottom if 'bottom' in edges else rect.y
+        backend.cursor=(px,py)
+        controller._handle_event({'type':'move_start','hwnd':hwnd})
+        clip=backend.cursor_clip
+        self.assertIsNotNone(clip)
+        x=min(max(px+pointer_travel[0],clip.x),clip.right-1)
+        y=min(max(py+pointer_travel[1],clip.y),clip.bottom-1)
+        backend.cursor=(x,y)
+        dx,dy=x-px,y-py
+        left=rect.x+dx if 'left' in edges else rect.x
+        right=rect.right+dx if 'right' in edges else rect.right
+        top=rect.y+dy if 'top' in edges else rect.y
+        bottom=rect.bottom+dy if 'bottom' in edges else rect.bottom
+        backend.windows[hwnd]=replace(backend.windows[hwnd],rect=Rect(left,top,right-left,bottom-top))
+        controller._preview_native_drag(hwnd)
+        controller._handle_event({'type':'move_end','hwnd':hwnd})
+        self.assertIsNone(backend.cursor_clip)
+        return clip
+
+    def test_held_window_stops_at_the_limit_on_every_edge(self):
+        from smartgrid.core.controller import FORCED_MINIMUM
+        controller,backend=self.make([record(h) for h in range(1,5)])
+        controller.start()
+        # 2x2: window 1 top-left has neighbours right and below, 4 left and above.
+        for hwnd,edge,travel,neighbour in ((1,'right',(2000,0),2),(1,'bottom',(0,2000),3),(4,'left',(-2000,0),3),(4,'top',(0,-2000),2)):
+            tile=controller._tile_rects[hwnd][1]
+            least,most=self.limits(controller,hwnd,edge)
+            clip=self.held_edge_gesture(controller,backend,hwnd,{edge},travel)
+            axis=0 if edge in ('left','right') else 1
+            start=getattr(tile,{'left':'x','right':'right','top':'y','bottom':'bottom'}[edge])
+            origin=(tile.right if edge=='right' else tile.x,tile.bottom if edge=='bottom' else tile.y)
+            # The pointer may travel exactly as far as the edge can, both ways.
+            self.assertEqual((clip.x,clip.right-1) if axis==0 else (clip.y,clip.bottom-1),
+                             (origin[axis]+least-start,origin[axis]+most-start))
+            # Released past the limit: the window lands exactly there, the
+            # neighbour at its minimum.
+            placed=backend.windows[hwnd].rect
+            self.assertEqual(getattr(placed,{'left':'x','right':'right','top':'y','bottom':'bottom'}[edge]),most if edge in ('right','bottom') else least)
+            size=backend.windows[neighbour].rect
+            self.assertEqual(size.width if axis==0 else size.height,FORCED_MINIMUM[axis])
+            controller.undo()
+
+    def test_corner_keeps_following_the_free_axis(self):
+        controller,backend=self.make([record(h) for h in range(1,5)])
+        controller.start()
+        tile=controller._tile_rects[1][1]
+        (xl,xm),(yl,ym)=self.limits(controller,1,'right'),self.limits(controller,1,'bottom')
+        # Far right, only 40 px down: x stops at its limit, y follows.
+        clip=self.held_edge_gesture(controller,backend,1,{'right','bottom'},(2000,40))
+        self.assertEqual((clip.x,clip.right-1),(tile.right+xl-tile.right,tile.right+xm-tile.right))
+        self.assertEqual((clip.y,clip.bottom-1),(tile.bottom+yl-tile.bottom,tile.bottom+ym-tile.bottom))
+        placed=backend.windows[1].rect
+        self.assertEqual(placed.right,xm)
+        self.assertEqual(placed.bottom,tile.bottom+40)
+        self.assertEqual(backend.windows[3].rect.y,tile.bottom+40+controller.settings.gap)
+        controller.undo()
+        # Both axes past their limits, from the other corner of window 4.
+        tile=controller._tile_rects[4][1]
+        self.held_edge_gesture(controller,backend,4,{'left','top'},(-2000,-2000))
+        placed=backend.windows[4].rect
+        self.assertEqual((placed.x,placed.y),(self.limits(controller,4,'left')[0],self.limits(controller,4,'top')[0]))
+
+    def test_limit_cascades_through_tiles_and_follows_the_settings(self):
+        from smartgrid.core.controller import FORCED_MINIMUM
+        controller,backend=self.make([record(h) for h in range(1,7)])
+        controller.start()
+        # 3x2: window 1's right edge pushes 2 then 3 to their minimum.
+        most=self.limits(controller,1,'right')[1]
+        self.held_edge_gesture(controller,backend,1,{'right'},(3000,0))
+        self.assertEqual(backend.windows[1].rect.right,most)
+        self.assertEqual([backend.windows[h].rect.width for h in (2,3)],[FORCED_MINIMUM[0]]*2)
+        controller.undo()
+        # Without forced tiling the applications' own minimums bound the edge;
+        # the held window's own minimum bounds it the other way.
+        controller.update_settings(replace(controller.settings,force_resize=False))
+        backend.minimums[2]=(500,1);backend.minimums[1]=(400,1)
+        least,most=self.limits(controller,1,'right')
+        clip=self.held_edge_gesture(controller,backend,1,{'right'},(3000,0))
+        self.assertEqual(backend.windows[2].rect.width,500)
+        self.assertEqual(backend.windows[1].rect.right,most)
+        tile=controller._tile_rects[1][1]
+        self.assertEqual(clip.x,tile.right+least-tile.right)
+        controller.undo()
+        self.held_edge_gesture(controller,backend,1,{'right'},(-3000,0))
+        self.assertEqual(backend.windows[1].rect.width,400)
+
+    def test_edges_told_by_the_window_moving_confine_the_pointer_too(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        backend.cursor=(tiles[1].right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        self.assertIsNone(backend.cursor_clip)
+        backend.cursor=(tiles[1].right+50,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width+50))
+        controller._preview_native_drag(1)
+        self.assertEqual(backend.cursor_clip.right-1,tiles[1].right+self.limits(controller,1,'right')[1]-tiles[1].right)
+        # Freed whatever ends the gesture: the window closed, tiling stopped.
+        del backend.windows[1]
+        controller._handle_event({'type':'destroyed','hwnd':1})
+        self.assertIsNone(backend.cursor_clip)
+        backend.windows[1]=record(1);controller.refresh()
+        backend.cursor=(tiles[1].right,500);backend.grab_edges=lambda h:{'right'}
+        controller._handle_event({'type':'move_start','hwnd':1})
+        self.assertIsNotNone(backend.cursor_clip)
+        controller.stop()
+        self.assertIsNone(backend.cursor_clip)
+
+    def test_ui_drives_the_preview_without_signals(self):
+        import threading
+        controller,backend=self.make([record(1),record(2)])
+        controller.preview_driven=True
+        controller.start()
+        guides=[]
+        controller.subscribe_guides(lambda:guides.append(list(controller.preview_rectangles)))
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        controller._handle_event({'type':'move_start','hwnd':1})
+        # The start is told, so the UI starts its beat; the runtime previews
+        # nothing itself on the window's moves.
+        self.assertEqual(guides,[[]])
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-200))
+        controller._handle_event({'type':'location','hwnd':1})
+        self.assertFalse(controller.preview_rectangles)
+        self.assertTrue(controller.drive_preview())
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-200)
+        self.assertEqual(len(guides),1)
+        # Nothing moved: nothing to draw. Runtime busy: the next frame will do.
+        self.assertFalse(controller.drive_preview())
+        with controller._lock:
+            result=[]
+            thread=threading.Thread(target=lambda:result.append(controller.drive_preview()));thread.start();thread.join()
+            self.assertEqual(result,[False])
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertIsNone(controller._preview_hwnd)
+        self.assertFalse(controller.drive_preview())
+
+    def test_release_leaves_windows_already_in_their_tiles_alone(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        images=[]
+        controller.subscribe_guides(lambda:images.append(list(controller.preview_rectangles)))
+        done=len(backend.operations)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        # Both windows followed the gesture: no placement, no settling wait.
+        self.assertEqual([op for op in backend.operations[done:] if op[0]=='place'],[])
+        self.assertEqual(controller._tile_rects[2][1],backend.windows[2].rect)
+        # Window 2's image went as soon as it was found in its tile, before the end.
+        self.assertNotIn(2,[p[2] for p in images[0]])
+        self.assertTrue(controller.profile('d1',0).resize_tiles)
+
+    def test_partly_filled_grid_keeps_its_resized_geometry(self):
+        # Five windows in a 3x2 grid: the sixth tile is empty.
+        controller,backend=self.make([record(h) for h in range(1,6)])
+        controller.start()
+        held=backend.windows[1].rect
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[1]=replace(backend.windows[1],rect=replace(held,width=held.width-200))
+        controller._preview_native_drag(1)
+        previewed=[p[1] for p in controller.preview_rectangles]
+        self.assertEqual(len(previewed),6)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        profile=controller.profile('d1',0)
+        self.assertEqual(len(profile.resize_tiles),6)
+        self.assertEqual(controller._profile_rects(profile),previewed)
+        self.assertEqual(backend.windows[2].rect,previewed[1])
+
+    def test_custom_layout_with_empty_tiles_keeps_its_resized_geometry(self):
+        controller,backend=self.make([record(1),record(2)])
+        profile=controller.profile('d1',0)
+        profile.preset='custom'
+        profile.tiles=[Tile('a',0,0,.5,.5),Tile('b',.5,0,.5,.5),Tile('c',0,.5,.5,.5),Tile('d',.5,.5,.5,.5)]
+        controller.start()
+        held=backend.windows[1].rect
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[1]=replace(backend.windows[1],rect=replace(held,width=held.width-200))
+        controller._preview_native_drag(1)
+        previewed=[p[1] for p in controller.preview_rectangles]
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(controller._profile_rects(controller.profile('d1',0)),previewed)
+        self.assertEqual(backend.windows[2].rect,previewed[1])
+
+    def test_an_edge_drag_moves_the_neighbours_from_its_first_pixels(self):
+        controller,backend=self.make([record(1),record(2)])
+        backend.gesture_kind=lambda hwnd:'resize'
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-3))
+        controller._preview_native_drag(1)
+        self.assertIsNone(controller.drag_guide)
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-3)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].rect.x,tiles[2].x-3)
+        self.assertTrue(controller.profile('d1',0).resize_tiles)
+
+    def test_preview_follows_the_pointer_past_a_slow_window(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        backend.cursor=(tiles[1].right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        # The pointer tells nothing before the window says which edge is held.
+        backend.cursor=(tiles[1].right-60,500)
+        controller._preview_native_drag(1)
+        self.assertFalse(controller.preview_rectangles)
+        # The window followed the first 100 px; the pointer went on 150 more
+        # (a slow application, or one at its minimum size).
+        backend.cursor=(tiles[1].right-100,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-100))
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-100)
+        backend.cursor=(tiles[1].right-250,540)
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-250)
+        # Only the edge the gesture moves follows the pointer: not the bottom.
+        self.assertEqual(controller.preview_rectangles[0][1].height,tiles[1].height)
+        # The window catching up part of the way does not pull the preview back.
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-150))
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[1][1].x,tiles[2].x-250)
+        # The release ends where the images showed; the held window is put there.
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].rect.x,tiles[2].x-250)
+        self.assertEqual(backend.windows[1].rect.width,tiles[1].width-250)
+
+    def test_release_takes_the_window_where_windows_left_it(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tiles={h:backend.windows[h].rect for h in (1,2)}
+        backend.cursor=(tiles[1].right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tiles[1].right-200,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-200))
+        controller._preview_native_drag(1)
+        # Released with a flick: the window went 5 px further than previewed.
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-205))
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[1].rect.width,tiles[1].width-205)
+        self.assertEqual(backend.windows[2].rect.x,tiles[2].x-205)
+        # Escape: Windows puts the window back although the pointer is far away.
+        controller._handle_event({'type':'move_start','hwnd':1})
+        held=backend.windows[1].rect
+        backend.cursor=(held.right-200,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(held,width=held.width-200))
+        controller._preview_native_drag(1)
+        backend.windows[1]=replace(backend.windows[1],rect=held)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[1].rect,held)
+        self.assertEqual(backend.windows[2].rect.x,tiles[2].x-205)
+
+    def test_gesture_is_previewed_between_events(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        controller.start_runtime()
+        try:
+            held=backend.windows[1].rect
+            controller._enqueue_event({'type':'move_start','hwnd':1})
+            deadline=time.monotonic()+2
+            while 1 not in controller._interacting and time.monotonic()<deadline:
+                time.sleep(.01)
+            # The window changes without any event reaching the queue.
+            backend.windows[1]=replace(backend.windows[1],rect=replace(held,width=held.width-200))
+            while not controller.preview_rectangles and time.monotonic()<deadline:
+                time.sleep(.01)
+            self.assertTrue(controller.preview_rectangles)
+        finally:
+            controller.quit()
+
+    def test_linked_resize_release_places_neighbours_and_undo_restores_them(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        target=controller.preview_rectangles[1][1]
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].rect,target)
+        self.assertTrue(controller.profile('d1',0).resize_tiles)
+        self.assertEqual(controller.preview_rectangles,[])
+        self.assertFalse(controller.motion_events)
+        controller.undo()
+        self.assertEqual(backend.windows[2].rect,tiles[2])
+
+    def test_cancelled_linked_resize_leaves_neighbours_in_their_tiles(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        # Escape: Windows puts the held window back where it was.
+        backend.windows[1]=replace(backend.windows[1],rect=tiles[1])
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].rect,tiles[2])
+        self.assertFalse(controller.profile('d1',0).resize_tiles)
+        self.assertEqual(controller.preview_rectangles,[])
+
+    def test_neighbours_follow_back_to_the_start_size(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        backend.windows[1]=replace(backend.windows[1],rect=tiles[1])
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[1][1],tiles[2])
+
+    def test_window_closed_during_linked_resize_ends_the_gesture(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        del backend.windows[1]
+        controller._handle_event({'type':'destroyed','hwnd':1})
+        self.assertFalse(controller._interacting)
+        self.assertEqual(controller.preview_rectangles,[])
+        self.assertEqual(self.live_requests(backend),[])
+
+    def test_minimized_neighbour_is_not_shown_during_linked_resize(self):
+        controller,backend=self.make([record(1),record(2),record(3)])
+        controller.start()
+        held=backend.windows[1].rect
+        backend.windows[3]=replace(backend.windows[3],state='minimized')
+        controller.refresh(auto=False)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[1]=replace(backend.windows[1],rect=Rect(held.x,held.y,held.width-200,held.height))
+        controller._preview_native_drag(1)
+        self.assertNotIn(3,[p[2] for p in controller.preview_rectangles])
+
+    def test_linked_resize_takes_the_drop_target_of_its_first_pixels_away(self):
+        controller,backend,tiles=self.resize_gesture(3)
+        self.assertIsNotNone(controller.drag_guide)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tiles[1],width=tiles[1].width-200))
+        controller._preview_native_drag(1)
+        self.assertTrue(controller.preview_rectangles)
+        self.assertIsNone(controller.drag_guide)
+
+    def test_failed_arrangement_still_ends_the_linked_resize(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        backend.desktop_known=False
+        with self.assertRaises(ValueError):
+            controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(controller.preview_rectangles,[])
+        self.assertEqual(backend.windows[2].rect,tiles[2])
+
+    def test_neighbour_maximized_during_linked_resize_is_left_alone(self):
+        controller,backend,tiles=self.resize_gesture(-200)
+        # Maximized since the last scan: its record still says normal.
+        backend.windows[2]=replace(backend.windows[2],state='maximized')
+        backend.windows[1]=replace(backend.windows[1],rect=tiles[1])
+        backend.discover_windows=lambda:[replace(w,state='normal') if w.ref.hwnd==2 else w for w in backend.windows.values()]
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].state,'maximized')
 
     def test_classic_layout_grows_and_shrinks_and_toggle_restores(self):
         controller,backend=self.make([record(1)])

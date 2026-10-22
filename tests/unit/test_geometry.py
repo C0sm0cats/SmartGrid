@@ -173,3 +173,22 @@ class ResizedLayoutCountTests(unittest.TestCase):
         self.assertEqual(effective_layout(profile,runtime=True)[0],'custom')
         profile.assignments=profile.assignments[:3]
         self.assertEqual(effective_layout(profile,runtime=True)[0],'master_stack')
+
+
+class ResizedLayoutTileCountTests(unittest.TestCase):
+    def test_linked_resize_applies_to_the_layout_with_as_many_tiles(self):
+        from smartgrid.core.models import Assignment,SpaceProfile
+        from smartgrid.core.geometry import effective_layout
+        # Five windows in a 3x2 grid resized: the sixth, empty tile counts.
+        tiles=[Tile(str(i),(i%3)/3,(i//3)/2,1/3,.5) for i in range(6)]
+        tiles[0]=Tile('0',0,0,.25,.5);tiles[1]=Tile('1',.25,0,1/3+1/12,.5)
+        profile=SpaceProfile('d',0,assignments=[Assignment(str(i),i+1) for i in range(5)],resize_tiles=tiles)
+        self.assertEqual(effective_layout(profile,runtime=True),('custom',tiles,6))
+        profile.assignments.append(Assignment('5',6))
+        self.assertEqual(effective_layout(profile,runtime=True)[0],'custom')
+        profile.assignments=profile.assignments[:4]
+        self.assertEqual(effective_layout(profile,runtime=True)[0],'2x2')
+        # A custom layout with empty tiles keeps its resized geometry too.
+        custom=SpaceProfile('d',0,preset='custom',tiles=[Tile('a',0,0,.5,1),Tile('b',.5,0,.5,1)],
+                            assignments=[Assignment('0',1)],resize_tiles=[Tile('a',0,0,.7,1),Tile('b',.7,0,.3,1)])
+        self.assertEqual(effective_layout(custom,runtime=True)[1],custom.resize_tiles)

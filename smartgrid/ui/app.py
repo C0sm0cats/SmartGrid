@@ -12,7 +12,7 @@ from .preferences import Preferences
 from .theme import apply_theme
 from .focus_frame import FocusFrame
 from .window_actions import WindowActions
-from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,WindowGhost,SourceGuide
+from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,WindowGhost,SourceGuide,LiveImage,TileCover,place_images
 from .tile_view import application_icon
 from smartgrid.core.geometry import effective_layout,preset_name
 
@@ -39,6 +39,20 @@ class DesktopUI:
         self.action_reference=None
         self.window_actions.action.connect(self.perform_window_action)
         self.resize_frames = []
+        self.resize_images = {}
+        self.resize_covers = []
+        # Per gesture: the visible frame of each imaged window, the colour of
+        # the covers per display.
+        self._image_frames = {}
+        self._cover_colors = {}
+        # A native gesture is previewed from here, a frame at a time (the
+        # pointer read now, the images moved at once), not from the runtime
+        # through a queued signal: 4 ms between beats, so every display frame
+        # gets a fresh position. Timing of the beats, logged per gesture.
+        self.drive_timer=QTimer(app);self.drive_timer.setTimerType(Qt.TimerType.PreciseTimer);self.drive_timer.setInterval(4)
+        self.drive_timer.timeout.connect(self._drive_preview)
+        self.drive_stats=None
+        controller.preview_driven=not getattr(controller.backend,'is_fake',False)
         self.quitting = False
         self.last_error = ''
         apply_theme(controller.settings)
@@ -281,10 +295,36 @@ class DesktopUI:
             screen = self.app.primaryScreen()
         return screen
 
-    def _logical(self, display_id, rect):
-        """Native physical rectangle to Qt logical coordinates, or None if unmapped."""
+    def _cover_color(self, display_id, mapping):
+        """The colour of the covers of a linked resize: that of a gap between
+        two tiles as they are (the wallpaper there), read once per gesture;
+        a dark neutral when the screen cannot be read."""
+        if display_id in self._cover_colors:
+            return self._cover_colors[display_id]
+        color=QColor(32,32,32)
+        sample=self.controller.preview_gap
+        display,screen=mapping
+        if sample and sample[0]==display_id and screen is not None:
+            try:
+                centre=self._logical(display_id,Rect(sample[1].x+sample[1].width//2-2,sample[1].y+sample[1].height//2-2,4,4),mapping)
+                image=screen.grabWindow(0,centre.x(),centre.y(),centre.width(),centre.height()).toImage()
+                if not image.isNull() and image.width()>0 and image.height()>0:
+                    pixels=[image.pixelColor(x,y) for x in range(image.width()) for y in range(image.height())]
+                    color=QColor(sum(p.red() for p in pixels)//len(pixels),sum(p.green() for p in pixels)//len(pixels),
+                                 sum(p.blue() for p in pixels)//len(pixels))
+            except Exception:
+                log.exception('Cover colour could not be read')
+        self._cover_colors[display_id]=color
+        return color
+
+    def _mapping(self, display_id):
+        """(display, Qt screen) of a native display, for several conversions."""
         display = next((d for d in self.controller.displays if d.id == display_id),None)
-        screen = self._screen(display) if display else None
+        return display, self._screen(display) if display else None
+
+    def _logical(self, display_id, rect, mapping=None):
+        """Native physical rectangle to Qt logical coordinates, or None if unmapped."""
+        display, screen = mapping or self._mapping(display_id)
         if screen is None:
             return None
         scale = screen.devicePixelRatio() or 1
@@ -379,26 +419,83 @@ class DesktopUI:
         return arrows
 
     def _refresh_resize_frames(self):
-        """Linked-resize preview outlines while a window edge is dragged."""
+        """Linked resize: each neighbour's live image on its future tile while
+        a window edge is dragged, an outline when Windows has no image for it,
+        and flat covers where the old tiles would show through."""
         controller=self.controller
-        previews=[] if getattr(controller.backend,'is_fake',False) else list(controller.preview_rectangles)
-        while len(self.resize_frames)>len(previews):
-            self.resize_frames.pop().deleteLater()
-        while len(self.resize_frames)<len(previews):
-            self.resize_frames.append(FocusFrame(topmost=True))
-        for frame,(display_id,rect) in zip(self.resize_frames,previews):
-            display=next((d for d in controller.displays if d.id==display_id),None)
-            device=getattr(controller.backend,'monitor_devices',{}).get(display_id,'')
-            screen=self._screen(display) if display else None
-            if not display or not screen:
-                frame.hide()
+        fake=getattr(controller.backend,'is_fake',False)
+        previews=[] if fake else list(controller.preview_rectangles)
+        covers=[] if fake else list(controller.preview_covers)
+        outlines,images,placements,mappings=[],{},[],{}
+        over=controller._preview_hwnd is None
+        if over:
+            self._image_frames.clear();self._cover_colors.clear()
+        for display_id,rect,hwnd in previews:
+            if display_id not in mappings:
+                mappings[display_id]=self._mapping(display_id)
+            target=self._logical(display_id,rect,mappings[display_id])
+            if target is None:
                 continue
-            native,logical=display.work_area,screen.availableGeometry()
-            scale=screen.devicePixelRatio() or 1
-            frame.move_preview(QRect(logical.x()+round((rect.x-native.x)/scale),logical.y()+round((rect.y-native.y)/scale),round(rect.width/scale),round(rect.height/scale)),controller.settings)
+            if hwnd:
+                frame=self._image_frames.get(hwnd) or getattr(controller.backend,'visible_frame',lambda h: None)(hwnd)
+                image=self.resize_images.pop(hwnd,None) or (LiveImage(controller.backend.api) if frame else None)
+                if image and frame and image.show_window(hwnd,frame,target,rect):
+                    self._image_frames[hwnd]=frame
+                    images[hwnd]=image
+                    if image.placed!=rect:
+                        placements.append((image,rect))
+                    continue
+                if image:
+                    image.release();image.deleteLater()
+                outlines.append(target)
+        # Covers: a pool, hidden rather than destroyed as their number varies.
+        while len(self.resize_covers)<len(covers):
+            self.resize_covers.append(TileCover())
+        for cover,(display_id,rect) in zip(self.resize_covers,covers):
+            if display_id not in mappings:
+                mappings[display_id]=self._mapping(display_id)
+            target=self._logical(display_id,rect,mappings[display_id])
+            if target is None:
+                cover.hide();continue
+            color=self._cover_color(display_id,mappings[display_id])
+            if cover.color!=color:
+                cover.color=color;cover.update()
+            if not cover.isVisible():
+                cover.setGeometry(target);cover.show()
+            if cover.placed!=rect:
+                placements.append((cover,rect))
+        for cover in self.resize_covers[len(covers):]:
+            cover.hide();cover.placed=None
+        if placements:
+            place_images(controller.backend.api,placements)
+            for widget,rect in placements:
+                widget.placed=rect
+        for image in images.values():
+            image.settle()
+        # Images of windows no longer previewed: the gesture ended, after the
+        # real windows were placed in their tiles. Those made ready for it
+        # (prepare_images) wait for their first frame meanwhile.
+        for hwnd,image in self.resize_images.items():
+            if over:
+                image.release();image.deleteLater()
+            else:
+                images[hwnd]=image
+        self.resize_images=images
+        if not covers:
+            for cover in self.resize_covers:
+                cover.deleteLater()
+            self.resize_covers=[]
+        while len(self.resize_frames)>len(outlines):
+            self.resize_frames.pop().deleteLater()
+        while len(self.resize_frames)<len(outlines):
+            self.resize_frames.append(FocusFrame(topmost=True))
+        for frame,target in zip(self.resize_frames,outlines):
+            frame.move_preview(target,controller.settings)
             frame.color=controller.settings.accent
             frame.width_px=2
             frame.style='outline'
+            if covers:
+                frame.raise_()
             frame.update()
             if not frame.isVisible():
                 frame.show()
@@ -406,11 +503,84 @@ class DesktopUI:
     def refresh_drag(self):
         """Drag guides only: called as soon as they change, without waiting
         for the 100 ms timer."""
+        self.bridge.guides_queued=False
         try:
             self._refresh_resize_frames()
             self.refresh_guides()
+            if self.controller.preview_driven and self.controller._preview_hwnd is not None and not self.drive_timer.isActive():
+                self.drive_stats={'started':time.perf_counter(),'last':None,'frames':0,'beats':0,'compute':0.0,'compute_max':0.0,
+                                  'draw':0.0,'draw_max':0.0,'gap_max':0.0,'logged':time.perf_counter()}
+                self.drive_timer.start()
+                self._prepare_images(self.controller._preview_hwnd)
+            if self.controller._preview_hwnd is None and not self.controller._interacting and not self.focus_frame.isVisible():
+                # The gesture is over and its windows placed: the outline at
+                # once, from two readings that agree, not after the timer.
+                self._refresh_frame();self._refresh_frame()
         except Exception:
             log.exception('Drag guides could not be drawn')
+
+    def _prepare_images(self, hwnd):
+        """Images of the held window's neighbours registered before they are
+        needed: the first frame of a resize has only to show them."""
+        controller=self.controller
+        if controller._gesture_kinds.get(hwnd)=='move' or getattr(controller.backend,'is_fake',False):
+            return
+        window=next((w for w in controller.windows if w.ref.hwnd==hwnd),None)
+        if not window:
+            return
+        profile=controller.profile(window.display_id,controller.active_spaces.get(window.display_id,0))
+        for assignment in list(profile.assignments):
+            other=assignment.window_id if assignment else None
+            if not other or other==hwnd or other in self.resize_images:
+                continue
+            frame=getattr(controller.backend,'visible_frame',lambda h: None)(other)
+            image=LiveImage(controller.backend.api) if frame else None
+            if image and image.prepare(other):
+                self._image_frames[other]=frame;self.resize_images[other]=image
+            elif image:
+                image.deleteLater()
+
+    def _drive_preview(self):
+        """One beat of a native gesture: the preview computed from the pointer
+        now and drawn at once, on this thread."""
+        controller=self.controller
+        stats=self.drive_stats
+        if controller._preview_hwnd is None:
+            self.drive_timer.stop()
+            if stats and stats['frames']:
+                log.info('Gesture frames: %d in %.1f s (%d beats), compute %.2f ms (max %.2f), draw %.2f ms (max %.2f), longest gap between frames %.1f ms',
+                         stats['frames'],time.perf_counter()-stats['started'],stats['beats'],
+                         stats['compute']/stats['frames']*1000,stats['compute_max']*1000,
+                         stats['draw']/stats['frames']*1000,stats['draw_max']*1000,stats['gap_max']*1000)
+            self.drive_stats=None
+            return
+        started=time.perf_counter()
+        try:
+            changed=controller.drive_preview()
+            computed=time.perf_counter()
+            if changed:
+                self._refresh_resize_frames()
+                self.refresh_guides()
+        except Exception:
+            log.exception('Gesture preview could not be drawn')
+            return
+        if not stats:
+            return
+        stats['beats']+=1
+        if not changed:
+            return
+        drawn=time.perf_counter()
+        stats['frames']+=1
+        stats['compute']+=computed-started;stats['compute_max']=max(stats['compute_max'],computed-started)
+        stats['draw']+=drawn-computed;stats['draw_max']=max(stats['draw_max'],drawn-computed)
+        if stats['last'] is not None:
+            stats['gap_max']=max(stats['gap_max'],started-stats['last'])
+        stats['last']=started
+        if drawn-stats['logged']>=1.0 and log.isEnabledFor(logging.DEBUG):
+            log.debug('Gesture frames: %d so far, compute %.2f ms (max %.2f), draw %.2f ms (max %.2f), longest gap %.1f ms, pointer to placed %.2f ms',
+                      stats['frames'],stats['compute']/stats['frames']*1000,stats['compute_max']*1000,
+                      stats['draw']/stats['frames']*1000,stats['draw_max']*1000,stats['gap_max']*1000,(drawn-started)*1000)
+            stats['logged']=drawn
 
     def refresh_focus(self):
         try:
@@ -492,6 +662,11 @@ class DesktopUI:
         else:
             self.window_actions.dismiss();self.action_reference=None
         self._refresh_resize_frames()
+        self._refresh_frame()
+
+    def _refresh_frame(self):
+        """Focus outline around the focused tiled window."""
+        controller=self.controller
         hwnd=controller._last_border
         window=next((w for w in controller.windows if w.ref.hwnd==hwnd),None)
         if getattr(controller.backend,'is_fake',False):
@@ -577,6 +752,10 @@ class DesktopUI:
         self.window_actions.close()
         for frame in self.resize_frames:
             frame.close()
+        for image in self.resize_images.values():
+            image.release();image.close()
+        for cover in self.resize_covers:
+            cover.close()
         self.tray.hide()
         for card in self.cards.values():
             card.close()
