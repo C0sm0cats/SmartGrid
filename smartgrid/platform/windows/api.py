@@ -116,7 +116,8 @@ class Win32:
             fn.restype = C.c_ssize_t if C.sizeof(C.c_void_p) == 8 else LONG
             fn.argtypes = [HWND, C.c_int] + ([fn.restype] if base == 'SetWindowLong' else [])
             setattr(self, base, fn)
-        for name, result, args in [('SetProcessDpiAwarenessContext', BOOL, [HANDLE]), ('SetThreadDpiAwarenessContext', HANDLE, [HANDLE]), ('GetDpiForWindow', UINT, [HWND])]:
+        for name, result, args in [('SetProcessDpiAwarenessContext', BOOL, [HANDLE]), ('SetThreadDpiAwarenessContext', HANDLE, [HANDLE]), ('GetDpiForWindow', UINT, [HWND]),
+                                    ('GetWindowDpiAwarenessContext', HANDLE, [HWND]), ('GetDpiFromDpiAwarenessContext', UINT, [HANDLE])]:
             fn = getattr(self.user32, name, None)
             if fn is not None:
                 fn.restype, fn.argtypes = result, args

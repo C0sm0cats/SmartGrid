@@ -231,8 +231,20 @@ class WindowsBackend:
         # SMTO_ABORTIFHUNG|SMTO_BLOCK, maximum 100 ms.
         if not self.api.SendMessageTimeoutW(hwnd, 0x84, 0, ((point.y & 0xffff) << 16) | (point.x & 0xffff), 3, 100, C.byref(result)):
             return None
-        return {10: {'left'}, 11: {'right'}, 12: {'top'}, 13: {'left', 'top'}, 14: {'right', 'top'},
+        told = {10: {'left'}, 11: {'right'}, 12: {'top'}, 13: {'left', 'top'}, 14: {'right', 'top'},
                 15: {'bottom'}, 16: {'left', 'bottom'}, 17: {'right', 'bottom'}}.get(result.value)
+        # An application that is not DPI aware reads these physical
+        # coordinates as its own and can answer for another place: only the
+        # edges the cursor is actually near count.
+        raw, visible = self._raw_rect(hwnd), self.window_rect(hwnd)
+        if not told or not raw or not visible:
+            return None
+        inside = round(12 * (self.api.GetDpiForWindow(hwnd) if self.api.GetDpiForWindow else 96) / 96)
+        near = {edge for edge, distance, outside in (
+                    ('left', point.x - visible.x, visible.x - raw.x), ('right', visible.right - point.x, raw.right - visible.right),
+                    ('top', point.y - visible.y, visible.y - raw.y), ('bottom', visible.bottom - point.y, raw.bottom - visible.bottom))
+                if -outside - 2 <= distance <= inside}
+        return (told & near) or None
 
     @physical
     def gesture_kind(self, hwnd):
@@ -250,7 +262,15 @@ class WindowsBackend:
         margin = 4
         inside = (rect.x + margin <= point.x < rect.right - margin and
                   rect.y + margin <= point.y < rect.bottom - margin)
-        return 'move' if inside else 'resize'
+        if not inside:
+            return 'resize'
+        # Over the client area, not a title bar: a gesture started from the
+        # keyboard (Alt+Space, Size or Move puts the cursor in the middle).
+        # Unknown: a size change then makes it a resize.
+        result = ULONG_PTR()
+        if self.api.SendMessageTimeoutW(hwnd, 0x84, 0, ((point.y & 0xffff) << 16) | (point.x & 0xffff), 3, 100, C.byref(result)) and result.value == 1:
+            return None
+        return 'move'
 
     def _identity(self, hwnd, *, pid=None, scan_identities=None):
         if pid is None:
@@ -428,7 +448,23 @@ class WindowsBackend:
         raw, visible = self._raw_rect(hwnd), self.window_rect(hwnd)
         dx = raw.width - visible.width if raw and visible else 0
         dy = raw.height - visible.height if raw and visible else 0
-        return max(1, info.ptMinTrackSize.x - dx), max(1, info.ptMinTrackSize.y - dy)
+        scale = self._app_scale(hwnd)
+        return max(1, round(info.ptMinTrackSize.x * scale) - dx), max(1, round(info.ptMinTrackSize.y * scale) - dy)
+
+    def _app_scale(self, hwnd):
+        """Physical pixels per pixel of the application: above 1 for an
+        application that is not DPI aware (or aware of the system DPI only)
+        on a scaled display, whose sizes Windows does not convert in a
+        message sent to it."""
+        context = self.api.GetWindowDpiAwarenessContext(hwnd) if self.api.GetWindowDpiAwarenessContext else None
+        own = self.api.GetDpiFromDpiAwarenessContext(context) if context and self.api.GetDpiFromDpiAwarenessContext else 0
+        if not own:
+            return 1.0  # per-monitor aware, or unknown
+        x, y = UINT(), UINT()
+        monitor = self.api.MonitorFromWindow(hwnd, 2)
+        if not monitor or self.api.GetDpiForMonitor(monitor, 0, C.byref(x), C.byref(y)) != 0 or not x.value:
+            return 1.0
+        return x.value / own
 
     @staticmethod
     def _close_rect(actual, expected, tolerance=2):
@@ -750,7 +786,15 @@ class WindowsBackend:
                         # Child windows laid out again inside a window being
                         # resized (dozens per step): nothing to follow there.
                         return
-                    self._enqueue({'type':event_types.get(event, 'changed'), 'hwnd':int(hwnd), 'native_time':event_time})
+                    payload = {'type':event_types.get(event, 'changed'), 'hwnd':int(hwnd), 'native_time':event_time}
+                    if event == 0xa:
+                        # The window and the pointer as the gesture starts,
+                        # before the runtime handles it.
+                        try:
+                            payload['rect'], payload['cursor'] = self.window_rect(hwnd), self.cursor_position()
+                        except Exception:
+                            log.exception('Gesture start could not be read')
+                    self._enqueue(payload)
                 self._winevent_proc = WINEVENTPROC(event_proc)
                 for event in event_types:
                     hook = self.api.SetWinEventHook(event, event, None, self._winevent_proc, 0, 0, 2)

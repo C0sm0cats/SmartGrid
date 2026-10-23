@@ -352,6 +352,8 @@ class ControllerReviewTests(unittest.TestCase):
     def test_edges_told_by_the_window_moving_confine_the_pointer_too(self):
         controller,backend=self.make([record(1),record(2)])
         controller.start()
+        # The cursor on the edge (a mouse resize), the edge not told.
+        backend.gesture_kind=lambda hwnd:'resize'
         tiles={h:backend.windows[h].rect for h in (1,2)}
         backend.cursor=(tiles[1].right,500)
         controller._handle_event({'type':'move_start','hwnd':1})
@@ -460,6 +462,8 @@ class ControllerReviewTests(unittest.TestCase):
     def test_preview_follows_the_pointer_past_a_slow_window(self):
         controller,backend=self.make([record(1),record(2)])
         controller.start()
+        # The cursor on the edge (a mouse resize), the edge not told.
+        backend.gesture_kind=lambda hwnd:'resize'
         tiles={h:backend.windows[h].rect for h in (1,2)}
         backend.cursor=(tiles[1].right,500)
         controller._handle_event({'type':'move_start','hwnd':1})
@@ -642,6 +646,266 @@ class ControllerReviewTests(unittest.TestCase):
         self.addCleanup(self.temporary.cleanup)
         self.displays = [Display('d1','Primary',Rect(0,0,1920,1080),primary=True),
                          Display('d2','Secondary',Rect(1920,0,1600,900))]
+
+    def late_start(self, travel):
+        """Window 1 (2x1) held by its right edge; the runtime handles the
+        start when the window has already grown by travel, the event telling
+        where the window and the pointer were when Windows started it."""
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+travel))
+        backend.cursor=(tile.right+travel,500)
+        controller._handle_event({'type':'move_start','hwnd':1,'rect':tile,'cursor':(tile.right,500)})
+        return controller,backend,tile
+
+    def test_a_gesture_handled_late_loses_nothing_at_the_release(self):
+        controller,backend,tile=self.late_start(60)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+200))
+        backend.cursor=(tile.right+200,500)
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[0][1].right,tile.right+200)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[1].rect.right,tile.right+200)
+
+    def test_undo_after_a_gesture_handled_late_puts_the_window_back_in_its_tile(self):
+        controller,backend,tile=self.late_start(60)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+200))
+        backend.cursor=(tile.right+200,500)
+        controller._preview_native_drag(1)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        controller.undo()
+        self.assertEqual(backend.windows[1].rect,tile)
+
+    def test_escape_cancels_a_gesture_handled_late(self):
+        controller,backend,tile=self.late_start(40)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+300))
+        backend.cursor=(tile.right+300,500)
+        controller._preview_native_drag(1)
+        # Escape: Windows puts the window back; the pointer stays.
+        backend.windows[1]=replace(backend.windows[1],rect=tile)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[1].rect,tile)
+        self.assertFalse(controller.profile('d1',0).resize_tiles)
+
+    def test_release_keeps_the_minimums_of_the_preview(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.settings.force_resize=False
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        answers=iter([(1,1),(1,1)])
+        # Busy at the start (no answer), then 700 px: the preview's stays.
+        backend.min_size=lambda h:next(answers,(700,100) if h==2 else (1,1))
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tile.right+600,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+600))
+        controller._preview_native_drag(1)
+        preview=[p[1] for p in controller.preview_rectangles]
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual([backend.windows[h].rect for h in (1,2)],preview)
+
+    def test_an_outer_edge_does_not_hold_the_pointer_still(self):
+        controller,backend=self.make([record(h,f'app{h}') for h in range(1,5)])
+        controller.start()
+        held=max(backend.windows,key=lambda h:(backend.windows[h].rect.right,backend.windows[h].rect.bottom))
+        tile=backend.windows[held].rect
+        backend.grab_edges=lambda h:{'right','bottom'}
+        backend.cursor=(tile.right,tile.bottom)
+        controller._handle_event({'type':'move_start','hwnd':held})
+        area=self.displays[0].work_area
+        self.assertEqual(backend.cursor_clip,Rect(area.x,area.y,area.width,area.height))
+        # Past its tile, the window is covered up to it.
+        backend.windows[held]=replace(backend.windows[held],rect=replace(tile,width=tile.width-100))
+        backend.cursor=(tile.right-100,tile.bottom)
+        controller._preview_native_drag(held)
+        self.assertIn(('d1',Rect(tile.right-100,tile.y,100,tile.height)),controller.preview_covers)
+
+    def test_nothing_is_rescanned_during_a_gesture_and_new_windows_join_at_the_release(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        controller._suppress_events_until=0
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        scans=[];discover=backend.discover_windows
+        backend.discover_windows=lambda:(scans.append(1),discover())[1]
+        backend.windows[3]=record(3,'new')
+        for kind in ('created','shown','reconcile','hidden','minimized'):
+            controller._last_reconcile=0
+            controller._handle_event({'type':kind,'hwnd':3})
+        self.assertEqual(scans,[])
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertIn(3,[a.window_id for a in controller.profile('d1',0).assignments if a])
+
+    def test_a_window_closed_during_a_resize_does_not_change_the_resize(self):
+        controller,backend=self.make([record(h,f'app{h}') for h in (1,2,3)])
+        controller.start()
+        controller._suppress_events_until=0
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tile.right+100,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+100))
+        controller._preview_native_drag(1)
+        preview=[p[1] for p in controller.preview_rectangles]
+        del backend.windows[3]
+        controller._handle_event({'type':'destroyed','hwnd':3})
+        controller._handle_event({'type':'move_end','hwnd':1})
+        # Made for the three tiles shown; back when three windows are.
+        backend.windows[3]=record(3,'app3');controller.refresh()
+        self.assertEqual([backend.windows[h].rect for h in (1,2,3)],preview)
+
+    def test_a_drag_to_another_display_survives_a_window_opened_meanwhile(self):
+        controller,backend=self.make([record(1),record(2),record(3,'app','d2')])
+        backend.gesture_kind=lambda hwnd:'move'
+        controller.start()
+        controller._suppress_events_until=0
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[9]=replace(record(9,'tooltip'),eligible=False)
+        controller._handle_event({'type':'created','hwnd':9})
+        backend.windows[1]=replace(backend.windows[1],rect=Rect(2200,100,640,480),display_id='d2')
+        backend.cursor=(2500,300)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertIn(1,[a.window_id for a in controller.profile('d2',0).assignments if a])
+
+    def test_shortcuts_that_move_windows_wait_for_the_release(self):
+        for action in ('arrange','undo','space2','float','swap','toggle','pause'):
+            controller,backend=self.make([record(1),record(2)])
+            controller.start()
+            backend.grab_edges=lambda h:{'right'}
+            tile=backend.windows[1].rect
+            backend.cursor=(tile.right,500)
+            controller._handle_event({'type':'move_start','hwnd':1})
+            backend.foreground_hwnd=1
+            operations=len(backend.operations)
+            controller.handle_action(action)
+            self.assertEqual(backend.operations[operations:],[],action)
+            self.assertEqual(controller.active_spaces['d1'],0,action)
+            self.assertIsNone(controller._swap_snapshot,action)
+            self.assertNotIn(1,controller._floating,action)
+            self.assertTrue(controller.running and not controller.paused,action)
+
+    def test_a_resize_is_the_layout_remembered_for_its_preset(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tile.right+200,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+200))
+        controller._preview_native_drag(1)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        profile=controller.profile('d1',0)
+        self.assertEqual(controller.repository.get_variant('d1',0,profile.preset).resize_tiles,profile.resize_tiles)
+
+    def test_a_window_opened_just_after_an_arrangement_joins_at_the_release(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        # Within the quiet time after an arrangement: the event is not seen.
+        controller._suppress_events_until=time.monotonic()+60
+        backend.windows[3]=record(3,'new')
+        controller._handle_event({'type':'created','hwnd':3})
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertIn(3,[a.window_id for a in controller.profile('d1',0).assignments if a])
+
+    def test_the_held_window_takes_no_lock_from_the_event_thread(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        controller._enqueue_event({'type':'move_start','hwnd':1})
+        guarded=[];controller._guard_slots=lambda only=None:guarded.append(only)
+        controller._enqueue_event({'type':'location','hwnd':1})
+        self.assertEqual(guarded,[])
+
+    def test_cover_colour_is_read_where_nothing_moves(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        # Read at the start, in the margin along the other tile (the only gap
+        # touches the held window and its outline).
+        display,strip=controller.preview_gap
+        other=backend.windows[2].rect
+        self.assertTrue(strip.x>=other.x and strip.right<=other.right)
+
+    def test_keyboard_sizing_is_followed_by_the_window_and_kept(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        tile=backend.windows[1].rect
+        # Alt+Space, Size: the cursor in the middle (kind unknown), then on the edge.
+        backend.cursor=(tile.x+tile.width//2,tile.y+tile.height//2)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tile.right+120,tile.y+tile.height//2)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+120))
+        controller._preview_native_drag(1)
+        self.assertEqual(controller.preview_rectangles[0][1].right,tile.right+120)
+        # Held at the limit like a mouse resize, from where the pointer is.
+        self.assertEqual(backend.cursor_clip.right-1,tile.right+self.limits(controller,1,'right')[1]-tile.right)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[1].rect.right,tile.right+120)
+
+    def test_pause_frees_the_pointer(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        self.assertIsNotNone(backend.cursor_clip)
+        controller.pause()
+        self.assertIsNone(backend.cursor_clip)
+
+    def test_release_below_the_minimum_is_forced_at_once(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        backend.grab_edges=lambda h:{'right'}
+        backend.min_size=lambda h:(900,100) if h==2 else (1,1)
+        tile=backend.windows[1].rect
+        backend.cursor=(tile.right,500)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.cursor=(tile.right+400,500)
+        backend.windows[1]=replace(backend.windows[1],rect=replace(tile,width=tile.width+400))
+        controller._preview_native_drag(1)
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertNotIn(2,[op[1] for op in backend.operations if op[0]=='place_live'])
+
+    def test_the_ui_beat_never_waits_for_an_application(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        controller._interaction_minimums.clear()
+        asked=[];backend.min_size=lambda h:asked.append(h) or (1,1)
+        controller._driving=True
+        try:
+            controller._gesture_minimums(controller.profile('d1',0),controller._profile_rects(controller.profile('d1',0)))
+        finally:
+            controller._driving=False
+        self.assertEqual(asked,[])
+
+    def test_a_gesture_never_ended_is_ended_after_two_minutes(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        controller._handle_event({'type':'move_start','hwnd':1})
+        controller._end_stale_gestures()
+        self.assertIn(1,controller._interacting)
+        controller._interaction_started[1]-=121
+        # Still held: a long resize goes on.
+        backend.mouse_pressed=True
+        controller._end_stale_gestures()
+        self.assertIn(1,controller._interacting)
+        backend.mouse_pressed=False
+        controller._end_stale_gestures()
+        self.assertFalse(controller._interacting)
 
     def make(self, windows=(), apps=()):
         backend = FakeBackend(self.displays, windows, apps)

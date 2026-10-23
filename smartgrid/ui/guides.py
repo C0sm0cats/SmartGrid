@@ -5,6 +5,9 @@ from PySide6.QtWidgets import QWidget
 
 FLAGS = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
          Qt.WindowType.WindowDoesNotAcceptFocus)
+# Images and covers of a linked resize: above the held window (the top of the
+# ordinary windows, where it is while held), below always-on-top windows.
+GESTURE_FLAGS = FLAGS & ~Qt.WindowType.WindowStaysOnTopHint
 SURFACE = QColor(24, 30, 37, 237)
 
 
@@ -263,7 +266,7 @@ class LiveImage(QWidget):
         super().__init__()
         # Opaque and not click-through: Windows does not draw a thumbnail in a
         # layered window.
-        self.setWindowFlags(FLAGS)
+        self.setWindowFlags(GESTURE_FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_PaintOnScreen)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
@@ -298,6 +301,7 @@ class LiveImage(QWidget):
         if not self.isVisible():
             self.setGeometry(logical)
             self.show()
+            raise_above(self.api, self)
         return True
 
     def prepare(self, source):
@@ -351,7 +355,7 @@ class TileCover(QWidget):
     size. Opaque, painted by Qt; moved natively with the images."""
     def __init__(self):
         super().__init__()
-        self.setWindowFlags(FLAGS | Qt.WindowType.WindowTransparentForInput)
+        self.setWindowFlags(GESTURE_FLAGS | Qt.WindowType.WindowTransparentForInput)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
@@ -368,19 +372,28 @@ def place_images(api, placements):
     physical Rect)]."""
     if not placements:
         return
-    # SWP_NOZORDER|SWP_NOACTIVATE|SWP_NOREDRAW|SWP_NOCOPYBITS: Windows draws
-    # the thumbnail; there is nothing of our own to repaint or copy.
-    flags = 0x0004 | 0x0010 | 0x0008 | 0x0100
+    # SWP_NOZORDER|SWP_NOACTIVATE, and for images SWP_NOREDRAW|SWP_NOCOPYBITS:
+    # Windows draws the thumbnail, there is nothing of our own to repaint or
+    # copy. A cover is painted by Qt: what it gains when it grows is painted.
+    def flags(widget):
+        return 0x0004 | 0x0010 | (0x0008 | 0x0100 if isinstance(widget, LiveImage) else 0)
     batch = api.BeginDeferWindowPos(len(placements))
     for image, rect in placements:
         if not batch:
             break
-        batch = api.DeferWindowPos(batch, int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags)
+        batch = api.DeferWindowPos(batch, int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags(image))
     if batch and api.EndDeferWindowPos(batch):
         return
     # A failed batch moves nothing: one by one instead.
     for image, rect in placements:
-        api.SetWindowPos(int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags)
+        api.SetWindowPos(int(image.winId()), None, rect.x, rect.y, rect.width, rect.height, flags(image))
+
+
+def raise_above(api, widget):
+    """A newly shown image or cover at the top of the ordinary windows, where
+    the held window is: above it and its neighbours, below always-on-top
+    windows. SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE, HWND_TOP."""
+    api.SetWindowPos(int(widget.winId()), None, 0, 0, 0, 0, 0x0002 | 0x0001 | 0x0010)
 
 
 class SourceGuide(Overlay):

@@ -12,7 +12,7 @@ from .preferences import Preferences
 from .theme import apply_theme
 from .focus_frame import FocusFrame
 from .window_actions import WindowActions
-from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,WindowGhost,SourceGuide,LiveImage,TileCover,place_images
+from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,WindowGhost,SourceGuide,LiveImage,TileCover,place_images,raise_above
 from .tile_view import application_icon
 from smartgrid.core.geometry import effective_layout,preset_name
 
@@ -307,7 +307,9 @@ class DesktopUI:
         if sample and sample[0]==display_id and screen is not None:
             try:
                 centre=self._logical(display_id,Rect(sample[1].x+sample[1].width//2-2,sample[1].y+sample[1].height//2-2,4,4),mapping)
-                image=screen.grabWindow(0,centre.x(),centre.y(),centre.width(),centre.height()).toImage()
+                # Relative to the screen grabbed, not to the desktop.
+                origin=screen.geometry().topLeft()
+                image=screen.grabWindow(0,centre.x()-origin.x(),centre.y()-origin.y(),max(1,centre.width()),max(1,centre.height())).toImage()
                 if not image.isNull() and image.width()>0 and image.height()>0:
                     pixels=[image.pixelColor(x,y) for x in range(image.width()) for y in range(image.height())]
                     color=QColor(sum(p.red() for p in pixels)//len(pixels),sum(p.green() for p in pixels)//len(pixels),
@@ -428,7 +430,10 @@ class DesktopUI:
         covers=[] if fake else list(controller.preview_covers)
         outlines,images,placements,mappings=[],{},[],{}
         over=controller._preview_hwnd is None
-        if over:
+        if over and not previews and not covers:
+            # Kept while the release lands its windows: read again then, the
+            # colour would come from where windows now are, and each image
+            # dropped would grab the screen.
             self._image_frames.clear();self._cover_colors.clear()
         for display_id,rect,hwnd in previews:
             if display_id not in mappings:
@@ -461,7 +466,7 @@ class DesktopUI:
             if cover.color!=color:
                 cover.color=color;cover.update()
             if not cover.isVisible():
-                cover.setGeometry(target);cover.show()
+                cover.setGeometry(target);cover.show();raise_above(controller.backend.api,cover)
             if cover.placed!=rect:
                 placements.append((cover,rect))
         for cover in self.resize_covers[len(covers):]:
@@ -476,7 +481,9 @@ class DesktopUI:
         # real windows were placed in their tiles. Those made ready for it
         # (prepare_images) wait for their first frame meanwhile.
         for hwnd,image in self.resize_images.items():
-            if over:
+            if over or image.isVisible():
+                # Shown, then no longer previewed (its window closed or
+                # minimized during the gesture): not left frozen there.
                 image.release();image.deleteLater()
             else:
                 images[hwnd]=image
@@ -511,7 +518,15 @@ class DesktopUI:
                 self.drive_stats={'started':time.perf_counter(),'last':None,'frames':0,'beats':0,'compute':0.0,'compute_max':0.0,
                                   'draw':0.0,'draw_max':0.0,'gap_max':0.0,'logged':time.perf_counter()}
                 self.drive_timer.start()
+                self._drive_error=None
                 self._prepare_images(self.controller._preview_hwnd)
+                # Pinned-tile cards are hidden during a drag; the colour of
+                # the covers is read now, before anything moves.
+                self.refresh_cards()
+                gap=self.controller.preview_gap
+                if gap:
+                    self.focus_frame.hide()
+                    self._cover_color(gap[0],self._mapping(gap[0]))
             if self.controller._preview_hwnd is None and not self.controller._interacting and not self.focus_frame.isVisible():
                 # The gesture is over and its windows placed: the outline at
                 # once, from two readings that agree, not after the timer.
@@ -528,13 +543,22 @@ class DesktopUI:
         window=next((w for w in controller.windows if w.ref.hwnd==hwnd),None)
         if not window:
             return
-        profile=controller.profile(window.display_id,controller.active_spaces.get(window.display_id,0))
-        for assignment in list(profile.assignments):
+        # Read only: a profile is never created from this thread.
+        profile=controller.profiles.get((window.display_id,controller.active_spaces.get(window.display_id,0)))
+        for assignment in list(profile.assignments if profile else ()):
             other=assignment.window_id if assignment else None
             if not other or other==hwnd or other in self.resize_images:
                 continue
             frame=getattr(controller.backend,'visible_frame',lambda h: None)(other)
             image=LiveImage(controller.backend.api) if frame else None
+            if image:
+                # Created where it will be shown, on that display and at its
+                # DPI: shown later on another, Windows would rescale it after
+                # it is placed.
+                neighbour=next((w for w in controller.windows if w.ref.hwnd==other),None)
+                where=self._logical(window.display_id,neighbour.rect) if neighbour else None
+                if where is not None:
+                    image.setGeometry(where)
             if image and image.prepare(other):
                 self._image_frames[other]=frame;self.resize_images[other]=image
             elif image:
@@ -547,6 +571,7 @@ class DesktopUI:
         stats=self.drive_stats
         if controller._preview_hwnd is None:
             self.drive_timer.stop()
+            self.refresh_cards()
             if stats and stats['frames']:
                 log.info('Gesture frames: %d in %.1f s (%d beats), compute %.2f ms (max %.2f), draw %.2f ms (max %.2f), longest gap between frames %.1f ms',
                          stats['frames'],time.perf_counter()-stats['started'],stats['beats'],
@@ -562,7 +587,12 @@ class DesktopUI:
                 self._refresh_resize_frames()
                 self.refresh_guides()
         except Exception:
-            log.exception('Gesture preview could not be drawn')
+            # Once per message and gesture, not on every 4 ms beat.
+            import traceback
+            text=traceback.format_exc()
+            if text!=getattr(self,'_drive_error',None):
+                self._drive_error=text
+                log.error('Gesture preview could not be drawn:\n%s',text)
             return
         if not stats:
             return
