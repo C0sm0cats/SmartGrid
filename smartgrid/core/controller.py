@@ -434,7 +434,11 @@ class Controller:
             layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or bool((closed|replaced) & assigned) or any(self._eligible(live[h]) for h in created|replaced)
             # Hidden, shown, cloaked or excluded by a new title: the window
             # leaves or joins the grid without being closed or created.
-            layout_changed |= any(self._eligible(previous[h]) != self._eligible(live[h]) for h in previous.keys() & live.keys())
+            flipped = sorted(h for h in previous.keys() & live.keys() if self._eligible(previous[h]) != self._eligible(live[h]))
+            layout_changed |= bool(flipped)
+            if flipped:
+                states.update({h: ('eligible' if self._eligible(previous[h]) else live[h].exclusion_reason or 'excluded',
+                                   'eligible' if self._eligible(live[h]) else live[h].exclusion_reason or 'excluded') for h in flipped})
             for hwnd, window in live.items():
                 old = previous.get(hwnd)
                 if old and window.state != old.state:
@@ -465,6 +469,11 @@ class Controller:
                 log.info('Automatic arrangement: closed %s, created %s, replaced %s, states %s',
                          sorted(closed), sorted(created), sorted(replaced), states)
                 self._reflow_all(include_new=True, compact=bool(closed and self.settings.compact_close))
+            elif auto and layout_changed:
+                # Said in the log: windows that changed and were not arranged.
+                log.info('No automatic arrangement (closed %s, created %s): %s', sorted(closed), sorted(created),
+                         'not running' if not self.running else 'paused' if self.paused else
+                         f'window {sorted(self._interacting)} held' if self._interacting else 'swap mode')
             self._update_border()
             if changed or previous!=live or previous_profiles!=self.profiles or previous_error!=self.last_error:
                 self._notify()
@@ -780,6 +789,7 @@ class Controller:
                 # A size change made by SmartGrid itself during the gesture (an
                 # arrangement running meanwhile) is not a user resize or drop.
                 if self._placed_at.get(hwnd,0)>=self._interaction_started.pop(hwnd,time.monotonic()):
+                    log.info('Gesture on %s ignored: SmartGrid placed it meanwhile', hwnd)
                     original=None
                 # Whatever the arrangement does (or fails to do), the live
                 # images go.
@@ -794,6 +804,10 @@ class Controller:
                     window = self._window(hwnd)
                     if original and window:
                         log.info("Gesture %s on %s ended: %s -> %s", gesture or "unknown", hwnd, original[0], window.rect)
+                    if original and window and not (self.running and not self.paused and original[1] in {d.id for d in self.displays} and window.state == "normal"):
+                        log.info('Gesture on %s: no drop or resize (%s)', hwnd,
+                                 'not running' if not self.running else 'paused' if self.paused else
+                                 f'window {window.state}' if window.state != 'normal' else 'its display is gone')
                     if self.running and not self.paused and original and original[1] in {d.id for d in self.displays} and window and window.state == "normal":
                         before, display_id = original
                         after = self._released_rect(window.rect, before) if self.preview_rectangles else window.rect
@@ -855,6 +869,10 @@ class Controller:
             # release.
             if self._interacting and kind not in ("foreground", "display_change"):
                 if kind in ("created", "destroyed", "shown", "hidden", "minimized", "restored"):
+                    if not self._gesture_lifecycle:
+                        held = sorted(self._interacting)
+                        log.info('Window changes kept for the release of %s (held %.1f s)', held,
+                                 time.monotonic() - min(self._interaction_started.get(h, time.monotonic()) for h in held))
                     self._gesture_lifecycle = True
                 return
             if time.monotonic() < self._suppress_events_until and kind not in ("foreground", "destroyed", "display_change"):
@@ -1068,6 +1086,8 @@ class Controller:
         blockers=[w for w in self.windows if w.display_id==profile.display_id and
                   (w.state=="fullscreen" or (not explicit and self._eligible(w) and (w.state=="maximized" or maximized(w.ref.hwnd))))]
         if not hide_surplus and blockers:
+            log.info('Arrangement of %s skipped: %s', profile.display_id,
+                     ', '.join(f'{w.ref.hwnd} ({w.app_id}) {"fullscreen" if w.state == "fullscreen" else "maximized"}' for w in blockers))
             if explicit:
                 result.failures={w.ref.hwnd:"A fullscreen window occupies this display. Leave fullscreen before arranging." for w in blockers}
             self.last_result=result

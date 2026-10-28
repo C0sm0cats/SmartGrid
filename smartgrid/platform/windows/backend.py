@@ -338,7 +338,11 @@ class WindowsBackend:
                 monitor = self.api.MonitorFromWindow(hwnd, 2)
                 state = 'minimized' if self.api.IsIconic(hwnd) else ('maximized' if self.api.IsZoomed(hwnd) else 'normal')
                 area = self._monitor_areas.get(monitor)
-                if state == 'normal' and area and not style & 0x00c00000 and self._close_rect(rect, area):
+                # A visible application window covering the monitor. A cloaked
+                # shell host of that size (the touch keyboard, emoji panel and
+                # clipboard history: MicrosoftWindows.Client.CBS InputApp) is
+                # not one: taken for fullscreen, it froze its display.
+                if state == 'normal' and allowed and area and not style & 0x00c00000 and self._close_rect(rect, area):
                     state = 'fullscreen'
                     allowed, reason = False, 'Fullscreen; preserved until explicitly restored'
                 desktop=self.desktop_id
@@ -456,15 +460,21 @@ class WindowsBackend:
         application that is not DPI aware (or aware of the system DPI only)
         on a scaled display, whose sizes Windows does not convert in a
         message sent to it."""
-        context = self.api.GetWindowDpiAwarenessContext(hwnd) if self.api.GetWindowDpiAwarenessContext else None
-        own = self.api.GetDpiFromDpiAwarenessContext(context) if context and self.api.GetDpiFromDpiAwarenessContext else 0
-        if not own:
-            return 1.0  # per-monitor aware, or unknown
-        x, y = UINT(), UINT()
-        monitor = self.api.MonitorFromWindow(hwnd, 2)
-        if not monitor or self.api.GetDpiForMonitor(monitor, 0, C.byref(x), C.byref(y)) != 0 or not x.value:
+        try:
+            context = self.api.GetWindowDpiAwarenessContext(hwnd) if self.api.GetWindowDpiAwarenessContext else None
+            own = self.api.GetDpiFromDpiAwarenessContext(context) if context and self.api.GetDpiFromDpiAwarenessContext else 0
+            if not own:
+                return 1.0  # per-monitor aware, or unknown
+            x, y = UINT(), UINT()
+            monitor = self.api.MonitorFromWindow(hwnd, 2)
+            if not monitor or self.api.GetDpiForMonitor(monitor, 0, C.byref(x), C.byref(y)) != 0 or not x.value:
+                return 1.0
+            # Within what display scaling allows (100 % to 500 %).
+            return min(5.0, max(1.0, x.value / own))
+        except Exception:
+            # A minimum size is never worth a failed arrangement.
+            log.exception('DPI scale of %s could not be read', hwnd)
             return 1.0
-        return x.value / own
 
     @staticmethod
     def _close_rect(actual, expected, tolerance=2):
