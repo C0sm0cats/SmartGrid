@@ -120,6 +120,9 @@ def apply_theme(settings,target=None):
             background: {t['canvas']}; border: 1px solid {t['line']}; border-radius: 8px; padding: 5px; }}
         QComboBox:editable {{ background: {t['canvas']}; padding: 5px 26px 5px 5px; }}
         QComboBox:editable QLineEdit {{ background: transparent; border: none; padding: 0; }}
+        QAbstractSpinBox {{ padding: 0 6px; }}
+        QAbstractSpinBox QLineEdit {{ background: transparent; border: none; padding: 0; margin: 0; }}
+        QLabel[stepper_value=true] {{ background: {t['canvas']}; color: {t['text']}; border: 1px solid {t['line']}; border-radius: 8px; }}
         QScrollArea {{ border: none; background: {t['bg']}; }}
         QScrollArea > QWidget > QWidget {{ background: {t['bg']}; }}
         QGroupBox {{ border: 1px solid {t['line']}; border-radius: 10px; margin-top: 14px; padding-top: 12px; }}

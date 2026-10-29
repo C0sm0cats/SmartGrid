@@ -253,21 +253,30 @@ class Preferences(QDialog):
 
     @staticmethod
     def _stepper(spin):
-        """The value followed by large − and + buttons."""
-        spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
-        spin.setAlignment(Qt.AlignmentFlag.AlignCenter);spin.setFixedWidth(72)
+        """The value followed by large − and + buttons. The value is shown in
+        a label: the Windows 11 style draws no text in a styled spin box (a
+        grey box). The spin box keeps the value, its range and its changes."""
         box=QWidget();layout=QHBoxLayout(box);layout.setContentsMargins(0,1,0,1);layout.setSpacing(4)
-        box.setMinimumHeight(36);spin.setFixedHeight(32)
-        layout.addWidget(spin)
+        box.setMinimumHeight(36)
+        layout.addWidget(spin);spin.hide()
+        value=QLabel();value.setProperty('stepper_value',True)
+        value.setAlignment(Qt.AlignmentFlag.AlignCenter);value.setFixedSize(72,32)
+        value.setAccessibleName(spin.accessibleName() or 'Value')
+        layout.addWidget(value)
         for text,step,tip in (('−',-1,'Decrease'),('+',1,'Increase')):
             button=QPushButton(text);button.setFixedSize(34,32);button.setToolTip(tip);button.setAccessibleName(tip)
             button.setAutoRepeat(True);button.setAutoRepeatDelay(400);button.setAutoRepeatInterval(60)
             button.clicked.connect(lambda checked=False,s=step:spin.stepBy(s))
             layout.addWidget(button)
         def refresh(*args):
+            value.setText(f'{spin.prefix()}{spin.textFromValue(spin.value())}{spin.suffix()}')
             buttons=box.findChildren(QPushButton)
             buttons[0].setEnabled(spin.value()>spin.minimum());buttons[1].setEnabled(spin.value()<spin.maximum())
         spin.valueChanged.connect(refresh);refresh()
+        # The mouse wheel over the value steps it too.
+        def wheel(event):
+            spin.stepBy(1 if event.angleDelta().y()>0 else -1 if event.angleDelta().y()<0 else 0)
+        value.wheelEvent=wheel
         return box
 
     def _spin(self,form,key,title,lower,upper,percent=False,subtitle=''):
