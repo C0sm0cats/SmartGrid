@@ -1029,18 +1029,7 @@ class Controller:
             for hwnd, (reference, state) in self._originals.items():
                 window = self._window(hwnd)
                 if window and window.ref == reference and self.backend.alive(hwnd):
-                    # A window the user minimized stays minimized: its size and
-                    # styles come back, not the window itself (it reappeared and
-                    # was tiled at the next start). Parked windows do come back.
-                    if window.exclusion_reason == "Not visible":
-                        # Hidden by the application itself (closed to the
-                        # notification area): shown again, it stayed blank and
-                        # took an empty tile at the next start.
-                        state = minimized_snapshot(state, hidden=True)
-                    elif (window.state == "minimized" and hwnd not in self._parked
-                            and hwnd not in self._hidden_by_template):
-                        state = minimized_snapshot(state)
-                    if not self.backend.restore(hwnd, state):
+                    if not self.backend.restore(hwnd, self._original_kept_out_of_sight(window, state)):
                         failures.append(hwnd)
             self._originals = {hwnd: value for hwnd, value in self._originals.items() if hwnd in failures}
             self._parked.clear()
@@ -1054,6 +1043,19 @@ class Controller:
             self._save()
             self._notify()
             return not failures
+
+    def _original_kept_out_of_sight(self, window, snapshot):
+        """The state from before tiling, for a window given back to the user.
+        A window the user minimized, or its application hid (closed to the
+        notification area), gets its size and styles back but stays out of
+        sight: shown again, a hidden one stayed blank and took an empty tile
+        at the next start. Windows SmartGrid parked or hid do come back."""
+        hwnd = window.ref.hwnd
+        if window.exclusion_reason == "Not visible":
+            return minimized_snapshot(snapshot, hidden=True)
+        if window.state == "minimized" and hwnd not in self._parked and hwnd not in self._hidden_by_template:
+            return minimized_snapshot(snapshot)
+        return snapshot
 
     def quit(self):
         if self._closed:
@@ -2507,7 +2509,7 @@ class Controller:
             for window in self.windows:
                 if window.app_id in newly_excluded:
                     saved=self._originals.get(window.ref.hwnd)
-                    if saved and saved[0]==window.ref and not self.backend.restore(window.ref.hwnd,saved[1]):
+                    if saved and saved[0]==window.ref and not self.backend.restore(window.ref.hwnd,self._original_kept_out_of_sight(window,saved[1])):
                         restore_failures.append(window.ref.hwnd)
             if settings.master_ratio!=self.settings.master_ratio:
                 for profile in self.profiles.values():

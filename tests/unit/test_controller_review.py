@@ -79,6 +79,14 @@ class ControllerReviewTests(unittest.TestCase):
         controller.stop()
         self.assertEqual(backend.windows[3].state,'hidden')
 
+    def test_always_floating_keeps_a_minimized_window_minimized(self):
+        controller,backend=self.make([record(1),record(2),record(3,'deskflow')])
+        controller.start()
+        backend.minimize(3);controller.refresh()
+        settings=deepcopy(controller.settings);settings.excluded_apps=['deskflow']
+        controller.update_settings(settings)
+        self.assertEqual(backend.windows[3].state,'minimized')
+
     def test_one_off_error_expires(self):
         controller,backend=self.make([record(1)])
         controller.last_error='Windows refused the window action.'
