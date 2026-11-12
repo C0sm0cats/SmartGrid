@@ -295,6 +295,7 @@ class Studio(QMainWindow):
         self.message=QLabel()
         self.message.setWordWrap(True)
         self.message.hide()
+        self._controller_error=''
         layout.addWidget(self.message)
         self.name_row=QWidget();name_layout=QHBoxLayout(self.name_row);name_layout.setContentsMargins(0,0,0,0)
         self.name_entry=QLineEdit();self.name_entry.setPlaceholderText('Layout name')
@@ -576,9 +577,7 @@ class Studio(QMainWindow):
             self.apply_button.setEnabled(not self.bridge.pending)
             if self.overview.isVisible():
                 self._fill_overview()
-            error=getattr(self.controller,'last_error','')
-            if error:
-                self.show_error(str(error))
+            self._mirror_controller_error()
         except Exception as exc:
             self.show_error(str(exc))
         finally:
@@ -1259,6 +1258,15 @@ class Studio(QMainWindow):
         from .preferences import Preferences
         self._preferences_window=Preferences(self.controller,self)
         self._preferences_window.show()
+
+    def _mirror_controller_error(self):
+        """The controller's error, shown once when it appears and taken down
+        when the controller drops it (expired, or its condition resolved)."""
+        error=str(getattr(self.controller,'last_error','') or '')
+        previous,self._controller_error=self._controller_error,error
+        if error==previous: return
+        if error: self.show_error(error)
+        elif previous and self.message.text()==previous: self.message.hide()
 
     def show_error(self,text):
         self.message.setProperty('error',True)

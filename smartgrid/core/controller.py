@@ -58,7 +58,9 @@ class Controller:
         self.history = History(10)
         self.running = False
         self.paused = False
-        self.last_error = ""
+        self._last_error = ""
+        self._last_error_at = 0.0
+        self._condition_errors = {}
         self.status = "Paused — the desktop is unchanged."
         self.last_result = ApplyResult()
         self.hotkey_conflicts = {}
@@ -248,6 +250,34 @@ class Controller:
         the windows: pinned-tile cards appear at once."""
         self._layout_callbacks.append(callback)
 
+    # A one-off error stays this long; a condition error (set through
+    # _condition_error) stays until its condition is resolved.
+    ERROR_LIFETIME = 15.0
+
+    @property
+    def last_error(self):
+        return self._last_error
+
+    @last_error.setter
+    def last_error(self, message):
+        self._last_error = message or ""
+        self._last_error_at = time.monotonic()
+
+    def _condition_error(self, source, message):
+        self._condition_errors[source] = message
+        if self._last_error != message:
+            self.last_error = message
+
+    def _resolve_error(self, source):
+        message = self._condition_errors.pop(source, None)
+        if message is not None and self._last_error == message:
+            self.last_error = ""
+
+    def _expire_error(self):
+        if (self._last_error and self._last_error not in self._condition_errors.values()
+                and time.monotonic() - self._last_error_at > self.ERROR_LIFETIME):
+            self.last_error = ""
+
     def set_ui_action_handler(self, callback):
         self._ui_action = callback
 
@@ -371,6 +401,7 @@ class Controller:
             previous = {w.ref.hwnd: w for w in self.windows}
             previous_profiles=deepcopy(self.profiles)
             previous_error=self.last_error
+            self._expire_error()
             old_displays = {d.id: (d.work_area, d.dpi) for d in self.displays}
             self.displays = self.backend.discover_displays()
             desktop=getattr(self.backend,'desktop_id',None)
@@ -1225,8 +1256,9 @@ class Controller:
 
     def _reflow_all(self, include_new=False, compact=False, explicit=False):
         if not getattr(self.backend,'desktop_known',True):
-            self.last_error='Cannot identify the current Windows desktop; arrangement is suspended.'
+            self._condition_error('desktop','Cannot identify the current Windows desktop; arrangement is suspended.')
             return
+        self._resolve_error('desktop')
         combined = ApplyResult()
         for display in self.displays:
             space = self.active_spaces.get(display.id, 0)
@@ -1589,9 +1621,11 @@ class Controller:
             if context is None or key[:2]==context:
                 self._cancelled_launches.append(dict(pending))
                 self._pending.pop(key,None)
+        self._warn_slow_launches()
 
     def _bind_pending(self):
-        if not self.running or not getattr(self.backend,'desktop_known',True): return
+        if not self.running or not getattr(self.backend,'desktop_known',True):
+            self._warn_slow_launches();return
         used = {a.window_id for p in self.profiles.values() for a in p.assignments if a and a.window_id}
         now=time.monotonic()
         self._cancelled_launches=[p for p in self._cancelled_launches if now-p["created"]<=120]
@@ -1605,9 +1639,8 @@ class Controller:
         for key, pending in list(self._pending.items()):
             display_id, space, index = key
             if display_id not in {d.id for d in self.displays}: continue
-            if time.monotonic()-pending["created"] > 120 and not pending.get('warned'):
+            if time.monotonic()-pending["created"] > 120:
                 pending['warned']=True
-                self.last_error = "The application has not opened a window yet. Its destination remains reserved."
             profile = self.profile(display_id, space)
             if index >= len(profile.assignments):
                 self._pending.pop(key, None)
@@ -1628,6 +1661,23 @@ class Controller:
             elif self.running and not self.paused and self.active_spaces.get(display_id, 0) != space and self.backend.minimize(window.ref.hwnd):
                 self._parked.add(window.ref.hwnd)
             self._save()
+        self._warn_slow_launches()
+
+    def _warn_slow_launches(self):
+        """Names each application launched over 120 s ago that still has no
+        window, with the tile kept for it; cleared once none is left."""
+        displays=[d.id for d in self.displays]
+        waiting=[]
+        for (display_id,space,index),pending in sorted(self._pending.items()):
+            if not pending.get('warned') or display_id not in displays: continue
+            name=next((a.name for a in self.apps if a.id==pending['app_id']),None) or app_display_name(pending['app_id'])
+            waiting.append(f'{name} (Display {displays.index(display_id)+1} · Space {space+1} · tile {index+1})')
+        if waiting:
+            self._condition_error('slow_launch',
+                f"No window yet from {', '.join(waiting)}; "+('its tile stays' if len(waiting)==1 else 'their tiles stay')+
+                ' reserved until it opens. Remove the application from the tile to release it.')
+        else:
+            self._resolve_error('slow_launch')
 
     def focus_direction(self, direction):
         with self._lock:

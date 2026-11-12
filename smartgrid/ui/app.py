@@ -242,8 +242,9 @@ class DesktopUI:
         self.redo_action.setEnabled(controller.running and controller.history.can_redo)
         self.arrange_action.setEnabled(controller.running)
         self.stop_action.setEnabled(controller.running)
-        if controller.last_error and controller.last_error != self.last_error:
-            self.error(controller.last_error)
+        if controller.last_error != self.last_error:
+            if controller.last_error: self.error(controller.last_error)
+            else: self.last_error = ''
         self.refresh_cards()
 
     def refresh_cards(self):

@@ -317,6 +317,18 @@ class UITests(unittest.TestCase):
         self.assertTrue(messages)
         self.assertIn('Partially',messages[0])
 
+    def test_controller_error_is_shown_once_and_taken_down_when_dropped(self):
+        studio=Studio(self.controller); self.widgets.append(studio)
+        shown=[];original=studio.show_error
+        studio.show_error=lambda text:(shown.append(text),original(text))
+        self.controller.last_error='Windows refused the window action.'
+        studio.refresh_from_controller();studio.refresh_from_controller()
+        self.assertEqual(shown,['Windows refused the window action.'])
+        self.assertFalse(studio.message.isHidden())
+        self.controller.last_error=''
+        studio.refresh_from_controller()
+        self.assertTrue(studio.message.isHidden())
+
     def test_library_skips_hidden_helper_windows_and_preserves_unchanged_items(self):
         from smartgrid.core.models import WindowRecord,WindowRef,Rect
         for hwnd in range(100,1100):

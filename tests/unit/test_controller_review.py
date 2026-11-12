@@ -42,6 +42,31 @@ class ControllerReviewTests(unittest.TestCase):
         arrived=backend.add_window('slow');controller.refresh()
         self.assertEqual(controller.profile('d1',0).assignments[0].window_id,arrived.ref.hwnd)
 
+    def test_slow_launch_warning_names_the_application_and_clears_when_it_arrives(self):
+        controller,backend=self.pending_template('d2')
+        controller.refresh();self.assertEqual(controller.last_error,'')
+        for pending in controller._pending.values(): pending['created']-=121
+        controller.refresh()
+        self.assertIn('Slow app (Display 2 · Space 1 · tile 1)',controller.last_error)
+        controller._last_error_at-=controller.ERROR_LIFETIME+1
+        controller.refresh();self.assertIn('Slow app',controller.last_error)
+        backend.add_window('slow');controller.refresh()
+        self.assertEqual(controller.last_error,'')
+
+    def test_slow_launch_warning_clears_when_its_tile_is_released(self):
+        controller,backend=self.pending_template()
+        for pending in controller._pending.values(): pending['created']-=121
+        controller.refresh();self.assertIn('Slow app',controller.last_error)
+        controller._cancel_pending()
+        self.assertEqual(controller.last_error,'')
+
+    def test_one_off_error_expires(self):
+        controller,backend=self.make([record(1)])
+        controller.last_error='Windows refused the window action.'
+        controller.refresh();self.assertTrue(controller.last_error)
+        controller._last_error_at-=controller.ERROR_LIFETIME+1
+        controller.refresh();self.assertEqual(controller.last_error,'')
+
     def test_desktop_namespaces_preserve_groups_and_unknown_desktop_stops_movement(self):
         from dataclasses import replace
         controller,backend=self.make([record(1)])
