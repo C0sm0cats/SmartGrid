@@ -7,6 +7,8 @@ from typing import Any, Mapping, TypeVar
 import math
 import re
 
+from .window_actions import ACTION_POSITIONS, REMOTE_VIEWERS, default_colors, default_positions
+
 
 class Serializable:
     def to_dict(self) -> dict[str, Any]:
@@ -170,10 +172,42 @@ class Settings(Serializable):
     overlay_words_removed: list[str] = field(default_factory=list)
     # Applications added to the overlay list (app IDs).
     overlay_apps_added: list[str] = field(default_factory=list)
+    # Window action handle per application (app ID or executable name):
+    # left/right/top/bottom, and #rrggbb. Unlisted: left, default style.
+    action_positions: dict[str, str] = field(default_factory=default_positions)
+    action_colors: dict[str, str] = field(default_factory=default_colors)
+    # Shipped handle defaults this file has already received: a default added
+    # by a later version reaches existing settings once; one the user removed
+    # stays removed.
+    action_defaults: list[str] = field(default_factory=lambda: list(REMOTE_VIEWERS))
+
+    @classmethod
+    def from_dict(cls, data):
+        if isinstance(data, Mapping) and 'action_defaults' not in data and 'action_positions' in data:
+            # Written before defaults were tracked: it received those it lists.
+            saved = [*(data.get('action_positions') or {}), *(data.get('action_colors') or {})]
+            data = {**data, 'action_defaults': sorted({k for k in saved if isinstance(k, str) and ':' not in k})}
+        settings = model_from_dict(cls, data)
+        if isinstance(settings.action_defaults, list):
+            seen = {k.casefold() for k in settings.action_defaults if isinstance(k, str)}
+            for name in REMOTE_VIEWERS:
+                if name.casefold() in seen: continue
+                settings.action_positions = {**default_positions_for(name), **settings.action_positions}
+                settings.action_colors = {**default_colors_for(name), **settings.action_colors}
+                settings.action_defaults = [*settings.action_defaults, name]
+        return settings
 
     def visual_duration(self, base=140):
         duration={'fast':90,'normal':140,'slow':220}.get(self.animation_speed,self.animation_duration)
         return round(base*duration/140) if self.animations else 0
+
+
+def default_positions_for(name):
+    return {name: default_positions()[name]}
+
+
+def default_colors_for(name):
+    return {name: default_colors()[name]}
 
 
 def app_display_name(app_id: str) -> str:
@@ -352,7 +386,7 @@ def _validate_model(value):
             raise ValueError('Margins require top, right, bottom and left')
         if any(type(v) is not int or not 0 <= v <= 10000 for v in value.margins.values()):
             raise ValueError('Margins must contain nonnegative integer distances')
-        for name in ('excluded_apps', 'included_apps', 'overlay_apps_added'):
+        for name in ('excluded_apps', 'included_apps', 'overlay_apps_added', 'action_defaults'):
             items = getattr(value, name)
             if not isinstance(items, list) or any(not isinstance(v, str) or not v.strip() or len(v) > 1024 for v in items):
                 raise ValueError(f'{name} must be a list of nonempty app identities')
@@ -360,6 +394,12 @@ def _validate_model(value):
             items = getattr(value, name)
             if not isinstance(items, list) or any(not isinstance(v, str) or not v.strip() or len(v) > 100 for v in items):
                 raise ValueError(f'{name} must be a list of nonempty words')
+        for name, valid in (('action_positions', lambda v: v in ACTION_POSITIONS),
+                            ('action_colors', lambda v: isinstance(v, str) and re.fullmatch(r'#[0-9a-fA-F]{6}', v))):
+            rules = getattr(value, name)
+            if not isinstance(rules, dict) or any(not isinstance(k, str) or not k.strip() or len(k) > 1024 or not valid(v)
+                                                  for k, v in rules.items()):
+                raise ValueError(f'{name} must map app identities to valid values')
         if not isinstance(value.hotkeys, dict) or any(not isinstance(k, str) or not k or not isinstance(v, str)
                                                     for k, v in value.hotkeys.items()):
             raise ValueError('Hotkeys must map action strings to shortcut strings')

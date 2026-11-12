@@ -1,12 +1,16 @@
 """Nonactivating focused-window palette with four actions.
 
-A 28×40 handle with a chevron sits on the focused window's left edge; hovering
-or clicking it reveals the 44×176 palette, which returns to the handle after
-1.6 s, or 350 ms after the pointer leaves it.
+A 28×40 handle with a chevron sits on an edge of the focused window (left
+unless its application chose another, see core.window_actions); hovering or
+clicking it reveals the 44×176 palette, which returns to the handle after
+1.6 s, or 350 ms after the pointer leaves it. On the top or bottom edge both
+are laid out horizontally.
 """
 from PySide6.QtCore import Qt, Signal, QTimer, QPropertyAnimation, QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QAbstractButton, QLabel
+from PySide6.QtWidgets import QWidget, QBoxLayout, QAbstractButton, QLabel
+
+from smartgrid.core.window_actions import horizontal, lighten, tooltip_placement
 
 FLAGS = (Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
          Qt.WindowType.WindowDoesNotAcceptFocus)
@@ -41,6 +45,12 @@ def _glyph(painter, kind, box, color):
         painter.drawLine(QPointF(x + s - 3, y + 3), QPointF(x + 3, y + s - 3))
     elif kind == 'next':         # go-next chevron, 12 px
         painter.drawPolyline([QPointF(x + s * .35, y + s * .2), QPointF(x + s * .7, y + s * .5), QPointF(x + s * .35, y + s * .8)])
+    elif kind == 'previous':
+        painter.drawPolyline([QPointF(x + s * .65, y + s * .2), QPointF(x + s * .3, y + s * .5), QPointF(x + s * .65, y + s * .8)])
+    elif kind == 'down':
+        painter.drawPolyline([QPointF(x + s * .2, y + s * .35), QPointF(x + s * .5, y + s * .7), QPointF(x + s * .8, y + s * .35)])
+    elif kind == 'up':
+        painter.drawPolyline([QPointF(x + s * .2, y + s * .65), QPointF(x + s * .5, y + s * .3), QPointF(x + s * .8, y + s * .65)])
 
 
 class ActionButton(QAbstractButton):
@@ -86,6 +96,13 @@ class ActionHandle(QAbstractButton):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(28, 40)
         self.setAccessibleName('Show window actions')
+        self.chevron, self.color = 'next', None
+
+    def set_style(self, position, color):
+        """Orientation for the edge it sits on, and an optional custom color."""
+        self.chevron = {'left': 'next', 'right': 'previous', 'top': 'down', 'bottom': 'up'}.get(position, 'next')
+        self.setFixedSize(*((40, 28) if horizontal(position) else (28, 40)))
+        self.color = color; self.update()
 
     def enterEvent(self, event):
         self.entered.emit(); self.update(); super().enterEvent(event)
@@ -97,10 +114,16 @@ class ActionHandle(QAbstractButton):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         hover = self.underMouse() or self.hasFocus()
-        painter.setPen(QPen(QColor('#b2d7ee' if hover else '#7893a3'), 1))
-        painter.setBrush(QColor('#344d60') if hover else SURFACE)
+        if self.color:
+            fill = QColor(self.color); fill.setAlphaF(.96)
+            painter.setPen(QPen(QColor(lighten(self.color, .65 if hover else .45)), 1))
+            painter.setBrush(fill.lighter(115) if hover else fill)
+        else:
+            painter.setPen(QPen(QColor('#b2d7ee' if hover else '#7893a3'), 1))
+            painter.setBrush(QColor('#344d60') if hover else SURFACE)
         painter.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 9, 9)
-        _glyph(painter, 'next', QRectF(8, 14, 12, 12), QColor('#ffffff' if hover else '#edf5f9'))
+        box = QRectF((self.width() - 12) / 2, (self.height() - 12) / 2, 12, 12)
+        _glyph(painter, self.chevron, box, QColor('#ffffff' if hover else '#edf5f9'))
 
 
 class WindowActions(QWidget):
@@ -112,7 +135,9 @@ class WindowActions(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setFixedSize(44, 176)
-        layout = QVBoxLayout(self); layout.setContentsMargins(4, 7, 4, 7); layout.setSpacing(3)
+        self.position, self.color = 'left', None
+        layout = self.box = QBoxLayout(QBoxLayout.Direction.TopToBottom, self)
+        layout.setContentsMargins(4, 7, 4, 7); layout.setSpacing(3)
         self.buttons = {}
         for key, label, danger in [('float', 'Float window', False), ('minimize', 'Minimize window', False),
                                    ('maximize', 'Maximize window', False), ('close', 'Close window', True)]:
@@ -141,6 +166,19 @@ class WindowActions(QWidget):
         max_button.tooltip = 'Restore window' if maximized else 'Maximize window'
         for button in (float_button, max_button):
             button.setAccessibleName(button.tooltip); button.update()
+
+    def set_style(self, position, color):
+        """Edge of the window the handle and palette sit on, and the handle
+        color (None: default style); the palette border follows it."""
+        if (position, color) == (self.position, self.color): return
+        self.position, self.color = position, color
+        if horizontal(position):
+            self.box.setDirection(QBoxLayout.Direction.LeftToRight); self.box.setContentsMargins(7, 4, 7, 4)
+            self.setFixedSize(176, 44)
+        else:
+            self.box.setDirection(QBoxLayout.Direction.TopToBottom); self.box.setContentsMargins(4, 7, 4, 7)
+            self.setFixedSize(44, 176)
+        self.handle.set_style(position, color); self.update()
 
     def set_accent(self, color):
         self.buttons['float'].accent = QColor(color)
@@ -174,12 +212,11 @@ class WindowActions(QWidget):
             self.tip.hide(); return
         self.hide_timer.stop()
         self.tip.setText(button.tooltip); self.tip.adjustSize()
-        origin = button.mapToGlobal(button.rect().topRight())
+        origin = button.mapToGlobal(button.rect().topLeft())
         screen = self.screen().availableGeometry() if self.screen() else None
-        x = origin.x() + 8
-        if screen and x + self.tip.width() > screen.right() - 6:
-            x = button.mapToGlobal(button.rect().topLeft()).x() - self.tip.width() - 8
-        self.tip.move(x, origin.y() + (button.height() - self.tip.height()) // 2)
+        area = (screen.x(), screen.y(), screen.width(), screen.height()) if screen else (-10**6, -10**6, 2 * 10**6, 2 * 10**6)
+        self.tip.move(*tooltip_placement(self.position, (origin.x(), origin.y(), button.width(), button.height()),
+                                         (self.tip.width(), self.tip.height()), area))
         self.tip.show()
 
     def enterEvent(self, event):
@@ -195,8 +232,8 @@ class WindowActions(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor('#7893a3'), 1)); painter.setBrush(SURFACE)
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 10, 10)
+        painter.setPen(QPen(QColor(self.color or '#7893a3'), 1.5 if self.color else 1)); painter.setBrush(SURFACE)
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(.75, .75, -.75, -.75), 10, 10)
 
     def closeEvent(self, event):
         self.handle.close(); self.tip.close(); super().closeEvent(event)

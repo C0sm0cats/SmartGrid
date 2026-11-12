@@ -12,6 +12,7 @@ from .preferences import Preferences
 from .theme import apply_theme
 from .focus_frame import FocusFrame
 from .window_actions import WindowActions
+from smartgrid.core.window_actions import action_style, placement
 from .guides import TargetGuide,SpaceOsd,PinPlaceholder,PlacementGhost,WindowGhost,SourceGuide,LiveImage,TileCover,place_images,raise_above
 from .tile_view import application_icon
 from smartgrid.core.geometry import effective_layout,preset_name
@@ -631,10 +632,9 @@ class DesktopUI:
 
     def _place_window_actions(self, rect, area):
         def position(size):
-            # windowActionPosition: 4 px inside the left edge, vertically centred, clamped.
-            x=min(max(rect.x()+4,area.x()+6),max(area.x()+6,area.right()-size.width()-6))
-            y=min(max(rect.y()+(rect.height()-size.height())//2,area.y()+8),max(area.y()+8,area.bottom()-size.height()-8))
-            return x,y
+            # 4 px inside the chosen edge, centred along it, kept on the screen.
+            return placement(self.window_actions.position,(rect.x(),rect.y(),rect.width(),rect.height()),
+                             (area.x(),area.y(),area.width(),area.height()),(size.width(),size.height()))
         self.window_actions.move(*position(self.window_actions.size()))
         self.window_actions.handle.move(*position(self.window_actions.handle.size()))
 
@@ -681,6 +681,7 @@ class DesktopUI:
                 self._handle_due=time.monotonic()+.14
             live=getattr(controller.backend,'window_rect',None)
             rect=self._logical(display.id,(live(selected.ref.hwnd) if live else None) or selected.rect)
+            self.window_actions.set_style(*action_style(selected.app_id,controller.settings))
             self._place_window_actions(rect,screen.availableGeometry())
             self.window_actions.set_state(selected.floating,selected.state=='maximized')
             self.window_actions.set_accent(controller.focus_color)

@@ -7,6 +7,8 @@ from PySide6.QtWidgets import (QDialog,QWidget,QVBoxLayout,QHBoxLayout,QFormLayo
     QTabWidget,QScrollArea,QComboBox,QSpinBox,QDoubleSpinBox,QCheckBox,QColorDialog,QKeySequenceEdit,
     QPlainTextEdit,QGroupBox,QFileDialog,QLineEdit,QTreeWidget,QTreeWidgetItem,QListWidget,QListWidgetItem,QApplication)
 from smartgrid.core.models import Settings,app_display_name
+from smartgrid.core.window_actions import (ACTION_POSITIONS,REMOTE_HANDLE_COLOR,matching_rules,rule_value,
+    set_rule,valid_color)
 from smartgrid.core.exclusions import TITLE_WORDS, excluded_app, normalize_word, overlay_words
 from smartgrid.core.controller import DEFAULT_HOTKEYS
 from .bridge import bridge_for
@@ -17,6 +19,8 @@ from smartgrid.core.geometry import preset_name,effective_layout
 from .widgets import Switch,SpacePreview,ShortcutEditor
 
 # Shortcut titles, in display order.
+HANDLE_POSITIONS={'left':'Left edge','right':'Right edge','top':'Top edge','bottom':'Bottom edge'}
+
 HOTKEY_LABELS={'toggle':'Toggle tiling','arrange':'Arrange again','studio':'Open Layout Studio',
     'quick_switcher':'Change layout','float':'Float focused window','swap':'Swap mode',
     'undo':'Undo','redo':'Redo','focus_left':'Focus window to the left',
@@ -149,9 +153,22 @@ class Preferences(QDialog):
         self.app_search=QLineEdit();self.app_search.setPlaceholderText('Search applications')
         self.app_search.setAccessibleName('Search applications');self.app_search.textChanged.connect(self.refresh_rules)
         rules.addRow(self.app_search)
-        self.rules=QTreeWidget();self.rules.setHeaderHidden(True);self.rules.setColumnCount(1)
+        self.positions=dict(self.settings.action_positions);self.colors=dict(self.settings.action_colors)
+        self.rules=QTreeWidget();self.rules.setHeaderHidden(True);self.rules.setColumnCount(2)
+        self.rules.header().setStretchLastSection(False)
+        self.rules.header().setSectionResizeMode(0,self.rules.header().ResizeMode.Stretch)
+        self.rules.header().setSectionResizeMode(1,self.rules.header().ResizeMode.Fixed);self.rules.header().resizeSection(1,160)
         self.rules.setMinimumHeight(300);self.rules.itemChanged.connect(self._rule_changed)
         rules.addRow(self.rules)
+        # Shown for 5 s after an application's rules are removed.
+        self.removed_bar=QWidget();bar=QHBoxLayout(self.removed_bar);bar.setContentsMargins(0,0,0,0)
+        self.removed_label=QLabel();self.removed_label.setWordWrap(True)
+        self.removed_undo=QPushButton('Undo');self.removed_undo.clicked.connect(self._undo_remove_rules)
+        bar.addWidget(self.removed_label,1);bar.addWidget(self.removed_undo)
+        self.removed_bar.hide();self._removed=None
+        self.removed_timer=QTimer(self);self.removed_timer.setSingleShot(True);self.removed_timer.setInterval(5000)
+        self.removed_timer.timeout.connect(self._forget_removed)
+        rules.addRow(self.removed_bar)
         note=QLabel('Windows that cannot shrink to their tile are handled by Force windows into their tiles, in Windows tools and advanced settings.')
         note.setWordWrap(True);note.setProperty('muted',True);rules.addRow(note)
         advanced=self._group(main,'Windows tools and advanced settings','Placement options for Windows.')
@@ -434,6 +451,7 @@ class Preferences(QDialog):
         settings.excluded_apps=list(dict.fromkeys(x.strip() for x in self.excluded.toPlainText().splitlines() if x.strip()))
         settings.overlay_words_added=list(self.words_added);settings.overlay_words_removed=list(self.words_removed)
         settings.overlay_apps_added=list(self.apps_added)
+        settings.action_positions=dict(self.positions);settings.action_colors=dict(self.colors)
         mapping=deepcopy(self.settings.hotkeys)
         mapping.update({action:edit.keySequence().toString(QKeySequence.SequenceFormat.PortableText) for action,edit in self.hotkeys.items()})
         settings.hotkeys=mapping
@@ -526,10 +544,13 @@ class Preferences(QDialog):
         query=self.app_search.text().casefold()
         included=set(self.included.toPlainText().splitlines());excluded=set(self.excluded.toPlainText().splitlines())
         known={a.id:a for a in self.controller.apps}
-        ids=set(known)|included|excluded|{w.app_id for w in self.controller.windows if w.eligible}
+        # Rules saved under a full app ID are listed even when the app is not
+        # installed here, so that they can be removed.
+        saved={k for k in (*self.positions,*self.colors) if ':' in k}
+        ids=set(known)|included|excluded|saved|{w.app_id for w in self.controller.windows if w.eligible}
         builtin=self.controls['builtin_exclusions'].isChecked()
         words=overlay_words(self.words_added,self.words_removed)
-        signature=(query,builtin,words,tuple(self.apps_added),tuple(sorted(included)),tuple(sorted(excluded)),tuple((i,known[i].name,known[i].icon_path) for i in sorted(known)),tuple(sorted(ids)))
+        signature=(query,builtin,words,tuple(self.apps_added),tuple(sorted(included)),tuple(sorted(excluded)),tuple(sorted(self.positions.items())),tuple(sorted(self.colors.items())),tuple((i,known[i].name,known[i].icon_path) for i in sorted(known)),tuple(sorted(ids)))
         if signature==self._rules_signature: return
         self._rules_signature=signature
         expanded={self.rules.topLevelItem(i).child(j).data(0,Qt.ItemDataRole.UserRole)
@@ -539,7 +560,7 @@ class Preferences(QDialog):
         overlays=[]
         with QSignalBlocker(self.rules):
             self.rules.clear();configured=QTreeWidgetItem(['Configured applications']);available=QTreeWidgetItem(['Other applications'])
-            configured.setToolTip(0,'Applications you keep floating.')
+            configured.setToolTip(0,'Applications with a rule: always floating, or a handle position or color.')
             self.rules.addTopLevelItems([configured,available])
             for app_id in sorted(ids,key=lambda i:known[i].name.casefold() if i in known else app_display_name(i).casefold()):
                 app=known.get(app_id);name=app.name if app else app_display_name(app_id)
@@ -550,12 +571,18 @@ class Preferences(QDialog):
                 if query and query not in (name+' '+app_id).casefold(): continue
                 item=QTreeWidgetItem([name]);item.setIcon(0,application_icon(app));item.setToolTip(0,app_id if app else f'{app_id} · Saved app ID')
                 item.setData(0,Qt.ItemDataRole.UserRole,app_id)
-                item.setExpanded(app_id in expanded)
-                (configured if floating else available).addChild(item)
+                is_configured=self._configured(app_id,excluded)
+                (configured if is_configured else available).addChild(item)
                 item.setExpanded(app_id in expanded)
                 toggle=QTreeWidgetItem(['Always floating']);toggle.setToolTip(0,'Keep its windows outside the tiled grid');toggle.setFlags(toggle.flags()|Qt.ItemFlag.ItemIsUserCheckable)
                 toggle.setCheckState(0,Qt.CheckState.Checked if floating else Qt.CheckState.Unchecked)
                 toggle.setData(0,Qt.ItemDataRole.UserRole,(app_id,False));item.addChild(toggle)
+                self._handle_rows(item,app_id,name)
+                if is_configured:
+                    remove=QPushButton('🗑');remove.setFlat(True);remove.setFixedWidth(32)
+                    remove.setToolTip(f'Remove {name} configuration');remove.setAccessibleName(f'Remove {name} configuration')
+                    remove.clicked.connect(lambda _=False,a=app_id,n=name:self.remove_rules(a,n))
+                    self.rules.setItemWidget(item,1,remove)
             for group in (configured,available):
                 group.setText(0,group.text(0)+f' · {group.childCount()}');group.setExpanded(True);group.setHidden(not group.childCount())
             if not configured.childCount() and not available.childCount(): self.rules.addTopLevelItem(QTreeWidgetItem(['No matching applications']))
@@ -580,9 +607,76 @@ class Preferences(QDialog):
                 app=known.get(app_id);self.app_input.addItem(application_icon(app),app.name if app else app_display_name(app_id),app_id)
             self.app_input.setCurrentIndex(-1);self.app_input.setEditText(text)
 
+    def _configured(self,app_id,excluded=None):
+        excluded=set(self.excluded.toPlainText().splitlines()) if excluded is None else excluded
+        return bool(app_id in excluded or matching_rules(self.positions,app_id) or matching_rules(self.colors,app_id))
+
+    def _handle_rows(self,item,app_id,name):
+        """Handle position and custom handle color rows of an application."""
+        position=QComboBox();position.setAccessibleName(f'{name} handle position');position.setMinimumWidth(140)
+        for value in ACTION_POSITIONS: position.addItem(HANDLE_POSITIONS[value],value)
+        current=rule_value(self.positions,app_id)
+        position.setCurrentIndex(max(0,position.findData(current)))
+        position.currentIndexChanged.connect(lambda _=0,a=app_id,c=position:self._set_position(a,c.currentData()))
+        row=QTreeWidgetItem(['Handle position']);row.setToolTip(0,'Edge of the window where its action handle appears')
+        item.addChild(row);self.rules.setItemWidget(row,1,position)
+        color=valid_color(rule_value(self.colors,app_id))
+        swatch=QPushButton();swatch.setAccessibleName(f'{name} handle color');swatch.setFixedSize(44,24)
+        shown=color or REMOTE_HANDLE_COLOR
+        swatch.setStyleSheet(f'QPushButton {{ background:{shown}; border:2px solid palette(mid); border-radius:5px; padding:0; min-height:0; }}'
+                             ' QPushButton:disabled { border-style:dashed; }')
+        swatch.setToolTip(shown);swatch.setEnabled(color is not None)
+        swatch.clicked.connect(lambda _=False,a=app_id,c=shown:self._choose_handle_color(a,c))
+        custom=QTreeWidgetItem(['Custom handle color']);custom.setToolTip(0,'Off: default handle style')
+        custom.setFlags(custom.flags()|Qt.ItemFlag.ItemIsUserCheckable)
+        custom.setCheckState(0,Qt.CheckState.Checked if color else Qt.CheckState.Unchecked)
+        custom.setData(0,Qt.ItemDataRole.UserRole,('color',app_id,shown))
+        item.addChild(custom);self.rules.setItemWidget(custom,1,swatch)
+
+    def _rules_edited(self):
+        self._rules_signature=None;QTimer.singleShot(0,self.refresh_rules);self._changed()
+
+    def _set_position(self,app_id,position):
+        # Left is the default: no rule is kept for it.
+        self.positions=set_rule(self.positions,app_id,None if position=='left' else position)
+        self._rules_edited()
+
+    def _set_color(self,app_id,color):
+        self.colors=set_rule(self.colors,app_id,color);self._rules_edited()
+
+    def _choose_handle_color(self,app_id,current):
+        color=QColorDialog.getColor(QColor(current),self,'Handle color')
+        if color.isValid(): self._set_color(app_id,color.name())
+
+    def remove_rules(self,app_id,name):
+        """All rules of an application at once: always floating, handle
+        position and color, including the shipped defaults."""
+        floating=[x for x in self.excluded.toPlainText().splitlines() if x==app_id]
+        self._removed=(name,floating,matching_rules(self.positions,app_id),matching_rules(self.colors,app_id))
+        with QSignalBlocker(self.excluded):
+            self.excluded.setPlainText('\n'.join(x for x in self.excluded.toPlainText().splitlines() if x and x!=app_id))
+        self.positions=set_rule(self.positions,app_id,None);self.colors=set_rule(self.colors,app_id,None)
+        self.removed_label.setText(f'Removed {name} configuration');self.removed_bar.show();self.removed_timer.start()
+        self._rules_edited()
+
+    def _undo_remove_rules(self):
+        # Restores exactly the removed entries; other applications keep later edits.
+        if not self._removed: return
+        _,floating,positions,colors=self._removed
+        values=self.excluded.toPlainText().splitlines()
+        with QSignalBlocker(self.excluded):
+            self.excluded.setPlainText('\n'.join([x for x in values if x]+[x for x in floating if x not in values]))
+        self.positions={**self.positions,**positions};self.colors={**self.colors,**colors}
+        self._forget_removed();self._rules_edited()
+
+    def _forget_removed(self):
+        self.removed_timer.stop();self._removed=None;self.removed_bar.hide()
+
     def _rule_changed(self,item,column):
         data=item.data(0,Qt.ItemDataRole.UserRole)
         if not isinstance(data,tuple): return
+        if data[0]=='color':
+            return self._set_color(data[1],data[2] if item.checkState(0)==Qt.CheckState.Checked else None)
         self._set_floating(data[0],data[1],item.checkState(0)==Qt.CheckState.Checked)
 
     def _set_floating(self,app_id,default,floating):

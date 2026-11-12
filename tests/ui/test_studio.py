@@ -147,6 +147,46 @@ class UITests(unittest.TestCase):
         tree('exe:code.exe').setCheckState(0,Qt.CheckState.Checked)
         self.assertEqual(prefs.collect_settings().excluded_apps,['exe:code.exe'])
 
+    def test_handle_rules_can_be_set_removed_and_restored(self):
+        from smartgrid.core.models import ApplicationRef
+        from PySide6.QtCore import Qt
+        mstsc=r'exe:C:\Windows\System32\mstsc.exe'
+        self.controller.apps=[ApplicationRef(mstsc,'Remote Desktop Connection'),ApplicationRef('exe:code.exe','Code')]
+        prefs=Preferences(self.controller); self.widgets.append(prefs)
+        prefs._apps_loaded=True;prefs.refresh_rules()
+        def row(app_id):
+            for i in range(prefs.rules.topLevelItemCount()):
+                group=prefs.rules.topLevelItem(i)
+                for j in range(group.childCount()):
+                    if group.child(j).data(0,Qt.ItemDataRole.UserRole)==app_id: return group,group.child(j)
+        group,item=row(mstsc)
+        self.assertTrue(group.text(0).startswith('Configured'))
+        self.assertEqual(prefs.rules.itemWidget(item.child(1),1).currentData(),'right')
+        self.assertEqual(item.child(2).checkState(0),Qt.CheckState.Checked)
+        prefs.remove_rules(mstsc,'Remote Desktop Connection');prefs.refresh_rules()
+        settings=prefs.collect_settings()
+        self.assertNotIn('mstsc.exe',settings.action_positions);self.assertNotIn('mstsc.exe',settings.action_colors)
+        self.assertTrue(row(mstsc)[0].text(0).startswith('Other'))
+        self.assertFalse(prefs.removed_bar.isHidden())
+        prefs._undo_remove_rules();prefs.refresh_rules()
+        self.assertEqual(prefs.collect_settings().action_positions['mstsc.exe'],'right')
+        self.assertTrue(prefs.removed_bar.isHidden())
+        _,code=row('exe:code.exe')
+        prefs.rules.itemWidget(code.child(1),1).setCurrentIndex(2)
+        code.child(2).setCheckState(0,Qt.CheckState.Checked)
+        settings=prefs.collect_settings()
+        self.assertEqual((settings.action_positions['exe:code.exe'],settings.action_colors['exe:code.exe']),('top','#ed5b00'))
+        prefs.refresh_rules();self.assertTrue(row('exe:code.exe')[0].text(0).startswith('Configured'))
+
+    def test_window_actions_follow_the_handle_position(self):
+        from smartgrid.ui.window_actions import WindowActions
+        actions=WindowActions(); self.widgets.append(actions)
+        actions.set_style('top','#ed5b00')
+        self.assertEqual((actions.width(),actions.height(),actions.handle.width(),actions.handle.height()),(176,44,40,28))
+        self.assertEqual((actions.handle.chevron,actions.handle.color),('down','#ed5b00'))
+        actions.set_style('left',None)
+        self.assertEqual((actions.width(),actions.handle.width(),actions.handle.chevron),(44,28,'next'))
+
     def test_applications_can_be_added_to_the_overlay_list(self):
         from smartgrid.core.models import ApplicationRef
         from PySide6.QtCore import Qt
