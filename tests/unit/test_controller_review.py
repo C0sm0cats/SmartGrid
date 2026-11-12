@@ -60,6 +60,25 @@ class ControllerReviewTests(unittest.TestCase):
         controller._cancel_pending()
         self.assertEqual(controller.last_error,'')
 
+    def test_window_minimized_by_the_user_stays_minimized_after_stop_and_restart(self):
+        controller,backend=self.make([record(1),record(2),record(3,'deskflow')])
+        controller.start()
+        backend.minimize(3);controller.refresh()
+        self.assertNotIn(3,[a.window_id for a in controller.profile('d1',0).assignments if a])
+        controller.stop()
+        self.assertEqual(backend.windows[3].state,'minimized')
+        restarted=Controller(backend,Repository(self.temporary.name));restarted.start()
+        self.assertNotIn(3,[a.window_id for a in restarted.profile('d1',0).assignments if a])
+        self.assertEqual(backend.windows[3].state,'minimized')
+
+    def test_window_hidden_to_the_notification_area_stays_hidden_after_stop(self):
+        controller,backend=self.make([record(1),record(2),record(3,'deskflow')])
+        controller.start()
+        backend.windows[3]=replace(backend.windows[3],eligible=False,exclusion_reason='Not visible');controller.refresh()
+        self.assertNotIn(3,[a.window_id for a in controller.profile('d1',0).assignments if a])
+        controller.stop()
+        self.assertEqual(backend.windows[3].state,'hidden')
+
     def test_one_off_error_expires(self):
         controller,backend=self.make([record(1)])
         controller.last_error='Windows refused the window action.'

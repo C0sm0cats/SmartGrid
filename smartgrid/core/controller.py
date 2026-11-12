@@ -43,6 +43,15 @@ RETIRED_HOTKEYS = {"focus_left": "Ctrl+Win+Left", "focus_right": "Ctrl+Win+Right
                    "focus_up": "Ctrl+Win+Up", "focus_down": "Ctrl+Win+Down"}
 
 
+def minimized_snapshot(snapshot, hidden=False):
+    """The same restoration, ending minimized without activation
+    (SW_SHOWMINNOACTIVE) or hidden (SW_HIDE); the normal position is unchanged."""
+    result = dict(snapshot, state="hidden" if hidden else "minimized")
+    if isinstance(snapshot.get("placement"), dict):
+        result["placement"] = dict(snapshot["placement"], showCmd=0 if hidden else 7)
+    return result
+
+
 class Controller:
     def __init__(self, backend, repository):
         self.backend, self.repository = backend, repository
@@ -1020,6 +1029,17 @@ class Controller:
             for hwnd, (reference, state) in self._originals.items():
                 window = self._window(hwnd)
                 if window and window.ref == reference and self.backend.alive(hwnd):
+                    # A window the user minimized stays minimized: its size and
+                    # styles come back, not the window itself (it reappeared and
+                    # was tiled at the next start). Parked windows do come back.
+                    if window.exclusion_reason == "Not visible":
+                        # Hidden by the application itself (closed to the
+                        # notification area): shown again, it stayed blank and
+                        # took an empty tile at the next start.
+                        state = minimized_snapshot(state, hidden=True)
+                    elif (window.state == "minimized" and hwnd not in self._parked
+                            and hwnd not in self._hidden_by_template):
+                        state = minimized_snapshot(state)
                     if not self.backend.restore(hwnd, state):
                         failures.append(hwnd)
             self._originals = {hwnd: value for hwnd, value in self._originals.items() if hwnd in failures}

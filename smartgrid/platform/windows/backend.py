@@ -429,7 +429,9 @@ class WindowsBackend:
                 return False
             deadline = time.monotonic() + .75
             while time.monotonic() < deadline and self.alive(hwnd):
-                if saved['showCmd'] in (2, 6, 7, 11):
+                if saved['showCmd'] == 0:
+                    restored = not self.api.IsWindowVisible(hwnd)
+                elif saved['showCmd'] in (2, 6, 7, 11):
                     restored = bool(self.api.IsIconic(hwnd))
                 elif saved['showCmd'] == 3:
                     restored = bool(self.api.IsZoomed(hwnd))
