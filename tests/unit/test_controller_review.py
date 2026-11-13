@@ -1031,6 +1031,50 @@ class ControllerReviewTests(unittest.TestCase):
         self.assertEqual(backend.launches,['slow'])
         return controller,backend
 
+    def test_launched_application_starting_maximized_goes_into_its_tile(self):
+        controller,backend = self.pending_template()
+        arrived = backend.add_window('slow',state='maximized');hwnd = arrived.ref.hwnd
+        controller.refresh()
+        self.assertEqual(controller.profile('d1',0).assignments[0].window_id,hwnd)
+        self.assertEqual(backend.windows[hwnd].state,'normal')
+        self.assertEqual(controller._tile_rects[hwnd][1],backend.windows[hwnd].rect)
+        self.assertNotEqual(backend.windows[hwnd].rect,arrived.rect)
+
+    def test_launched_application_maximizing_itself_is_restored_three_more_times(self):
+        controller,backend = self.pending_template()
+        hwnd = backend.add_window('slow').ref.hwnd
+        controller.refresh()
+        for _ in range(3):
+            backend.maximize(hwnd);controller.refresh()
+            self.assertEqual(backend.windows[hwnd].state,'normal')
+            self.assertEqual(controller._tile_rects[hwnd][1],backend.windows[hwnd].rect)
+        backend.maximize(hwnd);controller.refresh()
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+
+    def test_maximize_after_the_launch_grace_is_kept(self):
+        controller,backend = self.pending_template()
+        hwnd = backend.add_window('slow').ref.hwnd
+        controller.refresh()
+        controller._launch_grace[hwnd][0] -= 6
+        backend.maximize(hwnd);controller.refresh()
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+        self.assertFalse(controller._launch_grace)
+
+    def test_maximized_launch_is_kept_while_paused_floating_or_not_launched(self):
+        controller,backend = self.pending_template()
+        other = backend.add_window('other',state='maximized').ref.hwnd
+        controller.refresh()
+        self.assertEqual(backend.windows[other].state,'maximized')
+        backend.remove_window(other);controller.refresh()
+        hwnd = backend.add_window('slow').ref.hwnd
+        controller.refresh()
+        controller.pause()
+        backend.maximize(hwnd);controller.refresh()
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+        controller.paused = False;controller._floating.add(hwnd)
+        controller.refresh()
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+
     def test_late_application_arrives_on_target_secondary_display(self):
         controller,backend = self.pending_template('d2')
         arrived = backend.add_window('slow')

@@ -89,6 +89,8 @@ class Controller:
         self._pending = {}
         self._cancelled_launches = []
         self._late_unmanaged = set()
+        # Windows launched by a layout: [end of the grace, restores left] per hwnd.
+        self._launch_grace = {}
         self._generation = 0
         self._suppress_events_until = 0.0
         self._interaction_started = {}
@@ -460,6 +462,7 @@ class Controller:
                 self._free_moving.discard(hwnd)
                 self._floating.discard(hwnd)
                 self._late_unmanaged.discard(hwnd)
+                self._launch_grace.pop(hwnd, None)
                 self._parked.discard(hwnd)
                 self._hidden_by_template.discard(hwnd)
                 self._manual_minimized.discard(hwnd)
@@ -474,6 +477,7 @@ class Controller:
             layout_changed |= any(self._eligible(previous[h]) for h in closed|replaced) or bool((closed|replaced) & assigned) or any(self._eligible(live[h]) for h in created|replaced)
             # Hidden, shown, cloaked or excluded by a new title: the window
             # leaves or joins the grid without being closed or created.
+            layout_changed |= self._unmaximize_launched()
             flipped = sorted(h for h in previous.keys() & live.keys() if self._eligible(previous[h]) != self._eligible(live[h]))
             layout_changed |= bool(flipped)
             if flipped:
@@ -1679,11 +1683,33 @@ class Controller:
             self._capture(window.ref.hwnd)
             self._pending.pop(key, None)
             if self.active_spaces.get(display_id, 0) == space and self.running and not self.paused:
+                # Restored at once, then up to 3 more times during 5 s.
+                self._launch_grace[window.ref.hwnd] = [time.monotonic() + 5, 3 + (window.state == "maximized")]
+                self._unmaximize_launched()
                 self._apply_profile(profile)
             elif self.running and not self.paused and self.active_spaces.get(display_id, 0) != space and self.backend.minimize(window.ref.hwnd):
                 self._parked.add(window.ref.hwnd)
             self._save()
         self._warn_slow_launches()
+
+    def _unmaximize_launched(self):
+        """An application launched by a layout that maximizes itself (its
+        remembered state: at creation, or a moment later for Electron apps)
+        is restored for its tile, instead of covering the display and
+        suspending its arrangement. Only during the grace after its window was
+        bound; maximizing it later is the user's choice. True when one was."""
+        now, restored = time.monotonic(), False
+        for hwnd, grace in list(self._launch_grace.items()):
+            window = self._window(hwnd)
+            if now > grace[0] or not grace[1] or not window:
+                self._launch_grace.pop(hwnd, None)
+            elif (self.running and not self.paused and window.state == "maximized" and self._eligible(window)
+                    and hwnd not in self._floating and self.backend.show(hwnd)):
+                grace[1] -= 1
+                window.state = "normal"
+                restored = True
+                log.info("Launched by a layout, %s (%s) maximized itself: restored for its tile", hwnd, window.app_id)
+        return restored
 
     def _warn_slow_launches(self):
         """Names each application launched over 120 s ago that still has no

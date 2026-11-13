@@ -98,7 +98,7 @@ Spaces are window groups managed by SmartGrid, not additional Windows virtual de
 
 In Studio, select a window and choose **Pin this app to this tile** to reserve its place when it closes and reopens. **Clear tile** removes an assignment without closing the window. **Reset Space** clears the selected space's draft. **Apply arrangement** applies every edited display and space as one undoable arrangement; choosing an installed app reserves its tile and Apply reuses an existing window or opens the missing app.
 
-**Saved layouts** are named templates. **Restore in this space** reuses matching windows, launches missing apps when available, and minimizes surplus windows without closing them. Custom layouts keep their geometry; classic layouts grow and shrink with the number of windows. Import renames conflicting layouts with an "(imported)" suffix and keeps existing profiles.
+**Saved layouts** are named templates. **Restore in this space** reuses matching windows, launches missing apps when available, and minimizes surplus windows without closing them. An app launched this way that reopens maximized is put into its tile (for 5 seconds after its window appears; maximizing it afterwards is kept). Custom layouts keep their geometry; classic layouts grow and shrink with the number of windows. Import renames conflicting layouts with an "(imported)" suffix and keeps existing profiles.
 
 Maximizing or fullscreening a managed window freezes automatic layout changes on that display. With **Force windows into their tiles** enabled (the default), windows are sized to their tile even below the minimum size they report; turn it off to respect application minimum sizes, in which case refused placements are reported.
 
