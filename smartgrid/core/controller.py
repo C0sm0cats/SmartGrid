@@ -184,22 +184,60 @@ class Controller:
                     'created_utc':entry['created_utc'],'created':time.monotonic()-max(0,time.time()-entry['created_utc'])}
         self._session_signature=None
         self._desktop_id=getattr(backend,'desktop_id',None)
+        self._restored_hidden = set()
+        # The windows of the tiles are not written before they are found again.
+        self._session_ready = False
         self.refresh(auto=False)
-        self._bind_restored_profiles()
+        self._bind_restored_profiles(session.get('windows',[]))
+        self._session_ready = True
+        try: self._save_session()
+        except OSError as error:
+            self.last_error='Cannot save the runtime session: '+str(error)
+            log.exception('Unable to save runtime session')
 
-    def _bind_restored_profiles(self):
+    @staticmethod
+    def _process_key(ref):
+        """The process of a window, the same for every run of SmartGrid; '' when
+        Windows did not tell when it was created."""
+        key = ref.generation.rpartition(':')[0]
+        return '' if key.endswith(':') else key
+
+    def _bind_same_windows(self, entries):
+        """SmartGrid was restarted and these windows stayed open: each returns to
+        its tile. The entries of other windows are ignored."""
+        bound=set()
+        for entry in entries:
+            window=self._window(entry['hwnd'])
+            if (window is None or window.ref.pid!=entry['pid'] or self._process_key(window.ref)!=entry['process']
+                    or window.app_id!=entry['app_id'] or not self._eligible(window)
+                    or entry['display_id'] not in (window.display_id,window.display_id.split('@desktop:',1)[0])):
+                continue
+            profile=self.profiles.get((window.display_id,entry['space']))
+            if profile is None or entry['index']>=len(profile.assignments): continue
+            assignment=profile.assignments[entry['index']]
+            if (assignment is None or assignment.window_id or assignment.app_id!=window.app_id
+                    or any(a and a.window_id==window.ref.hwnd for a in profile.assignments)):
+                continue
+            assignment.window_id=window.ref.hwnd;bound.add(window.ref.hwnd)
+            if entry['space']!=self.active_spaces.get(window.display_id,0):
+                self._restored_hidden.add(window.ref.hwnd)
+        return bound
+
+    def _bind_restored_profiles(self, entries=()):
         """Rebind persisted occupants after a restart; forget apps that are closed.
 
         Profiles are stored without HWNDs. A regular occupant whose application
         is no longer open is not a launch request (only pins and
         real pending launches stay reserved), so it must not become OPENS ON APPLY.
-        In the active space the pins choose first; a hidden space must not take
-        the windows of the displayed one.
+        The windows that stayed open return to their tiles. Then, in the active
+        space, the pins choose first; a hidden space must not take the windows
+        of the displayed one.
         """
         with self._lock:
+            same=self._bind_same_windows(entries)
             pending={(key[0].split('@desktop:',1)[0],key[1],key[2]) for key in self._pending}
             for (display_id,space),profile in self.profiles.items():
-                used={a.window_id for a in profile.assignments if a and a.window_id}
+                used={a.window_id for a in profile.assignments if a and a.window_id}|same
                 if space==self.active_spaces.get(display_id,0):
                     for index,assignment in enumerate(profile.assignments):
                         if not assignment or assignment.window_id or not assignment.pinned:
@@ -412,15 +450,25 @@ class Controller:
         self._save_session()
 
     def _save_session(self):
+        if not self._session_ready:
+            return
         pending=[dict(display_id=key[0],space=key[1],index=key[2],app_id=value['app_id'],
                       created_utc=value.get('created_utc',time.time()-(time.monotonic()-value['created'])))
                  for key,value in sorted(self._pending.items())]
         # Store a wall-clock origin once; polling must not rewrite the file.
         for entry in pending:
             self._pending[(entry['display_id'],entry['space'],entry['index'])]['created_utc']=entry['created_utc']
-        signature=(repr(pending),tuple(sorted(self.active_spaces.items())))
+        windows=[]
+        for (display_id,space),profile in sorted(self.profiles.items()):
+            for index,assignment in enumerate(profile.assignments):
+                window=self._window(assignment.window_id) if assignment and assignment.window_id else None
+                process=self._process_key(window.ref) if window else ''
+                if process:
+                    windows.append(dict(display_id=display_id,space=space,index=index,app_id=assignment.app_id,
+                                        hwnd=window.ref.hwnd,pid=window.ref.pid,process=process))
+        signature=(repr(pending),repr(windows),tuple(sorted(self.active_spaces.items())))
         if signature!=self._session_signature:
-            self.repository.save_session(pending,self.active_spaces)
+            self.repository.save_session(pending,self.active_spaces,windows)
             self._session_signature=signature
 
     def refresh_apps(self):
@@ -1024,9 +1072,26 @@ class Controller:
             self.history.push(self._snapshot())
             self.running, self.paused = True, False
             self._bind_pending()
+            self._park_restored_hidden()
             self._reflow_all(include_new=True, explicit=True)
             self.status = self.last_result.summary
             self._notify()
+
+    def _park_restored_hidden(self):
+        """Windows of a hidden space, shown when SmartGrid quit: put aside again
+        at the first start after a restart."""
+        for hwnd in self._restored_hidden:
+            window = self._window(hwnd)
+            if window is None or window.state != "normal" or not self._eligible(window):
+                continue
+            active = self.active_spaces.get(window.display_id, 0)
+            spaces = {s for (d, s), p in self.profiles.items() if d == window.display_id
+                      for a in p.assignments if a and a.window_id == hwnd}
+            if spaces and active not in spaces:
+                self._capture(hwnd)
+                if self.backend.minimize(hwnd):
+                    self._parked.add(hwnd)
+        self._restored_hidden.clear()
 
     def pause(self):
         with self._lock:

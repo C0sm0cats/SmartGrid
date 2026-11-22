@@ -190,8 +190,16 @@ class Repository:
                     and type(index) is int and 0<=index<10000 and isinstance(app,str) and app
                     and type(created) in (int,float) and math.isfinite(created) and created>0):
                 clean.append(dict(display_id=display,space=space,index=index,app_id=app,created_utc=created))
-        return {'pending':clean,'active_spaces':{k:v for k,v in spaces.items() if isinstance(k,str) and type(v) is int and v in range(3)}}
+        windows=[]
+        for entry in data.get('windows',[]) if isinstance(data.get('windows'),list) else []:
+            if not isinstance(entry,dict): continue
+            display,space,index,app,hwnd,pid,process=(entry.get(k) for k in ('display_id','space','index','app_id','hwnd','pid','process'))
+            if (isinstance(display,str) and display and type(space) is int and space in range(3)
+                    and type(index) is int and 0<=index<10000 and isinstance(app,str) and app
+                    and type(hwnd) is int and hwnd>0 and type(pid) is int and pid>=0 and isinstance(process,str) and process):
+                windows.append(dict(display_id=display,space=space,index=index,app_id=app,hwnd=hwnd,pid=pid,process=process))
+        return {'pending':clean,'windows':windows,'active_spaces':{k:v for k,v in spaces.items() if isinstance(k,str) and type(v) is int and v in range(3)}}
 
-    def save_session(self, pending, active_spaces):
+    def save_session(self, pending, active_spaces, windows=()):
         if self.read_only: return
-        atomic_json(self.directory/'session.json',{'version':VERSION,'pending':pending,'active_spaces':active_spaces})
+        atomic_json(self.directory/'session.json',{'version':VERSION,'pending':pending,'active_spaces':active_spaces,'windows':list(windows)})

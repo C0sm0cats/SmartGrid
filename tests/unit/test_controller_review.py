@@ -236,6 +236,8 @@ class ControllerReviewTests(unittest.TestCase):
 
     def test_drop_target_is_under_the_pointer(self):
         for driven in (False,True):
+            # A new run, not the same windows found again after a restart.
+            (Path(self.temporary.name)/'session.json').unlink(missing_ok=True)
             controller,backend=self.make([record(1),record(2)])
             controller.preview_driven=driven
             controller.start()
@@ -254,6 +256,8 @@ class ControllerReviewTests(unittest.TestCase):
 
     def test_gestures_follow_one_another(self):
         for driven in (False,True):
+            # A new run, not the same windows found again after a restart.
+            (Path(self.temporary.name)/'session.json').unlink(missing_ok=True)
             controller,backend=self.make([record(1),record(2)])
             controller.preview_driven=driven
             controller.start()
@@ -1332,6 +1336,131 @@ class RestartBindingTests(unittest.TestCase):
             assignments=controller.profile('d1',0).assignments
             self.assertEqual([(a.app_id,a.window_id,a.pinned) for a in assignments if a],
                              [('open',1,False),('pinned',None,True)])
+
+
+class RestartIdentityTests(unittest.TestCase):
+    def make(self, directory, pins=(False,False), displays=1):
+        shown=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(displays)]
+        backend=FakeBackend(shown,[record(1,'chrome'),record(2,'chrome')],[ApplicationRef('chrome','Chrome')])
+        backend.auto_launch=False
+        controller=Controller(backend,Repository(directory))
+        controller.profiles[('d1',0)]=SpaceProfile('d1',0,assignments=[
+            Assignment('chrome',2,pins[0]),Assignment('chrome',1,pins[1])])
+        controller.start()
+        return backend,controller
+
+    def restart(self, backend, directory, start=True):
+        controller=Controller(backend,Repository(directory))
+        if start: controller.start()
+        return controller
+
+    def tiles(self, controller, space=0):
+        return [(a.window_id,a.pinned) if a else None for a in controller.profile('d1',space).assignments]
+
+    def test_windows_that_stayed_open_return_to_their_tiles(self):
+        for pins in ((False,False),(True,True),(True,False),(False,True)):
+            # Quit, or ended without a goodbye.
+            for crash in (False,True):
+                with self.subTest(pins=pins,crash=crash),tempfile.TemporaryDirectory() as directory:
+                    backend,controller=self.make(directory,pins)
+                    if not crash: controller.quit()
+                    self.assertEqual(self.tiles(self.restart(backend,directory)),[(2,pins[0]),(1,pins[1])])
+
+    def test_a_restart_without_start_forgets_nothing(self):
+        for quits in (False,True):
+            with self.subTest(quits=quits),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.make(directory);controller.quit()
+                for _ in range(2):
+                    idle=self.restart(backend,directory,start=False)
+                    self.assertEqual(self.tiles(idle),[(2,False),(1,False)])
+                    if quits: idle.quit()
+                self.assertEqual(self.tiles(self.restart(backend,directory)),[(2,False),(1,False)])
+
+    def test_the_session_is_not_emptied_before_the_windows_are_found(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory);controller.quit()
+            before=(Path(directory)/'session.json').read_text()
+            bind=Controller._bind_restored_profiles
+            try:
+                def crash(*args): raise RuntimeError('crash')
+                Controller._bind_restored_profiles=crash
+                with self.assertRaises(RuntimeError): Controller(backend,Repository(directory))
+            finally: Controller._bind_restored_profiles=bind
+            self.assertEqual((Path(directory)/'session.json').read_text(),before)
+            self.assertEqual(self.tiles(self.restart(backend,directory)),[(2,False),(1,False)])
+
+    def test_a_window_closed_meanwhile_does_not_move_the_other(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,(True,True));controller.quit()
+            backend.remove_window(2)
+            self.assertEqual(self.tiles(self.restart(backend,directory)),[(None,True),(1,True)])
+
+    def test_another_window_with_the_same_number_is_not_taken_for_it(self):
+        for change in (dict(ref=WindowRef(2,77,'generation:2')),dict(ref=WindowRef(2,2,'other:2')),dict(app_id='note')):
+            with self.subTest(change=change),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.make(directory,(True,True));controller.quit()
+                backend.windows[2]=replace(backend.windows[2],**change)
+                restarted=Controller(backend,Repository(directory))
+                self.assertFalse(restarted._restored_hidden)
+                # The ordinary rule: window 1 keeps its own tile.
+                self.assertEqual(self.tiles(restarted)[1],(1,True))
+                self.assertIn(self.tiles(restarted)[0],[(None,True),(2,True)])
+                self.assertEqual(self.tiles(restarted)[0][0],None if 'app_id' in change else 2)
+
+    def test_windows_on_another_display_are_not_brought_back(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,(True,True),displays=2);controller.quit()
+            backend.windows[2]=replace(backend.windows[2],display_id='d2')
+            self.assertEqual(self.tiles(self.restart(backend,directory)),[(None,True),(1,True)])
+            self.assertEqual(backend.windows[2].display_id,'d2')
+
+    def test_windows_of_a_hidden_space_are_put_aside_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory)
+            controller.switch_space('d1',1)
+            controller.profile('d1',1).assignments=[Assignment('chrome',1,True)]
+            controller.arrange('d1')
+            controller.quit()
+            # Quitting gave every window back.
+            self.assertEqual({w.state for w in backend.windows.values()},{'normal'})
+            restarted=self.restart(backend,directory,start=False)
+            self.assertEqual((self.tiles(restarted),self.tiles(restarted,1)),([(2,False),(1,False)],[(1,True)]))
+            self.assertEqual(backend.windows[2].state,'normal')
+            restarted.start()
+            self.assertEqual((backend.windows[1].state,backend.windows[2].state),('normal','minimized'))
+            self.assertIn(2,restarted._parked)
+            restarted.switch_space('d1',0)
+            self.assertEqual({w.state for w in backend.windows.values()},{'normal'})
+            self.assertEqual(self.tiles(restarted),[(2,False),(1,False)])
+            restarted.quit()
+
+    def test_no_title_is_stored_and_idle_scans_do_not_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory)
+            backend.windows[1]=replace(backend.windows[1],title='Secret');controller.refresh()
+            session=Path(directory)/'session.json'
+            self.assertNotIn('Secret',session.read_text())
+            self.assertEqual([e['hwnd'] for e in json.loads(session.read_text())['windows']],[2,1])
+            session.unlink()
+            for _ in range(20): controller.refresh()
+            self.assertFalse(session.exists())
+
+    def test_sessions_of_older_versions_and_invalid_entries_are_read(self):
+        good=dict(display_id='d1',space=0,index=0,app_id='chrome',hwnd=2,pid=2,process='generation')
+        for windows,kept in ((None,[]),('x',[]),([1,{},dict(good,hwnd='2'),dict(good,index=-1),dict(good,space=3),dict(good,process='')],[]),([good],[good])):
+            with tempfile.TemporaryDirectory() as directory:
+                data={'version':1,'pending':[],'active_spaces':{'d1':1}}
+                if windows is not None: data['windows']=windows
+                Repository(directory).save_session([],{})
+                stored=json.loads((Path(directory)/'session.json').read_text())
+                data['version']=stored['version']
+                (Path(directory)/'session.json').write_text(json.dumps(data))
+                session=Repository(directory).load_session()
+                self.assertEqual((session['windows'],session['active_spaces']),(kept,{'d1':1}))
+
+    def test_a_process_without_creation_date_is_not_recorded(self):
+        self.assertEqual(Controller._process_key(WindowRef(1,42,'42:1337:5')),'42:1337')
+        self.assertEqual(Controller._process_key(WindowRef(1,42,'42::5')),'')
 
 
 class CollapsedResizeTests(unittest.TestCase):
