@@ -26,7 +26,7 @@ class Overlay(QWidget):
 
 
 class TargetGuide(Overlay):
-    """Drop target with its label ("Swap · App" / "Move here")."""
+    """Drop target with its label ("Swap · App" / "Move here" / "Insert")."""
     def __init__(self):
         super().__init__()
         self.label = None

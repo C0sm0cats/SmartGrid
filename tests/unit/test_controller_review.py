@@ -1754,6 +1754,111 @@ class CrossDisplayDropTests(unittest.TestCase):
             self.assertEqual([t[1] for t in self.tiles(controller,'d2')],[1])
 
 
+class SameDisplayDropTests(unittest.TestCase):
+    def make(self, directory, assignments, preset='auto', tiles=()):
+        display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+        backend=FakeBackend([display],[record(1,'app'),record(2,'note'),record(3,'note')],
+                            [ApplicationRef('app','App'),ApplicationRef('other','Other')])
+        backend.auto_launch=False
+        controller=Controller(backend,Repository(directory))
+        controller.profiles[('d1',0)]=SpaceProfile('d1',0,preset,list(tiles),assignments)
+        controller.start()
+        return backend,controller
+
+    def drop(self, backend, controller, index, hwnd=1):
+        before=backend.windows[hwnd].rect
+        backend.cursor=(before.x+before.width//2,before.y+20)
+        rect=controller.resolved_rects('d1',0)[index]
+        controller._handle_event({'type':'move_start','hwnd':hwnd})
+        backend.cursor=(rect.x+rect.width//2,rect.y+rect.height//2)
+        backend.windows[hwnd]=replace(backend.windows[hwnd],rect=Rect(rect.x+5,rect.y+5,before.width,before.height))
+        controller._handle_event({'type':'move_end','hwnd':hwnd});controller.refresh()
+
+    def tiles(self, controller):
+        return [(a.app_id,a.window_id,a.pinned) if a else None for a in controller.profile('d1',0).assignments]
+
+    def test_an_unpinned_window_takes_the_pin_and_leaves_no_hole(self):
+        for assignments,aimed,expected in (
+                ([Assignment('app',1),Assignment('note',2),Assignment('note',3),Assignment('app',None,True)],3,
+                 [('note',2,False),('note',3,False),('app',1,True)]),
+                ([Assignment('app',None,True),Assignment('note',2),Assignment('app',1),Assignment('note',3)],0,
+                 [('app',1,True),('note',2,False),('note',3,False)])):
+            with self.subTest(aimed=aimed),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.make(directory,assignments)
+                self.drop(backend,controller,aimed)
+                self.assertEqual(self.tiles(controller),expected)
+                self.assertFalse(controller.reserved_slots())
+                self.assertEqual(len(controller.resolved_rects('d1',0)),3)
+
+    def test_a_custom_layout_keeps_the_tile_left_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            quarters=[Tile(str(i),i/4,0,1/4,1) for i in range(4)]
+            backend,controller=self.make(directory,
+                [Assignment('app',1),Assignment('note',2),Assignment('note',3),Assignment('app',None,True)],'custom',quarters)
+            self.drop(backend,controller,3)
+            self.assertEqual(self.tiles(controller),[None,('note',2,False),('note',3,False),('app',1,True)])
+            self.assertEqual(backend.windows[1].rect,controller.resolved_rects('d1',0)[3])
+
+    def test_a_pinned_window_or_the_pin_of_another_app_is_swapped(self):
+        for first,pin in ((Assignment('app',1,True),Assignment('app',None,True)),(Assignment('app',1),Assignment('other',None,True))):
+            with self.subTest(pin=pin.app_id),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.make(directory,[first,Assignment('note',2),Assignment('note',3),pin])
+                self.drop(backend,controller,3)
+                self.assertEqual(self.tiles(controller),[(pin.app_id,None,True),('note',2,False),('note',3,False),('app',1,first.pinned)])
+
+    def test_the_drop_is_undone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,
+                [Assignment('app',1),Assignment('note',2),Assignment('note',3),Assignment('app',None,True)])
+            before=self.tiles(controller)
+            self.drop(backend,controller,3);self.assertNotEqual(self.tiles(controller),before)
+            controller.undo();self.assertEqual(self.tiles(controller),before)
+
+    def test_launches_follow_their_tiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[Assignment('app',1),Assignment('note',2),Assignment('note',3),
+                Assignment('app',None,True),Assignment('other',None,True)])
+            controller.activate_reserved('d1',0,3);controller.activate_reserved('d1',0,4)
+            self.assertEqual(sorted(k[2] for k in controller._pending),[3,4])
+            self.drop(backend,controller,3)
+            self.assertEqual({k[2]:p['app_id'] for k,p in controller._pending.items()},{3:'other'})
+            late=backend.add_window('other',hwnd=20).ref.hwnd;controller.refresh()
+            self.assertEqual(self.tiles(controller)[2:],[('app',1,True),('other',late,True)])
+
+
+class CrossDisplayGuideTests(unittest.TestCase):
+    def test_the_guide_shows_what_the_drop_does(self):
+        for assignments,aimed,label,shown in (
+                ([Assignment('note',2),Assignment('app',None,True)],1,'Move here',1),
+                ([Assignment('note',2),Assignment('app',None,True)],0,'Move here',1),
+                ([Assignment('note',2)],0,'Insert',None),
+                ([Assignment('note',2),Assignment('other',None,True)],1,'Insert',None),
+                ([],None,'Insert',None)):
+            with self.subTest(label=label,aimed=aimed),tempfile.TemporaryDirectory() as directory:
+                displays=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(2)]
+                windows=[record(1,'app','d2')]+([record(2,'note')] if assignments else [])
+                backend=FakeBackend(displays,windows,[ApplicationRef('app','App')]);backend.auto_launch=False
+                controller=Controller(backend,Repository(directory))
+                controller.profiles[('d1',0)]=SpaceProfile('d1',0,assignments=deepcopy(assignments))
+                controller.start()
+                rects=controller.resolved_rects('d1',0)
+                aim=rects[aimed] if aimed is not None else Rect(100,100,800,600)
+                held=backend.windows[1].rect
+                backend.cursor=(held.x+held.width//2,held.y+20)
+                controller._handle_event({'type':'move_start','hwnd':1})
+                backend.cursor=(aim.x+aim.width//2,aim.y+aim.height//2)
+                backend.windows[1]=replace(backend.windows[1],rect=Rect(aim.x+5,aim.y+5,640,480),display_id='d1')
+                controller._handle_event({'type':'location','hwnd':1})
+                guide=controller.drag_guide
+                self.assertEqual((guide[0],guide[2]),('d1',label))
+                if shown is not None: self.assertEqual(guide[1],rects[shown])
+                elif rects: self.assertEqual((guide[1].x,guide[1].right),(min(r.x for r in rects),max(r.right for r in rects)))
+                else: self.assertEqual(guide[1],displays[0].work_area)
+                controller._handle_event({'type':'move_end','hwnd':1});controller.refresh()
+                held=next(i for i,a in enumerate(controller.profile('d1',0).assignments) if a and a.window_id==1)
+                self.assertEqual(held,shown if shown is not None else len(assignments))
+
+
 class PinnedCardTests(unittest.TestCase):
     def make(self, directory, windows, assignments, displays=1):
         shown=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(displays)]

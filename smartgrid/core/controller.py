@@ -2079,7 +2079,7 @@ class Controller:
         self.history.push(self._resize_snapshot or self._snapshot())
         if old_display != target_display:
             value = source.assignments[source_index]
-            index = self._empty_drop_slot(target, window)
+            index = self._empty_drop_slot(target, window, self._profile_rects(target), self._pointer())
             for (display_id, _), profile in self.profiles.items():
                 if display_id == old_display:
                     profile.assignments = [None if a and a.window_id == hwnd else a for a in profile.assignments]
@@ -2100,19 +2100,40 @@ class Controller:
             index = nearest_slot(rects, x, y)
             if index is not None and index != source_index:
                 target.assignments += [None] * max(0, len(rects) - len(target.assignments))
-                target.assignments[source_index], target.assignments[index] = target.assignments[index], target.assignments[source_index]
+                value, aimed = target.assignments[source_index], target.assignments[index]
+                if (aimed and aimed.pinned and aimed.window_id is None and aimed.app_id == value.app_id
+                        and not value.pinned):
+                    self._fill_pinned_slot(target, source_index, index)
+                else:
+                    target.assignments[source_index], target.assignments[index] = aimed, value
             self._apply_profile(target)
         self._hide_overlay()
         self._save()
         self._notify()
 
-    def _empty_drop_slot(self, profile, window):
+    def _fill_pinned_slot(self, profile, source, index):
+        """An unpinned window takes the empty tile pinned for its app in the
+        same arrangement. The tile it leaves stays in a custom layout; a
+        classic one (or a custom one that overflows) loses it, or a hole
+        would remain."""
+        space = (profile.display_id, profile.space)
+        profile.assignments[index].window_id = profile.assignments[source].window_id
+        self._pending.pop((*space, index), None)
+        if profile.preset == "custom" and len(profile.assignments) <= len(profile.tiles):
+            profile.assignments[source] = None
+            return
+        del profile.assignments[source]
+        moved = {key: value for key, value in self._pending.items() if key[:2] == space and key[2] > source}
+        for key in moved:
+            del self._pending[key]
+        self._pending.update({(*space, key[2] - 1): value for key, value in moved.items()})
+
+    def _empty_drop_slot(self, profile, window, rects, pointer):
         """Empty tile that takes a window dropped from another display: the one
         aimed at, unless it is reserved for another app; else the first pinned
         one of the app. None: the window is inserted after the others."""
-        rects = self._profile_rects(profile)
         slots = profile.assignments + [None] * (len(rects) - len(profile.assignments))
-        aimed = nearest_slot(rects, *self._drop_point(window, self._pointer()))
+        aimed = nearest_slot(rects, *self._drop_point(window, pointer))
         if aimed is not None:
             slot = slots[aimed]
             if slot is None or slot.window_id is None and slot.app_id == window.app_id:
@@ -2428,7 +2449,19 @@ class Controller:
                 return
         self.preview_rectangles=[];self.preview_covers=[];self.preview_gap=None
         index = nearest_slot(rects, *self._drop_point(window, pointer))
-        if index is None:
+        if original and original[1] != window.display_id:
+            # From another display nothing is swapped: the empty tile that will
+            # be filled, or the whole arrangement the window is inserted in.
+            slot = self._empty_drop_slot(profile, window, rects, pointer)
+            if slot is not None:
+                guide = (window.display_id, rects[slot], 'Move here', window.app_id)
+            else:
+                area = self._display(window.display_id).work_area
+                if rects:
+                    x, y = min(r.x for r in rects), min(r.y for r in rects)
+                    area = Rect(x, y, max(r.right for r in rects) - x, max(r.bottom for r in rects) - y)
+                guide = (window.display_id, area, 'Insert', window.app_id)
+        elif index is None:
             guide = None
         else:
             target = profile.assignments[index] if index < len(profile.assignments) else None
