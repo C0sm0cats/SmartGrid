@@ -100,7 +100,7 @@ In Studio, select a window and choose **Pin this app to this tile** to reserve i
 
 **Saved layouts** are named templates. **Restore in this space** reuses matching windows, launches missing apps when available, and minimizes surplus windows without closing them. An app launched this way that reopens maximized is put into its tile (for 5 seconds after its window appears; maximizing it afterwards is kept). One app can hold several tiles, each with its own pin. If an app that is already open shows no new window, its launch is given up: after 30 seconds for a pinned tile, which stays reserved, and after 120 seconds for an unpinned one, which is released. Clicking the card of an empty pinned tile restores or opens a window for that tile only. Custom layouts keep their geometry; classic layouts grow and shrink with the number of windows. Import renames conflicting layouts with an "(imported)" suffix and keeps existing profiles.
 
-Maximizing or fullscreening a managed window freezes automatic layout changes on that display. With **Force windows into their tiles** enabled (the default), windows are sized to their tile even below the minimum size they report; turn it off to respect application minimum sizes, in which case refused placements are reported.
+Maximizing or fullscreening a managed window freezes automatic layout changes on that display. A tiled window maximized from its own title bar comes to the front, even when its application does not raise it. With **Force windows into their tiles** enabled (the default), windows are sized to their tile even below the minimum size they report; turn it off to respect application minimum sizes, in which case refused placements are reported.
 
 ## Development
 

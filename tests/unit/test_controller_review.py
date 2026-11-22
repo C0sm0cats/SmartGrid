@@ -1035,6 +1035,321 @@ class ControllerReviewTests(unittest.TestCase):
         self.assertEqual(backend.launches,['slow'])
         return controller,backend
 
+    def maximized_behind(self, count=3, order=(1,2,3), pointer=None):
+        """Window 3 maximized from its own button, left behind the others."""
+        controller,backend = self.make([record(h,f'app{h}') for h in range(1,count+1)])
+        controller.start()
+        tile = backend.windows[3].rect
+        backend.z_order = list(order);backend.foreground_hwnd = order[0]
+        backend.cursor = pointer or (tile.right-60,tile.y+15)
+        backend.window_at = lambda point: 3
+        backend.windows[3] = replace(backend.windows[3],state='maximized',rect=Rect(0,0,1920,1080))
+        backend.operations.clear()
+        return controller,backend,tile
+
+    def fronted(self, backend):
+        return [o for o in backend.operations if o[0] in ('activate','raise')]
+
+    def test_window_maximized_by_its_own_button_comes_in_front_of_the_tiles(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.z_order[0],3);self.assertEqual(backend.foreground_hwnd,3)
+        self.assertEqual(backend.windows[3].state,'maximized')
+        # Once per maximization, and nothing more once in front.
+        controller._handle_event({'type':'location','hwnd':3});controller._recheck_front()
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+        # Restored, then maximized again behind: in front again.
+        backend.windows[3] = replace(backend.windows[3],state='normal',rect=controller._tile_rects[3][1])
+        controller._handle_event({'type':'location','hwnd':3})
+        backend.windows[3] = replace(backend.windows[3],state='maximized',rect=Rect(0,0,1920,1080))
+        backend.z_order = [1,2,3]
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.z_order[0],3)
+
+    def test_active_window_still_behind_is_raised_and_not_left_always_on_top(self):
+        controller,backend,_ = self.maximized_behind()
+        backend._to_front = lambda hwnd: None  # Activated, not raised.
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.foreground_hwnd,3);self.assertEqual(backend.z_order[0],1)
+        del backend._to_front
+        controller._recheck_front()
+        self.assertEqual(backend.z_order[0],3)
+        backend.topmost.add(3)
+        controller._recheck_topmost()
+        self.assertEqual(backend.topmost,set())
+        controller._recheck_topmost()
+        self.assertIsNone(controller._topmost_check)
+        # A window that never answers is not asked forever.
+        backend.topmost.add(3);backend.drop_topmost = lambda hwnd: False
+        controller._topmost_check = (3,0,2)
+        controller._recheck_topmost();self.assertIsNotNone(controller._topmost_check)
+        controller._recheck_topmost();self.assertIsNone(controller._topmost_check)
+
+    def test_window_refused_the_foreground_never_covers_the_keyboard(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.failures.add(3)  # Windows refuses the activation.
+        controller._handle_event({'type':'location','hwnd':3})
+        for _ in range(3): controller._recheck_front()
+        self.assertEqual(self.fronted(backend),[('activate',3)]*4)
+        self.assertEqual(backend.z_order[0],1);self.assertIsNone(controller._raise_check)
+
+    def test_activation_is_not_asked_again_once_the_pointer_is_on_a_tile(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.failures.add(3)
+        controller._handle_event({'type':'location','hwnd':3})
+        backend.window_at = lambda point: 1
+        for _ in range(3): controller._recheck_front()
+        # The click, and one more try at once.
+        self.assertEqual(self.fronted(backend),[('activate',3)]*2)
+
+    def test_activation_refused_once_is_asked_again(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.failures.add(3)
+        controller._handle_event({'type':'location','hwnd':3})
+        backend.failures.clear()
+        controller._recheck_front()
+        self.assertEqual(backend.z_order[0],3);self.assertEqual(backend.foreground_hwnd,3)
+        # Then the user goes back to the other window: left there.
+        backend.foreground_hwnd = 1;backend.z_order = [1,3,2]
+        controller._recheck_front()
+        self.assertEqual(backend.foreground_hwnd,1);self.assertIsNone(controller._raise_check)
+
+    def test_window_maximized_by_a_drag_is_not_brought_to_the_front_later(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._interacting.add(3)
+        controller._enqueue_event({'type':'location','hwnd':3})
+        controller._handle_event({'type':'location','hwnd':3})
+        controller._interacting.clear()
+        controller._handle_event({'type':'location','hwnd':3})
+        controller.refresh()
+        self.assertEqual(self.fronted(backend),[])
+        # Maximized before SmartGrid saw it at all: not either.
+        other,backend,_ = self.maximized_behind()
+        other._maximized.clear();other.windows=[w for w in other.windows if w.ref.hwnd!=3]
+        other.refresh(auto=False)
+        self.assertTrue(other._maximized[3]["handled"])
+
+    def test_maximized_window_comes_to_the_front_from_the_event_thread(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._enqueue_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.z_order[0],3)
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+
+    def busy_enqueue(self, controller, hwnd):
+        """The event queued while the runtime holds the lock."""
+        import threading
+        with controller._lock:
+            thread = threading.Thread(target=controller._enqueue_event,args=({'type':'location','hwnd':hwnd},))
+            thread.start();thread.join()
+
+    def test_pointer_gone_before_the_event_is_handled_is_no_miss(self):
+        controller,backend,_ = self.maximized_behind()
+        self.busy_enqueue(controller,3)
+        backend.cursor = (5,5);backend.window_at = lambda point: 1
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.z_order[0],3)
+
+    def test_active_window_is_raised_at_once_whatever_the_pointer_does_next(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.foreground_hwnd = 3
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[('raise',3)])
+        # Sent behind again by its application: raised at the next checks,
+        # three times at most.
+        backend.cursor = (5,5)
+        for _ in range(3):
+            backend.z_order = [1,2,3];controller._recheck_front()
+            self.assertEqual(backend.z_order[0],3)
+        self.assertIsNone(controller._raise_check)
+
+    def test_foreground_taken_back_after_its_activation_is_respected(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._handle_event({'type':'location','hwnd':3})
+        backend.foreground_hwnd = 1;backend.z_order = [1,3,2]
+        controller._recheck_front()
+        self.assertEqual(self.fronted(backend),[('activate',3)]);self.assertIsNone(controller._raise_check)
+
+    def test_late_activation_is_followed_by_a_raise(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.failures.add(3)
+        controller._handle_event({'type':'location','hwnd':3})
+        controller._recheck_front()
+        backend.foreground_hwnd = 3
+        controller._recheck_front()
+        self.assertEqual(backend.z_order[0],3)
+
+    def test_another_window_activated_before_the_event_is_handled_stays_in_front(self):
+        controller,backend,_ = self.maximized_behind()
+        self.busy_enqueue(controller,3)
+        backend.foreground_hwnd = 2
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[]);self.assertIsNone(controller._raise_check)
+
+    def test_restored_and_maximized_again_before_being_handled(self):
+        controller,backend,tile = self.maximized_behind()
+        controller._handle_event({'type':'location','hwnd':3})
+        maximized = backend.windows[3]
+        backend.windows[3] = replace(maximized,state='normal',rect=tile)
+        controller._enqueue_event({'type':'location','hwnd':3})
+        backend.windows[3] = maximized;backend.z_order = [1,2,3];backend.foreground_hwnd = 1
+        controller._enqueue_event({'type':'location','hwnd':3})
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(backend.z_order[0],3)
+
+    def test_maximized_while_another_window_is_held_comes_to_the_front_after(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._interacting.add(1)
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[])
+        controller._interacting.clear();controller.refresh()
+        self.assertEqual(backend.z_order[0],3)
+
+    def test_card_of_a_window_minimized_while_maximized_brings_it_to_the_front(self):
+        controller,backend,_ = self.maximized_behind(order=(3,1,2))
+        next(a for a in controller.profile('d1',0).assignments if a and a.window_id==3).pinned = True
+        controller.refresh()
+        backend.windows[3] = replace(backend.windows[3],state='minimized')
+        controller.refresh()
+        backend.z_order = [1,2,3];backend.foreground_hwnd = 1
+        # Windows brings it back as it was before: maximized.
+        backend.show = lambda hwnd: backend.windows.update({hwnd:replace(backend.windows[hwnd],state='maximized')}) or False
+        index = next(i for i,a in enumerate(controller.profile('d1',0).assignments) if a and a.window_id==3)
+        backend.operations.clear()
+        controller.activate_reserved('d1',0,index)
+        self.assertEqual(backend.windows[3].state,'maximized')
+        self.assertEqual(backend.z_order[0],3);self.assertEqual(backend.foreground_hwnd,3)
+        controller._handle_event({'type':'location','hwnd':3})
+        # Recalled in front by the backend itself: not shown without activation.
+        shown = []
+        backend.windows[3] = replace(backend.windows[3],state='minimized');controller.refresh()
+        backend.show = shown.append
+        backend.recall_maximized = lambda hwnd: backend.windows.update({hwnd:replace(backend.windows[hwnd],state='maximized')}) or True
+        backend.foreground_hwnd = 3
+        controller.activate_reserved('d1',0,index)
+        self.assertEqual(shown,[]);self.assertEqual(backend.windows[3].state,'maximized')
+        backend.operations[:] = backend.operations[:1]
+        controller._enqueue_event({'type':'location','hwnd':3})
+        controller._handle_event({'type':'location','hwnd':3})
+        for _ in range(3): controller._recheck_front() if controller._raise_check else None
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+
+    def test_card_of_a_window_back_in_its_tile_gives_it_no_focus(self):
+        controller,backend,_ = self.maximized_behind(order=(3,1,2))
+        next(a for a in controller.profile('d1',0).assignments if a and a.window_id==3).pinned = True
+        controller.refresh()
+        backend.windows[3] = replace(backend.windows[3],state='minimized')
+        controller.refresh()
+        index = next(i for i,a in enumerate(controller.profile('d1',0).assignments) if a and a.window_id==3)
+        backend.foreground_hwnd = 1;backend.operations.clear()
+        controller.activate_reserved('d1',0,index)
+        self.assertEqual(backend.windows[3].state,'normal')
+        self.assertEqual(self.fronted(backend),[]);self.assertEqual(backend.foreground_hwnd,1)
+
+    def pressed(self, **state):
+        """The mouse pressed in the title bar of window 3, window 1 in front."""
+        controller,backend = self.make([record(h,f'app{h}') for h in (1,2,3)])
+        controller.start()
+        tile = backend.windows[3].rect
+        backend.z_order = [1,2,3];backend.foreground_hwnd = 1;backend.mouse_pressed = True
+        backend.cursor = (tile.right-60,tile.y+15)
+        backend.window_at = lambda point: 3
+        backend.operations.clear()
+        for name,value in state.items(): setattr(backend,name,value(tile) if callable(value) and name=='cursor' else value)
+        return controller,backend
+
+    def press(self, controller, then=None):
+        import threading
+        from unittest.mock import patch
+        with patch('smartgrid.core.controller.threading.Timer') as timer:
+            controller._enqueue_event({'type':'capture','hwnd':3})
+        if timer.called:
+            if then: then()
+            controller._activate_pressed(*timer.call_args[0][2])
+        return timer.called
+
+    def test_window_pressed_on_its_title_bar_is_activated_before_it_maximizes(self):
+        controller,backend = self.pressed()
+        self.assertTrue(self.press(controller))
+        self.assertEqual(backend.foreground_hwnd,3)
+        # In front already once maximized: nothing more.
+        backend.windows[3] = replace(backend.windows[3],state='maximized',rect=Rect(0,0,1920,1080))
+        controller._enqueue_event({'type':'location','hwnd':3})
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+
+    def test_press_activating_its_window_by_itself_is_left_to_windows(self):
+        controller,backend = self.pressed(foreground_hwnd=3)
+        self.assertFalse(self.press(controller))
+        controller,backend = self.pressed()
+        self.press(controller,lambda: setattr(backend,'foreground_hwnd',3))
+        self.assertEqual(self.fronted(backend),[])
+        controller,backend = self.pressed()
+        self.press(controller,lambda: setattr(backend,'foreground_hwnd',2))
+        self.assertEqual(self.fronted(backend),[])
+
+    def test_other_presses_never_activate_a_window(self):
+        for state in (dict(mouse_pressed=False),dict(cursor=lambda tile:(tile.right-60,tile.y+200)),
+                      dict(cursor=lambda tile:(5,tile.y-40)),dict(window_at=lambda point:1),
+                      dict(accepts_activation=lambda hwnd:False),dict(foreground_hwnd=0)):
+            controller,backend = self.pressed(**state)
+            self.press(controller)
+            self.assertEqual(self.fronted(backend),[],state)
+        for change in (lambda c: c._floating.add(3),lambda c: setattr(c,'paused',True),
+                       lambda c: c._interacting.add(1),lambda c: c._native_gestures.update({1:0})):
+            controller,backend = self.pressed();change(controller)
+            self.press(controller)
+            self.assertEqual(self.fronted(backend),[])
+        # A gesture started by this very press.
+        controller,backend = self.pressed()
+        self.press(controller,lambda: controller._native_gestures.update({3:0}))
+        self.assertEqual(self.fronted(backend),[])
+
+    def test_maximization_first_seen_by_a_rescan_comes_to_the_front_too(self):
+        controller,backend,_ = self.maximized_behind()
+        controller.refresh()
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+
+    def test_window_already_in_front_once_maximized_is_left_alone(self):
+        controller,backend,_ = self.maximized_behind(order=(3,1,2))
+        controller._handle_event({'type':'location','hwnd':3})
+        controller._recheck_front()
+        self.assertEqual(self.fronted(backend),[])
+
+    def test_window_maximizing_itself_in_the_background_stays_behind(self):
+        controller,backend,tile = self.maximized_behind(pointer=(5,5))
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[])
+        # The pointer on its content, or on another window in front of it.
+        for pointer,over in (((tile.right-60,tile.y+200),3),((tile.right-60,tile.y+15),1)):
+            controller._maximized.clear();backend.cursor = pointer
+            backend.window_at = lambda point: over
+            controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[]);self.assertIsNone(controller._raise_check)
+
+    def test_another_window_activated_meanwhile_is_not_covered(self):
+        controller,backend,_ = self.maximized_behind()
+        backend.failures.add(3)
+        controller._handle_event({'type':'location','hwnd':3})
+        backend.foreground_hwnd = 2
+        controller._recheck_front()
+        self.assertEqual(self.fronted(backend),[('activate',3)])
+
+    def test_floating_windows_and_a_stopped_grid_are_never_brought_to_the_front(self):
+        controller,backend,_ = self.maximized_behind()
+        controller._floating.add(3)
+        controller._handle_event({'type':'location','hwnd':3})
+        controller._floating.clear();controller._maximized.clear();controller.paused = True
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[])
+        # A floating window in front of it stays there on its own.
+        controller,backend,_ = self.maximized_behind(order=(1,3,2))
+        controller._floating.add(1)
+        controller._handle_event({'type':'location','hwnd':3})
+        self.assertEqual(self.fronted(backend),[])
+
     def test_launched_application_starting_maximized_goes_into_its_tile(self):
         controller,backend = self.pending_template()
         arrived = backend.add_window('slow',state='maximized');hwnd = arrived.ref.hwnd

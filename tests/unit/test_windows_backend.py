@@ -301,6 +301,82 @@ class StackAboveTests(TestCase):
         self.assertEqual(calls[0][1], 70)
 
 
+class BringToFrontTests(TestCase):
+    def backend(self, order, topmost=(), foreground=0, accepts=True, hung=False, switch=True):
+        """order: the windows front to back."""
+        from types import SimpleNamespace
+        backend = WindowsBackend.__new__(WindowsBackend)
+        state = {'foreground': foreground, 'calls': []}
+        def foreground_call(name, works):
+            def call(hwnd, *args):
+                state['calls'].append(name)
+                if works: state['foreground'] = hwnd
+                return works
+            return call
+        backend.api = SimpleNamespace(
+            GetWindow=lambda h, c: order[order.index(h)-1] if order.index(h) else None,
+            GetWindowLong=lambda h, i: 8 if h in topmost else 0,
+            IsWindow=lambda h: 1, IsHungAppWindow=lambda h: hung,
+            GetForegroundWindow=lambda: state['foreground'],
+            SetForegroundWindow=foreground_call('set', accepts),
+            SwitchToThisWindow=foreground_call('switch', switch),
+            SetWindowPos=lambda h, after, *rest: state['calls'].append((after.value, rest[-1])) or 1)
+        return backend, state
+
+    def test_windows_above_stop_at_the_always_on_top_ones(self):
+        backend, _ = self.backend([1, 2, 3, 4], topmost={1})
+        self.assertEqual(backend.windows_above(4), [3, 2])
+        self.assertEqual(backend.windows_above(2), [])
+        self.assertEqual(backend.windows_above(1), [])
+
+    def test_activation_falls_back_when_windows_refuses_the_foreground(self):
+        backend, state = self.backend([2, 1], foreground=2)
+        self.assertTrue(backend.activate(1)); self.assertEqual(state['calls'], ['set'])
+        backend, state = self.backend([2, 1], foreground=2, accepts=False)
+        self.assertTrue(backend.activate(1)); self.assertEqual(state['calls'], ['set', 'switch'])
+        backend, state = self.backend([2, 1], foreground=2, accepts=False, switch=False)
+        self.assertFalse(backend.activate(1))
+        backend, state = self.backend([2, 1], foreground=1)
+        self.assertTrue(backend.activate(1)); self.assertEqual(state['calls'], [])
+
+    def test_raising_never_leaves_a_window_always_on_top_nor_activates_it(self):
+        backend, state = self.backend([2, 1], foreground=2)
+        self.assertTrue(backend.raise_window(1))
+        unsigned = 2 ** (8 * C.sizeof(C.c_void_p))
+        self.assertEqual([c[0] for c in state['calls']], [unsigned-1, unsigned-2])
+        for _, flags in state['calls']:
+            self.assertEqual(flags & 0x13, 0x13)
+        self.assertEqual(state['foreground'], 2)
+
+    def test_window_minimized_while_maximized_is_made_foreground_before_it_is_restored(self):
+        for flags, iconic, expected in ((2, True, ['set', 9]), (0, True, []), (2, False, [])):
+            backend, state = self.backend([2, 1], foreground=2)
+            shown = {'iconic': iconic}
+            def placement(hwnd, pointer):
+                C.cast(pointer, C.POINTER(WINDOWPLACEMENT)).contents.flags = flags
+                return 1
+            def show(hwnd, command):
+                state['calls'].append(command);shown['iconic'] = False
+            backend.api.GetWindowPlacement, backend.api.ShowWindowAsync = placement, show
+            backend.api.IsIconic = lambda h: shown['iconic']
+            backend.api.IsZoomed = lambda h: not shown['iconic']
+            self.assertEqual(backend.recall_maximized(1), bool(expected))
+            self.assertEqual(state['calls'], expected)
+
+    def test_disabled_and_never_activated_windows_are_told(self):
+        for style, exstyle, expected in ((0x14cf0000, 0, True), (0x1ccf0000, 0, False), (0x14cf0000, 0x08000000, False)):
+            backend, _ = self.backend([1])
+            backend.api.GetWindowLong = lambda h, i: style if i == -16 else exstyle
+            self.assertEqual(backend.accepts_activation(1), expected)
+
+    def test_a_hung_or_always_on_top_window_is_left_alone(self):
+        backend, state = self.backend([2, 1], foreground=2, hung=True)
+        self.assertFalse(backend.activate(1)); self.assertFalse(backend.raise_window(1))
+        backend, state2 = self.backend([2, 1], topmost={1})
+        self.assertFalse(backend.raise_window(1))
+        self.assertEqual(state['calls'] + state2['calls'], [])
+
+
 class ForcedResizeTests(TestCase):
     def test_fixed_size_window_gets_a_resizable_frame(self):
         from types import SimpleNamespace

@@ -28,6 +28,10 @@ FORCED_MINIMUM = (160, 120)
 # it), and of the wait for windows landing at the release.
 PREVIEW_INTERVAL = .008
 
+# Height of a title bar with its buttons, in logical pixels, with some margin
+# for those drawn by applications.
+TITLE_BAR = 56
+
 DEFAULT_HOTKEYS = {
     "toggle": "Ctrl+Alt+T", "arrange": "Ctrl+Alt+R", "studio": "Ctrl+Alt+P",
     "quick_switcher": "Ctrl+Alt+L", "swap": "Ctrl+Alt+S", "float": "Ctrl+Alt+F",
@@ -163,6 +167,14 @@ class Controller:
         # a window that never stays in its tile is left alone until placed again.
         self._guard_fixed = {}
         self._guard_released = set()
+        # Tiled windows maximized: how, as the event told, and whether handled.
+        self._maximized = {}
+        # The one to check again: (hwnd, foreground before, steps left, since,
+        # whether it has had the foreground).
+        self._raise_check = None
+        # The window just raised, when to make sure it is not always on top,
+        # and how many more times.
+        self._topmost_check = None
         # Windows in a native move or resize (start time), known as soon as
         # Windows reports it: the guard never clamps a window the user has
         # just grabbed, even before the runtime has handled the gesture.
@@ -535,6 +547,7 @@ class Controller:
                 self._originals.pop(hwnd, None)
                 self._tile_rects.pop(hwnd, None)
                 self._guard_fixed.pop(hwnd, None);self._guard_released.discard(hwnd)
+                self._maximized.pop(hwnd, None)
                 self._free_moving.discard(hwnd)
                 self._floating.discard(hwnd)
                 self._late_unmanaged.discard(hwnd)
@@ -561,6 +574,14 @@ class Controller:
                                    'eligible' if self._eligible(live[h]) else live[h].exclusion_reason or 'excluded') for h in flipped})
             for hwnd, window in live.items():
                 old = previous.get(hwnd)
+                if window.state == "normal":
+                    if hwnd in self._maximized and not getattr(self.backend, "is_maximized", lambda h: False)(hwnd):
+                        self._maximized.pop(hwnd, None)
+                elif window.state == "maximized" and old and old.state == "normal":
+                    # Its own event may be late or lost.
+                    self._front_maximized(hwnd)
+                elif window.state == "maximized":
+                    self._maximized.setdefault(hwnd, {"handled": True})["handled"] = True
                 if old and window.state != old.state:
                     changed = True
                     states[hwnd] = (old.state, window.state)
@@ -630,8 +651,27 @@ class Controller:
             self._native_gestures[event["hwnd"]] = time.monotonic()
         elif kind in ("move_end", "resize_end", "movesize_end", "destroyed"):
             self._native_gestures.pop(event.get("hwnd"), None)
+        if kind == "capture":
+            try:
+                self._press_in(event.get("hwnd"))
+            except Exception:
+                log.exception("Mouse press could not be read")
+            return
         if event.get("type") in ("location", "location_change") and event.get("hwnd"):
             self._notify_follow(event["hwnd"])
+            if event["hwnd"] in self._tile_rects:
+                try:
+                    self._note_maximized(event["hwnd"])
+                    note = self._maximized.get(event["hwnd"])
+                    # Brought to the front from here too, before the queue: its
+                    # neighbours are seen in front of it until then.
+                    if note and not note["handled"] and note["by_hand"] and self._lock.acquire(blocking=False):
+                        try:
+                            self._front_maximized(event["hwnd"])
+                        finally:
+                            self._lock.release()
+                except Exception:
+                    log.exception("Maximized window could not be read")
             # A tiled window resizing itself is clamped from here, before the
             # queue, when nothing else holds the runtime (no arrangement, rescan
             # or gesture handling); otherwise the queued event clamps it.
@@ -668,6 +708,18 @@ class Controller:
                 except Exception:
                     log.exception("Slot guard failed")
             self._end_stale_gestures()
+            if self._raise_check is not None and time.monotonic() >= self._raise_check[3] + self._raise_check[2][0]:
+                try:
+                    self._recheck_front()
+                except Exception:
+                    self._raise_check = None
+                    log.exception("Maximized window could not be checked")
+            if self._topmost_check is not None and time.monotonic() >= self._topmost_check[1]:
+                try:
+                    self._recheck_topmost()
+                except Exception:
+                    self._topmost_check = None
+                    log.exception("Raised window could not be checked")
             if self._cursor_clip is not None and (not self._interacting or time.monotonic() - self._clip_since > 120):
                 # Never a pointer trapped without a gesture.
                 with self._lock:
@@ -781,6 +833,174 @@ class Controller:
                                            retries=1, force=True)
             for hwnd in [h for h in self._guard_fixed if now - self._guard_fixed[h][-1] > 3]:
                 self._guard_fixed.pop(hwnd)
+
+    def _pressed_behind(self, hwnd):
+        """The foreground window, when the mouse is pressed in the title bar of
+        another one, tiled and in its normal state; None otherwise."""
+        backend, window, tile = self.backend, self._window(hwnd), self._tile_rects.get(hwnd)
+        if (not window or not tile or window.state != "normal" or not self._is_tiled(hwnd)
+                or self._interacting or self._native_gestures or self._swap_snapshot is not None
+                or not getattr(backend, "desktop_known", True)
+                or backend.is_maximized(hwnd) or backend.is_minimized(hwnd) or not backend.accepts_activation(hwnd)):
+            return None
+        foreground, pointer, rect = backend.foreground(), self._pointer(), backend.window_rect(hwnd)
+        display = next((d for d in self.displays if d.id == tile[0]), None)
+        if (not foreground or foreground == hwnd or not pointer or not rect or not display or not rect.contains(*pointer)
+                or pointer[1] - rect.y > TITLE_BAR * display.dpi / 96 or backend.window_at(pointer) != hwnd):
+            return None
+        return foreground
+
+    def _press_in(self, hwnd):
+        """The mouse just pressed in a window. Windows activates a window at the
+        press; the buttons some applications draw (GitHub Copilot) do not let
+        it, and their window was seen maximizing behind its neighbours. Checked
+        a moment later, for Windows to do it first."""
+        if hwnd not in self._tile_rects or not hasattr(self.backend, "accepts_activation"):
+            return
+        if not getattr(self.backend, "mouse_down", lambda: False)():
+            return
+        # Only read here, on the event thread; the rest under the lock.
+        foreground = self.backend.foreground()
+        if not foreground or foreground == hwnd:
+            return
+        timer = threading.Timer(.02, self._activate_pressed, (hwnd, foreground))
+        timer.daemon = True
+        timer.start()
+
+    def _activate_pressed(self, hwnd, before):
+        try:
+            # A busy runtime is not waited for past the click.
+            if self._stop_event.is_set() or not self._lock.acquire(timeout=.1):
+                return
+            try:
+                if not self._stop_event.is_set() and self._pressed_behind(hwnd) == before:
+                    accepted = self.backend.activate(hwnd)
+                    log.info("Pressed %s was not activated: activated (%s, foreground was %s)", hwnd,
+                             "accepted" if accepted else "refused", before)
+            finally:
+                self._lock.release()
+        except Exception:
+            log.exception("Pressed window could not be activated")
+
+    def _note_maximized(self, hwnd):
+        """Read as soon as a tiled window is maximized, on the event thread: the
+        runtime may handle it later, the pointer gone. By hand when the pointer
+        is where the title bar of its tile was: an application maximizing
+        itself in the background is left where it is."""
+        if not getattr(self.backend, "is_maximized", lambda h: False)(hwnd):
+            self._maximized.pop(hwnd, None)
+            return
+        if hwnd in self._maximized or not hasattr(self.backend, "windows_above"):
+            return
+        tile, window, pointer = self._tile_rects.get(hwnd), self._window(hwnd), self._pointer()
+        display = next((d for d in self.displays if tile and d.id == tile[0]), None)
+        by_hand = False
+        if tile and display and pointer and hwnd not in self._interacting and hwnd not in self._native_gestures:
+            # A window kept at its minimum size overflows its tile.
+            rects = [tile[1]] + ([window.rect] if window and window.state == "normal" else [])
+            by_hand = self.backend.window_at(pointer) == hwnd and any(
+                r.contains(*pointer) and pointer[1] - r.y <= TITLE_BAR * display.dpi / 96 for r in rects)
+        # Never over a note the other thread has just taken.
+        self._maximized.setdefault(hwnd, {"by_hand": by_hand, "time": time.monotonic(), "handled": False,
+                                          "foreground": self.backend.foreground()})
+
+    def _covering(self, hwnd):
+        """The tiled windows of its display in front of a tiled window, still
+        maximized; none when it is not to be brought to the front."""
+        tile = self._tile_rects.get(hwnd)
+        if (not tile or self._swap_snapshot is not None or not getattr(self.backend, "desktop_known", True)
+                or not self._is_tiled(hwnd) or not self.backend.is_maximized(hwnd)):
+            return []
+        tiled = {w.ref.hwnd for w in self.windows if w.display_id == tile[0] and w.state == "normal"
+                 and self._is_tiled(w.ref.hwnd)}
+        return [h for h in self.backend.windows_above(hwnd) if h in tiled]
+
+    def _front_maximized(self, hwnd):
+        """A tiled window maximized from its own title bar comes to the front.
+        Windows raises a window on the click that activates it, but an
+        application drawing its own buttons (GitHub Copilot) may be maximized
+        without being raised: its neighbours stayed in front of it."""
+        self._note_maximized(hwnd)
+        note = self._maximized.get(hwnd)
+        if not note or note["handled"]:
+            return
+        if self._interacting and hwnd not in self._interacting:
+            # Another window is held: at the rescan that follows its release.
+            return
+        # Once per maximization: by a drag to the top of the screen, it is not
+        # brought to the front at a later event either.
+        note["handled"] = True
+        if not note["by_hand"] or hwnd in self._interacting or time.monotonic() - note["time"] > 2:
+            return
+        before = note["foreground"]
+        foreground = self.backend.foreground()
+        if foreground and foreground not in (hwnd, before):
+            return  # Another window was activated since.
+        covering = self._covering(hwnd)
+        if covering:
+            if foreground == hwnd:
+                self._raise_covered(hwnd, covering)
+            else:
+                accepted = self.backend.activate(hwnd)
+                log.info("Maximized %s was left behind %s: activated after %.0f ms (%s, foreground was %s)", hwnd, covering,
+                         (time.monotonic() - note["time"]) * 1000, "accepted" if accepted else "refused", foreground)
+        self._raise_check = (hwnd, before, (.2, .5, 1.0), time.monotonic(), self.backend.foreground() == hwnd)
+
+    def _front_recalled(self, hwnd, before):
+        """The window of a clicked card, minimized while maximized, comes back
+        maximized and shown without being activated: the windows used meanwhile
+        stayed in front of it."""
+        if not hasattr(self.backend, "windows_above") or not self.backend.is_maximized(hwnd):
+            return
+        # Not once more for its own event.
+        self._maximized[hwnd] = {"handled": True}
+        accepted = self.backend.activate(hwnd)
+        log.info("Recalled %s is maximized: activated (%s, foreground was %s)", hwnd,
+                 "accepted" if accepted else "refused", before)
+        self._raise_check = (hwnd, before, (.2, .5, 1.0), time.monotonic(), accepted)
+
+    def _raise_covered(self, hwnd, covering):
+        raised = self.backend.raise_window(hwnd)
+        self._topmost_check = (hwnd, time.monotonic() + .2, 10)
+        log.info("Maximized %s active but behind %s: raised (%s)", hwnd, covering, "accepted" if raised else "refused")
+
+    def _recheck_front(self):
+        """Active but still behind a moment later: raised. Never when the
+        keyboard is in another window, which it would cover, nor once another
+        window was activated."""
+        with self._lock:
+            hwnd, before, steps, since, active = self._raise_check
+            self._raise_check = None
+            foreground = self.backend.foreground()
+            if self._interacting or foreground and foreground != hwnd and (active or foreground != before):
+                return
+            covering = self._covering(hwnd)
+            if covering and foreground == hwnd:
+                self._raise_covered(hwnd, covering)
+            elif covering and foreground and (len(steps) == 3 or self._pointer() and
+                                              self.backend.window_at(self._pointer()) == hwnd):
+                # Refused the first time (seen with Copilot): asked again, the
+                # foreground has not changed since the click. Later, only with
+                # the pointer still on it: gone to a tile, the user gave up.
+                active = accepted = self.backend.activate(hwnd)
+                log.info("Maximized %s still behind %s, foreground is %s: activated again (%s)", hwnd, covering, foreground,
+                         "accepted" if accepted else "refused")
+            if steps[1:] and self.backend.is_maximized(hwnd):
+                self._raise_check = (hwnd, before, steps[1:], since, active or foreground == hwnd)
+
+    def _recheck_topmost(self):
+        """Windows handles the two requests of raise_window later, in the
+        window's own thread: read again that it is back to normal."""
+        with self._lock:
+            hwnd, _, tries = self._topmost_check
+            self._topmost_check = None
+            if self.backend.alive(hwnd) and self.backend.is_topmost(hwnd):
+                self.backend.drop_topmost(hwnd)
+                # A window that does not answer handles it once it does.
+                self._topmost_check = (hwnd, time.monotonic() + .5, tries - 1) if tries > 1 else None
+                log.warning("Raised %s was left always on top: put back", hwnd)
+                if not self._topmost_check:
+                    log.error("Raised %s does not answer: still always on top", hwnd)
 
     def _guard_cooldown(self, hwnd, now):
         """Corrected again at once, unless the window keeps growing back
@@ -987,6 +1207,7 @@ class Controller:
             if kind in ("location", "location_change") and hwnd in self._tile_rects:
                 # A tiled window resizing itself goes back before anything else.
                 self._guard_slots(only=hwnd)
+                self._front_maximized(hwnd)
             # While a window is dragged nothing is rescanned: a rescan holds the
             # runtime and the images stop. Lifecycle events are kept for the
             # release.
@@ -2781,13 +3002,18 @@ class Controller:
                 window = self._free_window(assignment.app_id, display_id, here)
                 if window:
                     assignment.window_id = window.ref.hwnd
-            if assignment.window_id:
-                self._floating.discard(assignment.window_id)
-                self._manual_minimized.discard(assignment.window_id)
-                self.backend.show(assignment.window_id)
+            recalled, before = assignment.window_id, getattr(self.backend, "foreground", lambda: None)()
+            if recalled:
+                self._floating.discard(recalled)
+                self._manual_minimized.discard(recalled)
+                # One minimized while maximized comes back in front at once.
+                if not getattr(self.backend, "recall_maximized", lambda h: False)(recalled):
+                    self.backend.show(recalled)
             if not self.apps:
                 self.refresh_apps()
             self._apply_profile(profile, launch_missing=opens, launch_only=index)
+            if recalled:
+                self._front_recalled(recalled, before)
             self._save()
             self._notify()
 

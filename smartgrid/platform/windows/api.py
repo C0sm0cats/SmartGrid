@@ -73,7 +73,7 @@ class Win32:
                 'SetWindowPos': (BOOL, [HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
                 'BeginDeferWindowPos': (HANDLE, [C.c_int]), 'EndDeferWindowPos': (BOOL, [HANDLE]),
                 'DeferWindowPos': (HANDLE, [HANDLE, HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
-                'ShowWindowAsync': (BOOL, [HWND, C.c_int]), 'SetForegroundWindow': (BOOL, [HWND]), 'GetForegroundWindow': (HWND, []),
+                'ShowWindowAsync': (BOOL, [HWND, C.c_int]), 'SetForegroundWindow': (BOOL, [HWND]), 'GetForegroundWindow': (HWND, []), 'WindowFromPoint': (HWND, [POINT]),
                 'PostMessageW': (BOOL, [HWND, UINT, WPARAM, LPARAM]),
                 'SendMessageTimeoutW': (LRESULT, [HWND, UINT, WPARAM, LPARAM, UINT, UINT, p(ULONG_PTR)]),
                 'SetWinEventHook': (HANDLE, [DWORD, DWORD, HANDLE, WINEVENTPROC, DWORD, DWORD, DWORD]), 'UnhookWinEvent': (BOOL, [HANDLE]),
@@ -116,7 +116,7 @@ class Win32:
             fn.restype = C.c_ssize_t if C.sizeof(C.c_void_p) == 8 else LONG
             fn.argtypes = [HWND, C.c_int] + ([fn.restype] if base == 'SetWindowLong' else [])
             setattr(self, base, fn)
-        for name, result, args in [('SetProcessDpiAwarenessContext', BOOL, [HANDLE]), ('SetThreadDpiAwarenessContext', HANDLE, [HANDLE]), ('GetDpiForWindow', UINT, [HWND]),
+        for name, result, args in [('SwitchToThisWindow', None, [HWND, BOOL]), ('SetProcessDpiAwarenessContext', BOOL, [HANDLE]), ('SetThreadDpiAwarenessContext', HANDLE, [HANDLE]), ('GetDpiForWindow', UINT, [HWND]),
                                     ('GetWindowDpiAwarenessContext', HANDLE, [HWND]), ('GetDpiFromDpiAwarenessContext', UINT, [HANDLE])]:
             fn = getattr(self.user32, name, None)
             if fn is not None:

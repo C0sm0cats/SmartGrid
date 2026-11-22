@@ -723,6 +723,87 @@ class WindowsBackend:
     def foreground(self):
         return int(self.api.GetForegroundWindow() or 0)
 
+    @physical
+    def window_at(self, point):
+        """The top-level window under a point (physical coordinates)."""
+        hwnd = self.api.WindowFromPoint(POINT(*point))
+        return int(self.api.GetAncestor(hwnd, 2) or hwnd) if hwnd else 0  # GA_ROOT
+
+    def windows_above(self, hwnd):
+        """The windows above hwnd in the Z order; none when it is always on top.
+        Always-on-top windows are above by design and left out."""
+        found = []
+        if self.api.GetWindowLong(hwnd, -20) & 0x00000008:  # WS_EX_TOPMOST
+            return found
+        current = hwnd
+        for _ in range(2000):
+            current = self.api.GetWindow(current, 3)  # GW_HWNDPREV
+            if not current or self.api.GetWindowLong(current, -20) & 0x00000008:
+                break
+            found.append(int(current))
+        return found
+
+    def accepts_activation(self, hwnd):
+        """Neither disabled (a dialog of its own is open: WS_DISABLED) nor made
+        never to be activated (WS_EX_NOACTIVATE)."""
+        return bool(self.alive(hwnd) and not self.api.GetWindowLong(hwnd, -16) & 0x08000000
+                    and not self.api.GetWindowLong(hwnd, -20) & 0x08000000)
+
+    def activate(self, hwnd):
+        """Give the foreground to a window without changing its state: focus()
+        restores a maximized one. True when Windows accepted at once."""
+        if not self.alive(hwnd) or self._hung(hwnd):
+            return False
+        if self.foreground() != hwnd:
+            self.api.SetForegroundWindow(hwnd)
+        if self.foreground() != hwnd and self.api.SwitchToThisWindow:
+            # Windows may refuse the call above to a background process.
+            self.api.SwitchToThisWindow(hwnd, True)
+        return self.foreground() == hwnd
+
+    def recall_maximized(self, hwnd):
+        """Bring back a window minimized while maximized: made the foreground
+        one first, then restored, so that it appears in front at once. False,
+        and nothing done, for any other window."""
+        placement = WINDOWPLACEMENT()
+        placement.length = C.sizeof(placement)
+        # WPF_RESTORETOMAXIMIZED
+        if (not self.alive(hwnd) or self._hung(hwnd) or not self.api.IsIconic(hwnd)
+                or not self.api.GetWindowPlacement(hwnd, C.byref(placement)) or not placement.flags & 2):
+            return False
+        self.api.SetForegroundWindow(hwnd)
+        self.api.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
+        deadline = time.monotonic() + .5
+        while self.alive(hwnd) and time.monotonic() < deadline:
+            if self.api.IsZoomed(hwnd) and not self.api.IsIconic(hwnd):
+                break
+            time.sleep(.01)
+        return True
+
+    def raise_window(self, hwnd):
+        """Put a window above the other normal ones, without activating, moving
+        or resizing it. HWND_TOP is not honoured for a window of a background
+        process; always on top then back to normal is. Both requests are
+        handled in order by the window's own thread."""
+        if not self.alive(hwnd) or self._hung(hwnd) or self.is_topmost(hwnd):
+            return False
+        # SWP_ASYNCWINDOWPOS|SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE|SWP_NOOWNERZORDER
+        flags = 0x4000 | 0x0002 | 0x0001 | 0x0010 | 0x0200
+        if not self.api.SetWindowPos(hwnd, C.c_void_p(-1), 0, 0, 0, 0, flags):  # HWND_TOPMOST
+            return False
+        return self.drop_topmost(hwnd)
+
+    def is_topmost(self, hwnd):
+        return bool(self.api.GetWindowLong(hwnd, -20) & 0x00000008)  # WS_EX_TOPMOST
+
+    def drop_topmost(self, hwnd):
+        """HWND_NOTOPMOST, asked once more if refused."""
+        return any(self.api.SetWindowPos(hwnd, C.c_void_p(-2), 0, 0, 0, 0, 0x4000 | 0x0213) for _ in range(2))
+
+    def _hung(self, hwnd):
+        hung = getattr(self.api, 'IsHungAppWindow', None)
+        return bool(hung and hung(hwnd))
+
     def maximize(self, hwnd):
         return bool(self.alive(hwnd) and self.api.ShowWindowAsync(hwnd,3))
 
@@ -790,7 +871,7 @@ class WindowsBackend:
                 return None
             self._events = MessageThread(self.api, 'SmartGrid WinEvents', window_message)
             def install():
-                event_types = {0x8000:'created', 0x8001:'destroyed', 0x8002:'shown', 0x8003:'hidden', 0x800b:'location', 0x800c:'title', 3:'foreground', 0xa:'move_start', 0xb:'move_end', 0x16:'minimized', 0x17:'restored'}
+                event_types = {0x8000:'created', 0x8001:'destroyed', 0x8002:'shown', 0x8003:'hidden', 0x800b:'location', 0x800c:'title', 3:'foreground', 8:'capture', 0xa:'move_start', 0xb:'move_end', 0x16:'minimized', 0x17:'restored'}
                 def event_proc(hook, event, hwnd, object_id, child_id, thread_id, event_time):
                     if not hwnd or (event >= 0x8000 and (object_id != 0 or child_id != 0)):
                         return
@@ -799,6 +880,9 @@ class WindowsBackend:
                         # resized (dozens per step): nothing to follow there.
                         return
                     payload = {'type':event_types.get(event, 'changed'), 'hwnd':int(hwnd), 'native_time':event_time}
+                    if event == 8:
+                        # The mouse pressed in a window, or in one of its children.
+                        payload['hwnd'] = int(self.api.GetAncestor(hwnd, 2) or hwnd)
                     if event == 0xa:
                         # The window and the pointer as the gesture starts,
                         # before the runtime handles it.

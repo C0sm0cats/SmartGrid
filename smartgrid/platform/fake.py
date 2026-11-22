@@ -25,6 +25,9 @@ class FakeBackend:
         self.launches = []
         self.auto_launch = True
         self.stopped = False
+        # Front to back; only the windows a test stacks.
+        self.z_order = []
+        self.topmost = set()
         self.foreground_hwnd = next(iter(self.windows), 0)
         self.last_result = None
         self._generation = 0
@@ -149,6 +152,44 @@ class FakeBackend:
 
     def foreground(self):
         return self.foreground_hwnd
+
+    def window_at(self, point):
+        """The frontmost window under the point, as the Z order tells."""
+        for hwnd in self.z_order + [h for h in self.windows if h not in self.z_order]:
+            window = self.windows.get(hwnd)
+            if window and window.state == 'maximized' or window and window.state == 'normal' and window.rect.contains(*point):
+                return hwnd
+        return 0
+
+    def windows_above(self, hwnd):
+        return self.z_order[:self.z_order.index(hwnd)] if hwnd in self.z_order else []
+
+    def _to_front(self, hwnd):
+        self.z_order = [hwnd] + [h for h in self.z_order if h != hwnd]
+
+    def accepts_activation(self, hwnd):
+        return hwnd in self.windows
+
+    def activate(self, hwnd):
+        self.operations.append(('activate', hwnd))
+        if hwnd in self.failures:
+            return False
+        self.foreground_hwnd = hwnd
+        self._to_front(hwnd)
+        return True
+
+    def is_topmost(self, hwnd):
+        return hwnd in self.topmost
+
+    def drop_topmost(self, hwnd):
+        self.topmost.discard(hwnd)
+        self.operations.append(('drop_topmost', hwnd))
+        return True
+
+    def raise_window(self, hwnd):
+        self.operations.append(('raise', hwnd))
+        self._to_front(hwnd)
+        return True
 
     def maximize(self, hwnd):
         if not self.alive(hwnd) or hwnd in self.failures:
