@@ -28,6 +28,8 @@ class FakeBackend:
         # Front to back; only the windows a test stacks.
         self.z_order = []
         self.topmost = set()
+        # Windows minimized while maximized come back maximized.
+        self.restore_maximized = set()
         self.foreground_hwnd = next(iter(self.windows), 0)
         self.last_result = None
         self._generation = 0
@@ -145,7 +147,7 @@ class FakeBackend:
     def show(self, hwnd):
         if not self.alive(hwnd) or hwnd in self.failures:
             return False
-        self.windows[hwnd] = replace(self.windows[hwnd], state='normal')
+        self.windows[hwnd] = replace(self.windows[hwnd], state='maximized' if self.returns_maximized(hwnd) else 'normal')
         self.operations.append(('show', hwnd))
         self.emit('restored', hwnd)
         return True
@@ -166,6 +168,18 @@ class FakeBackend:
 
     def _to_front(self, hwnd):
         self.z_order = [hwnd] + [h for h in self.z_order if h != hwnd]
+
+    def returns_maximized(self, hwnd):
+        return self.alive(hwnd) and self.windows[hwnd].state == 'minimized' and hwnd in self.restore_maximized
+
+    def recall_maximized(self, hwnd):
+        if not self.returns_maximized(hwnd):
+            return False
+        self.windows[hwnd] = replace(self.windows[hwnd], state='maximized')
+        self.operations.append(('recall', hwnd))
+        self.foreground_hwnd = hwnd
+        self._to_front(hwnd)
+        return True
 
     def accepts_activation(self, hwnd):
         return hwnd in self.windows

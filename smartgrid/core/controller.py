@@ -172,6 +172,8 @@ class Controller:
         # The one to check again: (hwnd, foreground before, steps left, since,
         # whether it has had the foreground).
         self._raise_check = None
+        # The window in front as each space was left.
+        self._space_front = {}
         # The window just raised, when to make sure it is not always on top,
         # and how many more times.
         self._topmost_check = None
@@ -947,8 +949,8 @@ class Controller:
         self._raise_check = (hwnd, before, (.2, .5, 1.0), time.monotonic(), self.backend.foreground() == hwnd)
 
     def _front_recalled(self, hwnd, before):
-        """The window of a clicked card, minimized while maximized, comes back
-        maximized and shown without being activated: the windows used meanwhile
+        """The window of a clicked card or of a space shown again, minimized while
+        maximized, comes back maximized and shown without being activated: the windows used meanwhile
         stayed in front of it."""
         if not hasattr(self.backend, "windows_above") or not self.backend.is_maximized(hwnd):
             return
@@ -1853,6 +1855,8 @@ class Controller:
                 return
             self.refresh(auto=False)
             self.history.push(self._snapshot())
+            # Read before anything is minimized: Windows then activates another.
+            foreground = getattr(self.backend, "foreground", lambda: None)()
             old, new = self.profile(display_id, old_space), self.profile(display_id, space)
             old_ids = {a.window_id for a in old.assignments if a and a.window_id}
             new.assignments = self._resolve_assignments(new)
@@ -1864,13 +1868,39 @@ class Controller:
                     if self.backend.minimize(hwnd):
                         self._parked.add(hwnd)
             self.active_spaces[display_id] = space
-            for hwnd in new_ids:
-                if hwnd in self._parked and hwnd not in self._manual_minimized:
+            left = {h for h in old_ids - new_ids if h in self._parked}
+            self._space_front[(display_id, old_space)] = foreground if foreground in old_ids else None
+            returning = [a.window_id for a in new.assignments if a and a.window_id in self._parked
+                         and a.window_id not in self._manual_minimized]
+            # The one coming back maximized last, in front of the others; of
+            # several, the one in front as the space was left.
+            returns = getattr(self.backend, "returns_maximized", lambda h: False)
+            maximized = {h for h in returning if returns(h)}
+            front = self._space_front.get((display_id, space))
+            # Left with one of its tiles in front of it: not brought in front.
+            behind = front in returning and front not in maximized
+            returning.sort(key=lambda h: ((h in maximized) != behind, h == front))
+            last = returning[-1] if maximized and not behind else None
+            here = self._window(foreground) if foreground else None
+            # The window the user works in (in both spaces, floating, excluded)
+            # keeps the keyboard and stays in front; on another display it
+            # keeps the keyboard only. One of the space left is minimized now.
+            activates = (not foreground or foreground in left
+                         or getattr(self.backend, "is_shell_surface", lambda h: False)(foreground))
+            elsewhere = bool(not activates and here and here.display_id != display_id)
+            for hwnd in returning:
+                if hwnd != last or not activates or not self.backend.recall_maximized(hwnd):
                     self.backend.show(hwnd)
-                    self._parked.discard(hwnd)
+                self._parked.discard(hwnd)
             self.refresh(auto=False)
             if self.running and not self.paused:
                 self._apply_profile(new)
+            if last and elsewhere and self.backend.is_maximized(last):
+                covering = self._covering(last)
+                if covering:
+                    self._raise_covered(last, covering)
+            elif last and activates:
+                self._front_recalled(last, self.backend.foreground())
             self._save()
             self.space_event = (display_id, space, time.monotonic())
             index = next((i for i, d in enumerate(self.displays) if d.id == display_id), 0)

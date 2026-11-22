@@ -1246,6 +1246,97 @@ class ControllerReviewTests(unittest.TestCase):
         self.assertEqual(backend.windows[3].state,'normal')
         self.assertEqual(self.fronted(backend),[]);self.assertEqual(backend.foreground_hwnd,1)
 
+    def spaces(self, shared=False, windows=(1,2,3)):
+        """Windows 1 to 3 in space 1, 3 maximized in front of them; left for
+        space 2, where window 1 is too when shared."""
+        controller,backend = self.make([record(h,f'app{h}') for h in windows])
+        controller.start()
+        if shared:
+            controller.profiles[('d1',1)] = SpaceProfile('d1',1,assignments=[Assignment('app1',1)])
+        backend.windows[3] = replace(backend.windows[3],state='maximized')
+        backend.restore_maximized.add(3);backend.foreground_hwnd = 3;backend.z_order = [3,1,2]
+        controller.refresh()
+        controller.switch_space('d1',1)
+        self.assertEqual(backend.windows[3].state,'minimized')
+        backend.z_order = [1,2,3];backend.foreground_hwnd = 0
+        backend.operations.clear()
+        return controller,backend
+
+    def test_window_maximized_in_a_space_comes_back_in_front_of_its_tiles(self):
+        controller,backend = self.spaces()
+        controller.switch_space('d1',0)
+        self.assertEqual(backend.windows[3].state,'maximized')
+        self.assertEqual(backend.foreground_hwnd,3);self.assertEqual(backend.z_order[0],3)
+        shown = [o for o in backend.operations if o[0] in ('show','recall')]
+        self.assertEqual(shown[-1],('recall',3));self.assertEqual({o[1] for o in shown},{1,2,3})
+
+    def test_window_shared_by_both_spaces_and_not_in_use_does_not_cover_it(self):
+        controller,backend = self.spaces(shared=True)
+        controller.switch_space('d1',0)
+        self.assertEqual(backend.foreground_hwnd,3);self.assertEqual(backend.z_order[0],3)
+
+    def test_window_in_use_in_both_spaces_keeps_the_keyboard_and_the_front(self):
+        controller,backend = self.spaces(shared=True)
+        backend.foreground_hwnd = 1
+        controller.switch_space('d1',0)
+        self.assertEqual(backend.foreground_hwnd,1);self.assertEqual(self.fronted(backend),[])
+        self.assertNotIn(('recall',3),backend.operations)
+
+    def test_floating_or_unknown_window_in_use_is_not_covered_by_a_space_switch(self):
+        for hwnd in (8,77):
+            controller,backend = self.spaces()
+            if hwnd == 8:
+                backend.windows[8] = record(8,'note');controller._floating.add(8)
+            backend.foreground_hwnd = hwnd
+            controller.switch_space('d1',0)
+            self.assertEqual(backend.foreground_hwnd,hwnd);self.assertEqual(self.fronted(backend),[])
+            self.assertNotIn(('recall',3),backend.operations)
+            controller.stop()
+
+    def test_space_switched_from_a_window_of_the_space_left_or_the_tray_menu(self):
+        for shell in (False,True):
+            controller,backend = self.spaces()
+            backend.windows[4] = record(4,'app4');controller.refresh()
+            self.assertTrue(controller._is_tiled(4))
+            backend.foreground_hwnd = 66 if shell else 4
+            backend.is_shell_surface = lambda hwnd: hwnd == 66
+            controller.switch_space('d1',0)
+            self.assertEqual(backend.foreground_hwnd,3);self.assertEqual(backend.z_order[0],3)
+            controller.stop()
+
+    def test_space_left_with_a_tile_in_front_of_the_maximized_window(self):
+        controller,backend = self.spaces()
+        controller._space_front[('d1',0)] = 1
+        controller.switch_space('d1',0)
+        self.assertNotIn(('recall',3),backend.operations);self.assertEqual(self.fronted(backend),[])
+        self.assertEqual([o[1] for o in backend.operations if o[0]=='show'][-1],1)
+
+    def test_space_shown_from_another_display_does_not_take_the_keyboard(self):
+        controller,backend = self.spaces()
+        backend.windows[9] = record(9,'other','d2');backend.foreground_hwnd = 9
+        controller.switch_space('d1',0)
+        self.assertEqual(backend.foreground_hwnd,9)
+        self.assertEqual(self.fronted(backend),[('raise',3)]);self.assertEqual(backend.z_order[0],3)
+
+    def test_of_two_maximized_windows_the_one_in_front_comes_back_in_front(self):
+        for front in (2,3):
+            controller,backend = self.make([record(h,f'app{h}') for h in (1,2,3)])
+            controller.start()
+            for h in (2,3):
+                backend.windows[h] = replace(backend.windows[h],state='maximized');backend.restore_maximized.add(h)
+            backend.foreground_hwnd = front;controller.refresh()
+            controller.switch_space('d1',1);backend.foreground_hwnd = 0
+            controller.switch_space('d1',0)
+            self.assertEqual(backend.foreground_hwnd,front)
+            controller.stop()
+
+    def test_space_without_a_maximized_window_gives_no_focus(self):
+        controller,backend = self.make([record(h,f'app{h}') for h in (1,2)])
+        controller.start();controller.switch_space('d1',1)
+        backend.foreground_hwnd = 0;backend.operations.clear()
+        controller.switch_space('d1',0)
+        self.assertEqual(backend.foreground_hwnd,0);self.assertEqual(self.fronted(backend),[])
+
     def pressed(self, **state):
         """The mouse pressed in the title bar of window 3, window 1 in front."""
         controller,backend = self.make([record(h,f'app{h}') for h in (1,2,3)])

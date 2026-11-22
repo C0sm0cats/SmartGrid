@@ -761,15 +761,18 @@ class WindowsBackend:
             self.api.SwitchToThisWindow(hwnd, True)
         return self.foreground() == hwnd
 
+    def returns_maximized(self, hwnd):
+        """Minimized while maximized: Windows brings it back maximized."""
+        placement = WINDOWPLACEMENT()
+        placement.length = C.sizeof(placement)
+        return bool(self.alive(hwnd) and self.api.IsIconic(hwnd)
+                    and self.api.GetWindowPlacement(hwnd, C.byref(placement)) and placement.flags & 2)  # WPF_RESTORETOMAXIMIZED
+
     def recall_maximized(self, hwnd):
         """Bring back a window minimized while maximized: made the foreground
         one first, then restored, so that it appears in front at once. False,
         and nothing done, for any other window."""
-        placement = WINDOWPLACEMENT()
-        placement.length = C.sizeof(placement)
-        # WPF_RESTORETOMAXIMIZED
-        if (not self.alive(hwnd) or self._hung(hwnd) or not self.api.IsIconic(hwnd)
-                or not self.api.GetWindowPlacement(hwnd, C.byref(placement)) or not placement.flags & 2):
+        if self._hung(hwnd) or not self.returns_maximized(hwnd):
             return False
         self.api.SetForegroundWindow(hwnd)
         self.api.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
