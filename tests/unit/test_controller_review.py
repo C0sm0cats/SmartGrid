@@ -1390,9 +1390,9 @@ class PinnedStateTests(unittest.TestCase):
             backend.windows[1].state='minimized';controller.refresh(auto=False)
             states={s['app_id']:s['state'] for s in controller.reserved_slots()}
             self.assertEqual(states,{'editor':'MINIMIZED','closed':'CLOSED'})
-            # Another window of the same app tiled in this space: the pin is still CLOSED.
+            # Another window of the same app tiled in this space: no window for the pin.
             profile.assignments[2]=Assignment('other',None,True)
-            self.assertEqual({s['app_id']:s['state'] for s in controller.reserved_slots()}['other'],'CLOSED')
+            self.assertEqual({s['app_id']:s['state'] for s in controller.reserved_slots()}['other'],'NO WINDOW')
             # The same app in another space of the display: OPEN ELSEWHERE.
             profile.assignments[1]=None
             controller.profile('d1',1).assignments=[Assignment('other',2)]
@@ -1557,7 +1557,7 @@ class SeveralPinsTests(unittest.TestCase):
             assignments=controller.profile('d1',0).assignments
             self.assertIsNotNone(assignments[0].window_id)
             self.assertIsNone(assignments[1].window_id)
-            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'CLOSED')])
+            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'NO WINDOW')])
             # Its card opens a new window for that tile; the sibling stays in place.
             sibling=assignments[0].window_id
             controller.activate_reserved('d1',0,1)
@@ -1595,7 +1595,7 @@ class SeveralPinsTests(unittest.TestCase):
             notified=[];controller.subscribe(lambda:notified.append(1))
             self.elapse(controller,2)
             self.assertEqual((controller._pending,controller._cancelled_launches),({},[]))
-            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'CLOSED')])
+            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'NO WINDOW')])
             self.assertTrue(notified)
             self.assertEqual(controller.last_error,'')
             self.assertEqual(Repository(directory).load_session()['pending'],[])
@@ -1615,7 +1615,8 @@ class SeveralPinsTests(unittest.TestCase):
     def test_expired_launch_releases_an_unpinned_tile(self):
         with tempfile.TemporaryDirectory() as directory:
             backend,controller=self.single_instance(directory,pinned=False)
-            self.elapse(controller,31)
+            self.elapse(controller,119);self.assertTrue(controller._pending)
+            self.elapse(controller,2)
             self.assertFalse(controller._pending)
             self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments if a],[1])
             self.assertEqual(controller.last_error,'')
@@ -1632,7 +1633,7 @@ class SeveralPinsTests(unittest.TestCase):
     def test_launch_does_not_expire_while_a_window_is_held(self):
         with tempfile.TemporaryDirectory() as directory:
             backend,controller=self.single_instance(directory,pinned=False)
-            controller._interacting.add(1);self.elapse(controller,31)
+            controller._interacting.add(1);self.elapse(controller,121)
             self.assertTrue(controller._pending)
             controller._interacting.clear();controller.refresh()
             self.assertFalse(controller._pending)
@@ -1657,6 +1658,137 @@ class SeveralPinsTests(unittest.TestCase):
                 self.elapse(controller,20)
                 self.assertEqual(len(controller._pending),left)
             self.elapse(controller,11);self.assertFalse(controller._pending)
+
+
+    def test_slow_window_keeps_its_unpinned_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1,'chrome'),record(2,'notepad')],[ApplicationRef('chrome','Chrome')])
+            backend.auto_launch=False
+            controller=Controller(backend,Repository(directory))
+            controller.restore_profile(SpaceProfile('d1',0,'2x2',assignments=[
+                Assignment('chrome'),Assignment('chrome'),Assignment('notepad')]))
+            controller.refresh();self.elapse(controller,60)
+            late=backend.add_window('chrome',hwnd=20).ref.hwnd;controller.refresh()
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments if a],[1,late,2])
+
+    def test_no_slow_launch_warning_while_the_application_has_a_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[],[ApplicationRef('chrome','Chrome')]);backend.auto_launch=False
+            controller=Controller(backend,Repository(directory))
+            controller.restore_profile(SpaceProfile('d1',0,'2x2',assignments=[Assignment('chrome') for _ in range(3)]))
+            self.elapse(controller,100)
+            backend.add_window('chrome',hwnd=20);controller.refresh()
+            self.elapse(controller,25)
+            self.assertEqual((len(controller._pending),controller.last_error),(2,''))
+            # Its only window closes: it is waited for again, with the warning.
+            backend.remove_window(20);controller.refresh()
+            self.assertIn('Chrome',controller.last_error)
+
+
+class PinnedCardTests(unittest.TestCase):
+    def make(self, directory, windows, assignments, displays=1):
+        shown=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(displays)]
+        backend=FakeBackend(shown,windows,[ApplicationRef('chrome','Chrome'),ApplicationRef('notepad','Notepad')])
+        controller=Controller(backend,Repository(directory))
+        controller.profiles[('d1',0)]=SpaceProfile('d1',0,assignments=assignments)
+        controller.start()
+        return backend,controller
+
+    def states(self, controller):
+        return [(s['index'],s['state']) for s in controller.reserved_slots() if s['display_id']=='d1']
+
+    def test_a_click_opens_only_its_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[],[Assignment(a,None,True) for a in ('chrome','notepad','chrome')])
+            self.assertEqual(backend.launches,[])
+            controller.activate_reserved('d1',0,2)
+            self.assertEqual(backend.launches,['chrome'])
+            controller.refresh()
+            assignments=controller.profile('d1',0).assignments
+            self.assertEqual([bool(a.window_id) for a in assignments],[False,False,True])
+            self.assertEqual(self.states(controller),[(0,'NO WINDOW'),(1,'CLOSED')])
+
+    def test_restoring_a_minimized_or_floating_window_opens_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[record(1,'chrome')],[Assignment('chrome',None,True),Assignment('notepad',None,True)])
+            backend.minimize(1);controller.refresh()
+            self.assertEqual(self.states(controller),[(0,'MINIMIZED'),(1,'CLOSED')])
+            controller.activate_reserved('d1',0,0);controller.refresh()
+            self.assertEqual((backend.launches,backend.windows[1].state),([],'normal'))
+            controller.toggle_float(1)
+            self.assertEqual(self.states(controller),[(0,'FLOATING'),(1,'CLOSED')])
+            controller.activate_reserved('d1',0,0);controller.refresh()
+            self.assertEqual(backend.launches,[])
+            self.assertEqual(self.states(controller),[(1,'CLOSED')])
+
+    def test_a_click_on_the_card_of_a_cleared_tile_does_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[],[None,Assignment('chrome',None,True)])
+            undo=controller.history.undo_count
+            for index in (0,5): controller.activate_reserved('d1',0,index)
+            self.assertEqual((backend.launches,controller.history.undo_count),([],undo))
+
+    def test_open_elsewhere_on_another_display_opens_one_window_here(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[record(1,'chrome','d2')],
+                [Assignment('chrome',None,True),Assignment('notepad',None,True)],displays=2)
+            self.assertEqual(self.states(controller),[(0,'OPEN ELSEWHERE'),(1,'CLOSED')])
+            controller.activate_reserved('d1',0,0);controller.refresh()
+            self.assertEqual(backend.launches,['chrome'])
+            self.assertNotIn(controller.profile('d1',0).assignments[0].window_id,(None,1))
+            self.assertEqual(backend.windows[1].display_id,'d2')
+
+    def test_a_window_of_another_space_is_shown_by_one_click_in_the_clicked_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[record(1,'chrome')],[])
+            controller.profiles[('d1',1)]=SpaceProfile('d1',1)
+            controller.active_spaces['d1']=0
+            controller.switch_space('d1',1);controller.refresh(auto=False)
+            self.assertEqual(backend.windows[1].state,'minimized')
+            controller.profile('d1',1).assignments=[Assignment('chrome',None,True),Assignment('chrome',None,True)]
+            self.assertEqual(self.states(controller),[(0,'OPEN ELSEWHERE'),(1,'OPEN ELSEWHERE')])
+            controller.activate_reserved('d1',1,1);controller.refresh()
+            self.assertEqual(backend.launches,[])
+            self.assertEqual([a.window_id for a in controller.profile('d1',1).assignments],[None,1])
+            self.assertEqual(backend.windows[1].state,'normal')
+
+    def test_restart_serves_the_pins_of_the_active_space_first(self):
+        for count,expected in ((0,[None]),(1,[1]),(2,[1,2])):
+            with self.subTest(count=count),tempfile.TemporaryDirectory() as directory:
+                Repository(directory).save_layouts([],{('d1',0):SpaceProfile('d1',0,assignments=[
+                    Assignment('chrome'),Assignment('chrome',None,True)])})
+                display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+                backend=FakeBackend([display],[record(i,'chrome') for i in range(1,count+1)],[ApplicationRef('chrome','Chrome')])
+                controller=Controller(backend,Repository(directory));controller.start()
+                assignments=[a for a in controller.profile('d1',0).assignments if a]
+                pin=next(a for a in assignments if a.pinned)
+                self.assertEqual(pin.window_id,1 if count else None)
+                self.assertEqual(sorted([a.window_id for a in assignments],key=lambda v:v or 0),expected)
+
+    def test_restart_pin_of_a_hidden_space_takes_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Repository(directory).save_layouts([],{
+                ('d1',0):SpaceProfile('d1',0,assignments=[Assignment('chrome')]),
+                ('d1',1):SpaceProfile('d1',1,assignments=[Assignment('chrome',None,True)])})
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1,'chrome')],[ApplicationRef('chrome','Chrome')])
+            controller=Controller(backend,Repository(directory));controller.start()
+            self.assertEqual(controller.profile('d1',0).assignments[0].window_id,1)
+            self.assertIsNone(controller.profile('d1',1).assignments[0].window_id)
+
+    def test_restart_keeps_a_window_for_the_pending_launch_of_a_pin(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repository=Repository(directory)
+            repository.save_layouts([],{('d1',0):SpaceProfile('d1',0,assignments=[
+                Assignment('chrome',None,True),Assignment('chrome')])})
+            repository.save_session([dict(display_id='d1',space=0,index=0,app_id='chrome',created_utc=time.time())],{'d1':0})
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[record(1,'chrome')],[ApplicationRef('chrome','Chrome')])
+            controller=Controller(backend,Repository(directory));controller.start()
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments if a],[1])
+            self.assertFalse(controller._pending)
 
 
 class ForcedResizeTests(unittest.TestCase):

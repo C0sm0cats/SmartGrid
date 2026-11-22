@@ -193,11 +193,23 @@ class Controller:
         Profiles are stored without HWNDs. A regular occupant whose application
         is no longer open is not a launch request (only pins and
         real pending launches stay reserved), so it must not become OPENS ON APPLY.
+        In the active space the pins choose first; a hidden space must not take
+        the windows of the displayed one.
         """
         with self._lock:
             pending={(key[0].split('@desktop:',1)[0],key[1],key[2]) for key in self._pending}
             for (display_id,space),profile in self.profiles.items():
                 used={a.window_id for a in profile.assignments if a and a.window_id}
+                if space==self.active_spaces.get(display_id,0):
+                    for index,assignment in enumerate(profile.assignments):
+                        if not assignment or assignment.window_id or not assignment.pinned:
+                            continue
+                        window=self._free_window(assignment.app_id,display_id,used)
+                        if window:
+                            used.add(window.ref.hwnd)
+                            # A pending launch binds its window at the start.
+                            if (display_id.split('@desktop:',1)[0],space,index) not in pending:
+                                assignment.window_id=window.ref.hwnd
                 for index,assignment in enumerate(profile.assignments):
                     if not assignment or assignment.window_id or assignment.pinned:
                         continue
@@ -213,6 +225,12 @@ class Controller:
                     profile.assignments=compact_assignments(profile.assignments)
                 while profile.assignments and profile.assignments[-1] is None:
                     profile.assignments.pop()
+
+    def _free_window(self, app_id, display_id, used):
+        """A window of the app on this display that is not in `used`."""
+        candidates=[w for w in self.windows if w.app_id==app_id and w.display_id==display_id
+                    and self._eligible(w) and w.ref.hwnd not in used]
+        return next((w for w in candidates if w.state=='normal'),next(iter(candidates),None))
 
     def _migrate_hotkeys(self):
         """Replace retired default shortcuts that the user never changed."""
@@ -264,8 +282,10 @@ class Controller:
     # A one-off error stays this long; a condition error (set through
     # _condition_error) stays until its condition is resolved.
     ERROR_LIFETIME = 15.0
-    # Without a new window from an application that already has one (s).
-    SAME_APP_LAUNCH_WAIT = 30.0
+    # Without a new window from an application that already has one (s): a
+    # pinned tile stays reserved anyway, an unpinned one loses its place.
+    PINNED_LAUNCH_WAIT = 30.0
+    UNPINNED_LAUNCH_WAIT = 120.0
 
     @property
     def last_error(self):
@@ -1138,7 +1158,8 @@ class Controller:
         profile = self.draft(display_id, space).profile if draft else self.profile(display_id, space)
         return self._profile_rects(profile)
 
-    def _apply_profile(self, profile, include_new=False, launch_missing=False, hide_surplus=False, compact=False, explicit=False):
+    def _apply_profile(self, profile, include_new=False, launch_missing=False, hide_surplus=False, compact=False, explicit=False, launch_only=None):
+        """launch_only: index of the only tile whose application may be launched."""
         self._display(profile.display_id)
         if not getattr(self.backend,'desktop_known',True):
             raise ValueError('Cannot identify the current Windows desktop; arrangement is suspended.')
@@ -1155,7 +1176,8 @@ class Controller:
                 result.failures={w.ref.hwnd:"A fullscreen window occupies this display. Leave fullscreen before arranging." for w in blockers}
             self.last_result=result
             return result
-        assignments = self._resolve_assignments(profile, include_new=include_new, allow_cross_display=hide_surplus, allow_maximized=explicit, keep_reservations=launch_missing)
+        assignments = self._resolve_assignments(profile, include_new=include_new, allow_cross_display=hide_surplus, allow_maximized=explicit,
+                                                keep_reservations=launch_missing and launch_only is None)
         # Custom layouts keep tile positions (no compaction) while their tiles can
         # hold the windows; an overflowing custom layout falls back to Auto, which
         # grows, shrinks and compacts like any classic layout.
@@ -1207,7 +1229,7 @@ class Controller:
             hwnd = assignment.window_id
             if hwnd is None:
                 key = (profile.display_id, profile.space, index)
-                if launch_missing and key not in self._pending:
+                if launch_missing and launch_only in (None, index) and key not in self._pending:
                     app = next((a for a in self.apps if a.id == assignment.app_id), None)
                     if app is None:
                         result.unavailable.append(assignment.app_id)
@@ -1655,10 +1677,11 @@ class Controller:
                 self._pending.pop(key,None)
         self._warn_slow_launches()
 
-    def _has_open_window(self, app_id):
-        """A window of the app, floating and fullscreen ones included. Small,
-        excluded and hidden windows (splash screens, tray) do not count."""
-        return any(w.app_id == app_id and (w.state == "fullscreen" or w.eligible and w.ref.hwnd in self._floating
+    def _has_open_window(self, app_id, display_id=None):
+        """A window of the app (on that display), floating and fullscreen ones
+        included. Small, excluded and hidden windows (splash screens, tray) do
+        not count."""
+        return any(w.app_id == app_id and display_id in (None, w.display_id) and (w.state == "fullscreen" or w.eligible and w.ref.hwnd in self._floating
                                            or self._eligible(w)) for w in self.windows)
 
     def _bind_pending(self, expire=False):
@@ -1680,8 +1703,6 @@ class Controller:
         for key, pending in list(self._pending.items()):
             display_id, space, index = key
             if display_id not in {d.id for d in self.displays}: continue
-            if time.monotonic()-pending["created"] > 120:
-                pending['warned']=True
             profile = self.profile(display_id, space)
             if index >= len(profile.assignments):
                 self._pending.pop(key, None)
@@ -1692,9 +1713,13 @@ class Controller:
                 continue
             window = next((w for w in self.windows if w.app_id == pending["app_id"] and self._eligible(w) and w.ref.hwnd not in used), None)
             if window is None:
-                if not self._has_open_window(pending["app_id"]):
+                wait = self.PINNED_LAUNCH_WAIT if assignment.pinned else self.UNPINNED_LAUNCH_WAIT
+                opened = self._has_open_window(pending["app_id"])
+                # An open application is given up below, without a warning.
+                pending["warned"] = not opened and now-pending["created"] > 120
+                if not opened:
                     pending.pop("open_since", None)
-                elif now-pending.setdefault("open_since", now) >= self.SAME_APP_LAUNCH_WAIT and expire:
+                elif now-pending.setdefault("open_since", now) >= wait and expire:
                     # A single-instance application only showed the window it
                     # already had. Not a cancelled launch: a later window must
                     # still be tiled, and fill the tile if it is pinned.
@@ -2474,7 +2499,8 @@ class Controller:
 
     def reserved_slots(self):
         """Empty pinned tiles and their state: MINIMIZED, FLOATING,
-        OPENING, OPEN ELSEWHERE or CLOSED. Hidden while a fullscreen window
+        OPENING, OPEN ELSEWHERE, NO WINDOW (the app is open here, without a
+        window for this tile) or CLOSED. Hidden while a fullscreen window
         occupies the display."""
         result = []
         if not self.running or self.paused:
@@ -2497,6 +2523,8 @@ class Controller:
                     state = 'OPENING'
                 elif self._open_elsewhere(assignment.app_id, display.id, space):
                     state = 'OPEN ELSEWHERE'
+                elif self._has_open_window(assignment.app_id, display.id):
+                    state = 'NO WINDOW'
                 else:
                     state = 'CLOSED'
                 result.append({"display_id": display.id, "space": space, "index": index, "rect": rectangles[index],
@@ -2505,8 +2533,7 @@ class Controller:
 
     def _open_elsewhere(self, app_id, display_id, space):
         """A window of the app on another display or in another space of this one.
-        Other windows of the same app tiled in this space do not count: the
-        pinned app itself is closed, and clicking its card opens it."""
+        Other windows of the same app tiled in this space do not count."""
         here = {a.window_id for a in self.profile(display_id, space).assignments if a and a.window_id}
         other_spaces = {a.window_id for s in range(3) if s != space
                         for a in self.profile(display_id, s).assignments if a and a.window_id}
@@ -2516,16 +2543,26 @@ class Controller:
     def activate_reserved(self, display_id, space, index):
         with self._lock:
             self._require_desktop()
-            self.history.push(self._snapshot())
             profile = self.profile(display_id, space)
-            assignment = profile.assignments[index]
-            if assignment and assignment.window_id:
+            assignment = profile.assignments[index] if index < len(profile.assignments) else None
+            if assignment is None:
+                return  # the card of a tile cleared meanwhile
+            self.history.push(self._snapshot())
+            # Only the clicked tile: its window returns, else a free window of
+            # the app on this display is taken, else the app is opened.
+            opens = assignment.window_id is None
+            if opens and (display_id, space, index) not in self._pending:
+                here = {a.window_id for a in profile.assignments if a and a.window_id}
+                window = self._free_window(assignment.app_id, display_id, here)
+                if window:
+                    assignment.window_id = window.ref.hwnd
+            if assignment.window_id:
                 self._floating.discard(assignment.window_id)
                 self._manual_minimized.discard(assignment.window_id)
                 self.backend.show(assignment.window_id)
             if not self.apps:
                 self.refresh_apps()
-            self._apply_profile(profile, launch_missing=True, hide_surplus=False)
+            self._apply_profile(profile, launch_missing=opens, launch_only=index)
             self._save()
             self._notify()
 

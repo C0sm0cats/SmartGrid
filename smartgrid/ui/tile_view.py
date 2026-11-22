@@ -60,7 +60,7 @@ class TileCard(QAbstractButton):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(lambda p: self.context_requested.emit(self.index, self.mapToGlobal(p)))
 
-    def describe(self, assignment, app, window=None, shared=(), pending=False):
+    def describe(self, assignment, app, window=None, shared=(), pending=False, app_open=False):
         self.assignment = assignment
         self.window=window
         self.app_name = (app.name if app else app_display_name(assignment.app_id)) if assignment else 'Choose an app'
@@ -75,7 +75,7 @@ class TileCard(QAbstractButton):
         elif not assignment:
             self.title = ''
         elif assignment.pinned:
-            self.title = 'PINNED · ' + ('OPENING' if pending else 'CLOSED' if app else 'UNAVAILABLE')
+            self.title = 'PINNED · ' + ('OPENING' if pending else 'NO WINDOW' if app_open else 'CLOSED' if app else 'UNAVAILABLE')
         else:
             self.title = 'OPENING' if pending else 'OPENS ON APPLY'
         self.badges = []
@@ -447,7 +447,9 @@ class TileCanvas(QWidget):
                 if window: used.add(window.ref.hwnd)
             card.describe(assignment,apps_by_id.get(assignment.app_id) if assignment else None,
                           window,
-                          (shared or {}).get(i,()),i in (pending or ()))
+                          (shared or {}).get(i,()),i in (pending or ()),
+                          bool(assignment) and any(w.app_id==assignment.app_id and w.display_id==profile.display_id
+                                                   and (w.eligible or w.state=='fullscreen') for w in windows))
         self._layout_cards()
 
     def select(self,index,focus=False):

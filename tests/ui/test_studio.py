@@ -270,6 +270,63 @@ class UITests(unittest.TestCase):
                 studio.drop_assignment(0,{'app_id':'browser','window_id':None})
                 self.assertEqual(studio.current_profile().assignments[0],Assignment('browser'))
 
+    def test_application_dropped_in_the_current_arrangement_leaves_its_placed_window(self):
+        from smartgrid.platform.fake import FakeBackend
+        from smartgrid.core.models import ApplicationRef, Display, Rect
+        backend=FakeBackend([Display('d1','D',Rect(0,0,1920,1080),primary=True)],[],[ApplicationRef('chrome','Chrome')])
+        first=backend.add_window('chrome').ref.hwnd
+        with tempfile.TemporaryDirectory() as directory:
+            controller=Controller(backend,Repository(directory));controller.refresh_apps();controller.start()
+            studio=Studio(controller);self.widgets.append(studio)
+            def settle():
+                deadline=time.monotonic()+5
+                while bridge_for(controller).pending and time.monotonic()<deadline:
+                    self.app.processEvents();time.sleep(.01)
+                self.app.processEvents()
+            tiles=lambda:[a and a.window_id for a in controller.draft('d1',0).profile.assignments]
+            drop=lambda i:(studio.drop_assignment(i,{'app_id':'chrome','window_id':None}),settle())
+            drop(1);self.assertEqual(tiles(),[first,None])
+            self.assertEqual(controller.draft('d1',0).profile.assignments[1],Assignment('chrome'))
+            # On its own tile the application keeps its window.
+            drop(0);self.assertEqual(tiles(),[first,None])
+            # A free window is used.
+            controller.pause()
+            second=backend.add_window('chrome').ref.hwnd;controller.refresh(auto=False)
+            drop(1);self.assertEqual(tiles(),[first,second])
+            backend.remove_window(second);controller.refresh(auto=False);controller.resume()
+            controller.reset_draft('d1',0);drop(1)
+            controller.apply_drafts();controller.refresh()
+            self.assertEqual(backend.launches,['chrome'])
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments][0],first)
+            self.assertNotIn(controller.profile('d1',0).assignments[1].window_id,(None,first))
+            bridge_for(controller).shutdown();controller.quit()
+
+    def test_cards_of_open_applications_are_clickable(self):
+        from smartgrid.core.models import ApplicationRef
+        from smartgrid.ui.app import DesktopUI
+        ui=DesktopUI(self.controller,self.app);self.settle()
+        slots=[dict(display_id='demo-primary',space=0,index=i,rect=self.controller.displays[0].work_area,app_id=app,state=state)
+               for i,(app,state) in enumerate((('chrome','NO WINDOW'),('chrome','OPEN ELSEWHERE'),('chrome','CLOSED'),
+                   ('chrome','OPENING'),('gone','NO WINDOW'),('gone','OPEN ELSEWHERE'),('gone','CLOSED')))]
+        self.controller.apps=[ApplicationRef('chrome','Chrome')]
+        self.controller.reserved_slots=lambda:slots
+        ui.refresh_cards()
+        cards=[ui.cards[('demo-primary',0,i)] for i in range(len(slots))]
+        self.assertEqual([c.actionable for c in cards],[True,True,True,False,False,False,False])
+        self.assertEqual(cards[0].state,'PINNED · NO WINDOW')
+        self.assertEqual(cards[6].state,'PINNED · UNAVAILABLE')
+        self.controller.reserved_slots=lambda:[];ui.refresh_cards()
+        ui.timer.stop();ui.focus_frame.close();ui.window_actions.close();ui.tray.hide()
+
+    def test_studio_tile_says_no_window_while_the_application_is_open(self):
+        from smartgrid.ui.tile_view import TileCard
+        from smartgrid.core.models import ApplicationRef
+        card=TileCard(0,self.controller.settings);self.widgets.append(card)
+        app=ApplicationRef('chrome','Chrome')
+        for opened,title in ((True,'PINNED · NO WINDOW'),(False,'PINNED · CLOSED')):
+            card.describe(Assignment('chrome',None,True),app,app_open=opened)
+            self.assertEqual(card.title,title)
+
     def test_auto_five_windows_convert_to_full_custom_partition(self):
         studio=Studio(self.controller); self.widgets.append(studio)
         profile=self.controller.draft('demo-primary',0).profile

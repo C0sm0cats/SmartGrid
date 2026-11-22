@@ -948,14 +948,21 @@ class Studio(QMainWindow):
                 def assign():
                     controller=self.controller
                     wid=window_id
-                    if wid is None:
-                        # Reuse an open window of the app on this display.
-                        live=next((w for w in controller.windows if w.app_id==app_id and w.display_id==display_id
-                                   and w.eligible and not w.floating),None)
-                        wid=live.ref.hwnd if live else None
-                    window=controller._window(wid) if wid else None
                     profile=controller.draft(display_id,space).profile
                     previous=profile.assignments[index] if index<len(profile.assignments) else None
+                    if wid is None:
+                        # Reuse an open window of the app on this display that has no
+                        # other tile in this space, preferably in no space at all.
+                        # Without one the tile is reserved: Apply opens the app.
+                        placed=lambda s:{a.window_id for i,a in enumerate(controller.draft(display_id,s).profile.assignments)
+                                         if a and a.window_id and (s,i)!=(space,index)}
+                        here,anywhere=placed(space),set().union(*(placed(s) for s in range(3)))
+                        own=previous.window_id if previous and previous.app_id==app_id else None
+                        live=sorted((w for w in controller.windows if w.app_id==app_id and w.display_id==display_id
+                                     and w.eligible and not w.floating and w.ref.hwnd not in here),
+                                    key=lambda w:(w.ref.hwnd!=own,w.ref.hwnd in anywhere))
+                        wid=live[0].ref.hwnd if live else None
+                    window=controller._window(wid) if wid else None
                     pinned=bool(previous and previous.pinned and previous.app_id==app_id)
                     if window and window.display_id!=display_id:
                         # A window from another display moves; same-display spaces share it.

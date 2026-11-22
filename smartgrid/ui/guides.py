@@ -117,7 +117,8 @@ class PinPlaceholder(Overlay):
     def describe(self, icon, name, state, actionable):
         self.icon, self.name, self.state, self.actionable = icon, name, state, actionable
         kind = state.split(' · ')[-1]
-        verb = {'FLOATING': 'Tile floating window', 'MINIMIZED': 'Restore window', 'CLOSED': 'Open application'}.get(kind, kind)
+        verb = {'FLOATING': 'Tile floating window', 'MINIMIZED': 'Restore window', 'CLOSED': 'Open application',
+                'NO WINDOW': 'Open a window', 'OPEN ELSEWHERE': 'Open a window here'}.get(kind, kind) if actionable else kind
         self.setAccessibleName(f"{verb}: {name}")
         self.setCursor(Qt.CursorShape.PointingHandCursor if actionable else Qt.CursorShape.ArrowCursor)
         self.update()

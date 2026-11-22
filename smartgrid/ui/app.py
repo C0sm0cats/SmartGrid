@@ -267,8 +267,8 @@ class DesktopUI:
             name = app.name if app else app_display_name(slot['app_id'])
             state = slot['state']
             unavailable = state=='CLOSED' and not app
-            # Minimized and floating windows return, a closed app opens.
-            actionable = state in ('MINIMIZED','FLOATING') or (state=='CLOSED' and not unavailable)
+            # Minimized and floating windows return; otherwise the app opens a window.
+            actionable = state in ('MINIMIZED','FLOATING') or bool(app and state in ('CLOSED','NO WINDOW','OPEN ELSEWHERE'))
             card.describe(application_icon(app),name,f"PINNED · {'UNAVAILABLE' if unavailable else state}",actionable)
             rect = self._logical(key[0],slot['rect'])
             if rect is None or hide_cards:
