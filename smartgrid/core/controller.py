@@ -264,6 +264,8 @@ class Controller:
     # A one-off error stays this long; a condition error (set through
     # _condition_error) stays until its condition is resolved.
     ERROR_LIFETIME = 15.0
+    # Without a new window from an application that already has one (s).
+    SAME_APP_LAUNCH_WAIT = 30.0
 
     @property
     def last_error(self):
@@ -412,6 +414,7 @@ class Controller:
             previous = {w.ref.hwnd: w for w in self.windows}
             previous_profiles=deepcopy(self.profiles)
             previous_error=self.last_error
+            previous_pending=set(self._pending)
             self._expire_error()
             old_displays = {d.id: (d.work_area, d.dpi) for d in self.displays}
             self.displays = self.backend.discover_displays()
@@ -508,11 +511,14 @@ class Controller:
                         profile = self.profile(window.display_id, self.active_spaces.get(window.display_id, 0))
                         if not any(a and a.window_id == hwnd for a in profile.assignments):
                             profile.assignments.append(Assignment(window.app_id, hwnd))
-            self._bind_pending()
+            # A tile is only released when the arrangement below can follow.
+            released = self._bind_pending(auto and not self._interacting and self._swap_snapshot is None)
+            layout_changed |= released
+            changed |= previous_pending != set(self._pending)
             if auto and self.running and not self.paused and layout_changed and not self._interacting and self._swap_snapshot is None:
                 log.info('Automatic arrangement: closed %s, created %s, replaced %s, states %s',
                          sorted(closed), sorted(created), sorted(replaced), states)
-                self._reflow_all(include_new=True, compact=bool(closed and self.settings.compact_close))
+                self._reflow_all(include_new=True, compact=bool((closed or released) and self.settings.compact_close))
             elif auto and layout_changed:
                 # Said in the log: windows that changed and were not arranged.
                 log.info('No automatic arrangement (closed %s, created %s): %s', sorted(closed), sorted(created),
@@ -1649,9 +1655,18 @@ class Controller:
                 self._pending.pop(key,None)
         self._warn_slow_launches()
 
-    def _bind_pending(self):
+    def _has_open_window(self, app_id):
+        """A window of the app, floating and fullscreen ones included. Small,
+        excluded and hidden windows (splash screens, tray) do not count."""
+        return any(w.app_id == app_id and (w.state == "fullscreen" or w.eligible and w.ref.hwnd in self._floating
+                                           or self._eligible(w)) for w in self.windows)
+
+    def _bind_pending(self, expire=False):
+        """Gives new windows to the tiles waiting for them. True when an
+        unpinned tile was released: its application opened no new window."""
+        released = False
         if not self.running or not getattr(self.backend,'desktop_known',True):
-            self._warn_slow_launches();return
+            self._warn_slow_launches();return released
         used = {a.window_id for p in self.profiles.values() for a in p.assignments if a and a.window_id}
         now=time.monotonic()
         self._cancelled_launches=[p for p in self._cancelled_launches if now-p["created"]<=120]
@@ -1677,11 +1692,28 @@ class Controller:
                 continue
             window = next((w for w in self.windows if w.app_id == pending["app_id"] and self._eligible(w) and w.ref.hwnd not in used), None)
             if window is None:
+                if not self._has_open_window(pending["app_id"]):
+                    pending.pop("open_since", None)
+                elif now-pending.setdefault("open_since", now) >= self.SAME_APP_LAUNCH_WAIT and expire:
+                    # A single-instance application only showed the window it
+                    # already had. Not a cancelled launch: a later window must
+                    # still be tiled, and fill the tile if it is pinned.
+                    log.info('No new window from %s: launch for %s space %s tile %s given up',
+                             pending["app_id"], display_id, space, index+1)
+                    self._pending.pop(key, None)
+                    if not assignment.pinned:
+                        profile.assignments[index] = None
+                        released = True
+                    self._save()
                 continue
             assignment.window_id = window.ref.hwnd
             used.add(window.ref.hwnd)
             self._capture(window.ref.hwnd)
             self._pending.pop(key, None)
+            # Its other launches may still be opening their windows.
+            for other in self._pending.values():
+                if other["app_id"] == pending["app_id"]:
+                    other.pop("open_since", None)
             if self.active_spaces.get(display_id, 0) == space and self.running and not self.paused:
                 # Restored at once, then up to 3 more times during 5 s.
                 self._launch_grace[window.ref.hwnd] = [time.monotonic() + 5, 3 + (window.state == "maximized")]
@@ -1691,6 +1723,7 @@ class Controller:
                 self._parked.add(window.ref.hwnd)
             self._save()
         self._warn_slow_launches()
+        return released
 
     def _unmaximize_launched(self):
         """An application launched by a layout that maximizes itself (its

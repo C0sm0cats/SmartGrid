@@ -8,7 +8,7 @@ from pathlib import Path
 from PySide6.QtWidgets import QApplication
 from smartgrid.__main__ import demo_backend
 from smartgrid.core.controller import Controller
-from smartgrid.core.models import Assignment
+from smartgrid.core.models import Assignment, SpaceProfile
 from smartgrid.core.geometry import valid_tiles
 from smartgrid.storage.repository import Repository
 from smartgrid.ui.bridge import bridge_for
@@ -230,6 +230,45 @@ class UITests(unittest.TestCase):
             studio.selected_index=index;studio._pin_changed(True);self.settle()
         profile=self.controller.draft('demo-primary',0).profile
         self.assertEqual([a.pinned for a in profile.assignments[:2]],[True,True])
+
+    def composing_studios(self):
+        """A Studio composing a new layout, then one editing a saved layout."""
+        template=self.controller.save_profile_template('Saved',SpaceProfile('demo-primary',0,'2x2'))
+        for mode in ('new','edit'):
+            studio=Studio(self.controller); self.widgets.append(studio)
+            if mode=='edit':
+                studio.template_id=template.id
+                studio._activate_mode('edit');studio.edit_saved()
+            else:
+                studio._activate_mode('new')
+            self.assertEqual(studio.mode,mode)
+            yield mode,studio
+
+    def test_one_application_dropped_on_two_tiles_stays_on_both(self):
+        for mode,studio in self.composing_studios():
+            with self.subTest(mode=mode):
+                studio.drop_assignment(0,{'app_id':'editor','window_id':None})
+                studio.selected_index=0;studio._pin_changed(True)
+                studio.drop_assignment(1,{'app_id':'editor','window_id':2})
+                studio.drop_assignment(2,{'app_id':'editor','window_id':3})
+                self.assertEqual([(a.app_id,a.window_id,a.pinned) for a in studio.current_profile().assignments[:3]],
+                                 [('editor',None,True),('editor',2,False),('editor',3,False)])
+
+    def test_one_window_dropped_twice_moves_to_the_second_tile(self):
+        for mode,studio in self.composing_studios():
+            with self.subTest(mode=mode):
+                for index in (0,1): studio.drop_assignment(index,{'app_id':'editor','window_id':2})
+                self.assertEqual(studio.current_profile().assignments[:2],[None,Assignment('editor',2)])
+
+    def test_application_dropped_again_on_its_tile_keeps_the_pin(self):
+        for mode,studio in self.composing_studios():
+            with self.subTest(mode=mode):
+                studio.drop_assignment(0,{'app_id':'editor','window_id':None})
+                studio.selected_index=0;studio._pin_changed(True)
+                studio.drop_assignment(0,{'app_id':'editor','window_id':2})
+                self.assertEqual(studio.current_profile().assignments[0],Assignment('editor',2,True))
+                studio.drop_assignment(0,{'app_id':'browser','window_id':None})
+                self.assertEqual(studio.current_profile().assignments[0],Assignment('browser'))
 
     def test_auto_five_windows_convert_to_full_custom_partition(self):
         studio=Studio(self.controller); self.widgets.append(studio)

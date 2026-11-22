@@ -968,9 +968,12 @@ class Studio(QMainWindow):
             else:
                 def assign(profile):
                     self._pad_assignments(profile,index+1)
+                    # Several tiles may hold one application, but a window only one.
                     for i,a in enumerate(profile.assignments):
-                        if i!=index and a and a.app_id==app_id: profile.assignments[i]=None
-                    profile.assignments[index]=Assignment(app_id,window_id,False)
+                        if i!=index and a and window_id is not None and a.window_id==window_id: profile.assignments[i]=None
+                    previous=profile.assignments[index]
+                    pinned=bool(previous and previous.pinned and previous.app_id==app_id)
+                    profile.assignments[index]=Assignment(app_id,window_id,pinned)
                 self._mutate_profile(assign)
             self._show_library(False)
 

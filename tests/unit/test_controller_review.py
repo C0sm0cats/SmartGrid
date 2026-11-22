@@ -1568,6 +1568,96 @@ class SeveralPinsTests(unittest.TestCase):
             self.assertEqual(assignments[0].window_id,sibling)
             self.assertNotIn(assignments[1].window_id,(None,sibling))
 
+    def single_instance(self, directory, pinned=True):
+        """Two chrome tiles restored with one chrome window open; the launch
+        for the second tile opens no new window."""
+        display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+        backend=FakeBackend([display],[record(1,'chrome')],[ApplicationRef('chrome','Chrome')])
+        backend.auto_launch=False
+        controller=Controller(backend,Repository(directory))
+        controller.restore_profile(SpaceProfile('d1',0,'2x2',assignments=[
+            Assignment('chrome',None,True),Assignment('chrome',None,pinned)]))
+        self.assertEqual(backend.launches,['chrome'])
+        controller.refresh()
+        return backend,controller
+
+    def elapse(self, controller, seconds):
+        for pending in controller._pending.values():
+            pending['created']-=seconds
+            if 'open_since' in pending: pending['open_since']-=seconds
+        controller.refresh()
+
+    def test_launch_of_an_already_open_application_expires_to_a_closed_card(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory)
+            self.elapse(controller,29)
+            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'OPENING')])
+            notified=[];controller.subscribe(lambda:notified.append(1))
+            self.elapse(controller,2)
+            self.assertEqual((controller._pending,controller._cancelled_launches),({},[]))
+            self.assertEqual([(s['index'],s['state']) for s in controller.reserved_slots()],[(1,'CLOSED')])
+            self.assertTrue(notified)
+            self.assertEqual(controller.last_error,'')
+            self.assertEqual(Repository(directory).load_session()['pending'],[])
+            # The card still opens the application.
+            controller.activate_reserved('d1',0,1)
+            self.assertEqual(backend.launches,['chrome','chrome'])
+            self.assertTrue(controller._pending)
+
+    def test_late_window_fills_the_pinned_tile_of_an_expired_launch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory)
+            self.elapse(controller,31);self.assertFalse(controller._pending)
+            late=backend.add_window('chrome',hwnd=20).ref.hwnd;controller.refresh()
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments[:2]],[1,late])
+            self.assertNotIn(late,controller._floating)
+
+    def test_expired_launch_releases_an_unpinned_tile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory,pinned=False)
+            self.elapse(controller,31)
+            self.assertFalse(controller._pending)
+            self.assertEqual([a.window_id for a in controller.profile('d1',0).assignments if a],[1])
+            self.assertEqual(controller.last_error,'')
+            late=backend.add_window('chrome',hwnd=20).ref.hwnd;controller.refresh()
+            self.assertIn(late,[a.window_id for a in controller.profile('d1',0).assignments if a])
+
+    def test_launch_expires_when_the_open_window_floats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory)
+            controller._floating.add(1);controller.refresh()
+            self.elapse(controller,31)
+            self.assertFalse(controller._pending)
+
+    def test_launch_does_not_expire_while_a_window_is_held(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory,pinned=False)
+            controller._interacting.add(1);self.elapse(controller,31)
+            self.assertTrue(controller._pending)
+            controller._interacting.clear();controller.refresh()
+            self.assertFalse(controller._pending)
+
+    def test_launch_without_any_open_window_does_not_expire(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.single_instance(directory)
+            backend.remove_window(1);controller.refresh()
+            self.elapse(controller,121)
+            self.assertTrue(controller._pending)
+            self.assertIn('Chrome',controller.last_error)
+
+    def test_each_new_window_restarts_the_wait_of_the_other_launches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            display=Display('d1','D',Rect(0,0,1920,1080),primary=True)
+            backend=FakeBackend([display],[],[ApplicationRef('chrome','Chrome')]);backend.auto_launch=False
+            controller=Controller(backend,Repository(directory))
+            controller.restore_profile(SpaceProfile('d1',0,'2x2',assignments=[Assignment('chrome',None,True) for _ in range(3)]))
+            self.elapse(controller,60);self.assertEqual(len(controller._pending),3)
+            for hwnd,left in ((20,2),(21,1)):
+                backend.add_window('chrome',hwnd=hwnd);controller.refresh()
+                self.elapse(controller,20)
+                self.assertEqual(len(controller._pending),left)
+            self.elapse(controller,11);self.assertFalse(controller._pending)
+
 
 class ForcedResizeTests(unittest.TestCase):
     def test_tiles_forced_below_their_minimum_can_still_be_resized(self):
