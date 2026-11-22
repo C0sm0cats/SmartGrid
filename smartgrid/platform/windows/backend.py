@@ -684,10 +684,13 @@ class WindowsBackend:
             return False
         # SW_SHOWNOACTIVATE restores without making each tiled client steal focus.
         # Focus changes are confined to focus(), an explicit user command.
+        # Minimized while maximized, it comes back maximized: nothing more to
+        # wait for, unlike a maximized window to be restored.
+        minimized=bool(self.api.IsIconic(hwnd))
         self.api.ShowWindowAsync(hwnd, 4)
         deadline=time.monotonic()+.5
         while self.alive(hwnd) and time.monotonic()<deadline:
-            if not self.api.IsIconic(hwnd) and not self.api.IsZoomed(hwnd) and self.api.IsWindowVisible(hwnd):
+            if not self.api.IsIconic(hwnd) and (minimized or not self.api.IsZoomed(hwnd)) and self.api.IsWindowVisible(hwnd):
                 return True
             time.sleep(.01)
         return False

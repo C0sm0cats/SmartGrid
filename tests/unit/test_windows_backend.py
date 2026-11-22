@@ -20,6 +20,29 @@ class PolicyTests(TestCase):
         self.assertTrue(backend.show(42))
         self.assertEqual(calls,[(42,4)])
 
+    def test_showing_a_window_waits_no_longer_than_it_takes(self):
+        from types import SimpleNamespace
+        import time as clock
+        def shown(before, after):
+            """The states (iconic, zoomed) before and after the request."""
+            state=[before]
+            backend=WindowsBackend.__new__(WindowsBackend)
+            backend.alive=lambda hwnd:True
+            backend.api=SimpleNamespace(ShowWindowAsync=lambda h,cmd:state.__setitem__(0,after) or True,
+                IsIconic=lambda h:state[0][0],IsZoomed=lambda h:state[0][1],IsWindowVisible=lambda h:True)
+            started=clock.monotonic()
+            return backend.show(42),clock.monotonic()-started
+        # Minimized while maximized: back maximized, at once.
+        done,took=shown((True,False),(False,True))
+        self.assertTrue(done);self.assertLess(took,.2)
+        done,took=shown((True,False),(False,False))
+        self.assertTrue(done);self.assertLess(took,.2)
+        # A maximized window to restore, or one still minimized, is waited for.
+        done,took=shown((False,True),(False,True))
+        self.assertFalse(done);self.assertGreater(took,.4)
+        done,took=shown((True,False),(True,False))
+        self.assertFalse(done);self.assertGreater(took,.4)
+
     def test_firefox_and_normal_titles_have_no_substring_filter(self):
         for name in ['MozillaWindowClass', 'Chrome_WidgetWin_1', 'TkTopLevel', 'ConsoleWindowClass']:
             allowed, reason = eligibility(visible=True, cloaked=False, owner=0, style=0x00cf0000, exstyle=0, class_name=name)
