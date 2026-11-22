@@ -2108,6 +2108,24 @@ class ReplacedArrangementLaunchTests(unittest.TestCase):
             controller.swap_draft('d1',0,0,1);controller.apply_drafts([('d1',0)])
             self.assertEqual(([k for k in controller._pending],backend.launches),([('d1',0,0)],['app']))
 
+    def test_the_preview_does_not_count_launches_in_progress(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory)
+            controller.templates=[LayoutTemplate('t','T','2x2',assignments=[
+                Assignment('app'),Assignment('note'),Assignment('other'),Assignment('gone')])]
+            counts=lambda space=0:{k:controller.preview_template('t','d1',space)[k] for k in ('reuse','open','unavailable')}
+            self.assertEqual(counts(),dict(reuse=1,open=1,unavailable=1))
+            # Not for another space, nor for a launch that Restore starts again.
+            self.assertEqual(counts(1)['open'],2)
+            controller.templates[0].assignments[3]=Assignment('app')
+            self.assertEqual(counts()['open'],2)
+            for pending in controller._pending.values(): pending['created']-=121
+            self.assertEqual(counts()['open'],3)
+            for pending in controller._pending.values(): pending['created']+=121
+            launched=len(backend.launches);planned=counts()['open']
+            controller.restore_template('t','d1',0)
+            self.assertEqual(len(backend.launches)-launched,planned)
+
     def test_a_layout_restored_twice_launches_once(self):
         with tempfile.TemporaryDirectory() as directory:
             backend,controller=self.make(directory)

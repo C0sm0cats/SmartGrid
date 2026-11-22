@@ -326,6 +326,38 @@ class UITests(unittest.TestCase):
         for opened,title in ((True,'PINNED · NO WINDOW'),(False,'PINNED · CLOSED')):
             card.describe(Assignment('chrome',None,True),app,app_open=opened)
             self.assertEqual(card.title,title)
+        for state,known,title in (('OPEN ELSEWHERE',True,'OPEN ELSEWHERE'),('OPENING',True,'OPENING'),('NO WINDOW',True,'NO WINDOW'),
+                                  ('CLOSED',True,'CLOSED'),('CLOSED',False,'UNAVAILABLE'),('OPEN ELSEWHERE',False,'OPEN ELSEWHERE')):
+            # The state decides, not the windows of the display.
+            card.describe(Assignment('chrome',None,True),app if known else None,app_open=True,state=state)
+            self.assertEqual(card.title,'PINNED · '+title)
+
+    def test_studio_tiles_say_the_same_as_the_cards(self):
+        from smartgrid.core.models import ApplicationRef, Display, Rect, SpaceProfile, WindowRecord, WindowRef
+        from smartgrid.platform.fake import FakeBackend
+        def chrome(hwnd,display):
+            return WindowRecord(WindowRef(hwnd,hwnd,f'g:{hwnd}'),'chrome','Chrome',Rect(100,100,800,600),display)
+        displays=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(2)]
+        pin=lambda:Assignment('chrome',None,True)
+        cases=(('CLOSED',[],{0:[pin()]}),
+               ('NO WINDOW',[chrome(1,'d1')],{0:[Assignment('chrome',1),pin()]}),
+               ('OPEN ELSEWHERE',[chrome(1,'d2')],{0:[pin()]}),
+               ('OPEN ELSEWHERE',[chrome(1,'d1')],{0:[pin()],1:[Assignment('chrome',1)]}),
+               ('OPENING',[],{0:[pin()]}))
+        for expected,windows,spaces in cases:
+            with self.subTest(expected=expected,windows=len(windows)),tempfile.TemporaryDirectory() as directory:
+                backend=FakeBackend(displays,windows,[ApplicationRef('chrome','Chrome')]);backend.auto_launch=False
+                controller=Controller(backend,Repository(directory));controller.refresh_apps();controller.running=True
+                for space,assignments in spaces.items():
+                    controller.profiles[('d1',space)]=SpaceProfile('d1',space,assignments=assignments)
+                if expected=='OPENING': controller.activate_reserved('d1',0,0)
+                cards=[s for s in controller.reserved_slots() if s['display_id']=='d1']
+                self.assertEqual([s['state'] for s in cards],[expected])
+                studio=Studio(controller);self.widgets.append(studio)
+                studio.display_id,studio.space='d1',0
+                studio.refresh_from_controller();self.app.processEvents()
+                self.assertEqual(studio.canvas.cards[cards[0]['index']].title,'PINNED · '+expected)
+                bridge_for(controller).shutdown();controller.quit()
 
     def test_auto_five_windows_convert_to_full_custom_partition(self):
         studio=Studio(self.controller); self.widgets.append(studio)

@@ -60,7 +60,7 @@ class TileCard(QAbstractButton):
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(lambda p: self.context_requested.emit(self.index, self.mapToGlobal(p)))
 
-    def describe(self, assignment, app, window=None, shared=(), pending=False, app_open=False):
+    def describe(self, assignment, app, window=None, shared=(), pending=False, app_open=False, state=None):
         self.assignment = assignment
         self.window=window
         self.app_name = (app.name if app else app_display_name(assignment.app_id)) if assignment else 'Choose an app'
@@ -75,7 +75,8 @@ class TileCard(QAbstractButton):
         elif not assignment:
             self.title = ''
         elif assignment.pinned:
-            self.title = 'PINNED · ' + ('OPENING' if pending else 'NO WINDOW' if app_open else 'CLOSED' if app else 'UNAVAILABLE')
+            self.title = 'PINNED · ' + ('OPENING' if pending else state if state and state != 'CLOSED' else 'NO WINDOW' if app_open and not state
+                                           else 'CLOSED' if app else 'UNAVAILABLE')
         else:
             self.title = 'OPENING' if pending else 'OPENS ON APPLY'
         self.badges = []
@@ -414,7 +415,8 @@ class TileCanvas(QWidget):
         self.setMinimumSize(260,180)
         self.setAccessibleName("Layout grid")
 
-    def set_profile(self,profile,display,apps,windows,shared=None,pending=None,runtime=False):
+    def set_profile(self,profile,display,apps,windows,shared=None,pending=None,runtime=False,state=None):
+        """state: tells the state of an empty pinned tile from its index and app."""
         self.profile=profile
         self.native_area=display.work_area if display else Rect(0,0,1920,1080)
         if display:
@@ -449,7 +451,8 @@ class TileCanvas(QWidget):
                           window,
                           (shared or {}).get(i,()),i in (pending or ()),
                           bool(assignment) and any(w.app_id==assignment.app_id and w.display_id==profile.display_id
-                                                   and (w.eligible or w.state=='fullscreen') for w in windows))
+                                                   and (w.eligible or w.state=='fullscreen') for w in windows),
+                          state(i,assignment.app_id) if state and assignment and assignment.pinned and window is None else None)
         self._layout_cards()
 
     def select(self,index,focus=False):

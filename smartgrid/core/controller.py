@@ -1693,9 +1693,17 @@ class Controller:
             known = {a.id for a in self.apps}
             missing = [a.app_id for a in assignments if a and not a.window_id]
             reuse = len(selected)
-            opened = sum(app_id in known for app_id in missing)
+            # Launches in progress that Restore keeps are not opened again.
+            waiting = self._recent_launches((display_id, space))
+            opened = 0
+            for app_id in missing:
+                if app_id in waiting:
+                    waiting.remove(app_id)
+                elif app_id in known:
+                    opened += 1
+            absent = sum(app_id not in known for app_id in missing)
             hidden = sum(w.display_id == display_id and w.state == "normal" and self._eligible(w) and w.ref.hwnd not in selected for w in self.windows)
-            return {"reuse": reuse, "open": opened, "hide": hidden, "unavailable": len(missing) - opened,
+            return {"reuse": reuse, "open": opened, "hide": hidden, "unavailable": absent,
                     "profile": profile, "assignments": assignments}
 
     def restore_template(self, template_id, display_id, space):
@@ -1763,13 +1771,19 @@ class Controller:
     def _take_pending(self, context):
         """The launches in progress of a space whose arrangement is replaced.
         Older ones are cancelled: their app is launched again."""
-        now = time.monotonic()
-        recent = {key: value for key, value in sorted(self._pending.items())
-                  if key[:2] == context and now - value["created"] < self.UNPINNED_LAUNCH_WAIT}
+        recent = self._recent_pending(context)
         for key in recent:
             del self._pending[key]
         self._cancel_pending(context)
         return list(recent.values())
+
+    def _recent_pending(self, context):
+        now = time.monotonic()
+        return {key: value for key, value in sorted(self._pending.items())
+                if key[:2] == context and now - value["created"] < self.UNPINNED_LAUNCH_WAIT}
+
+    def _recent_launches(self, context):
+        return [value["app_id"] for value in self._recent_pending(context).values()]
 
     def _use_waiting(self, waiting, key, assignment):
         entry = next((p for p in waiting or () if p["app_id"] == assignment.app_id), None)
@@ -2710,17 +2724,21 @@ class Controller:
                     continue
                 if window is not None:
                     state = 'FLOATING' if assignment.window_id in self._floating else 'MINIMIZED'
-                elif (display.id, space, index) in self._pending:
-                    state = 'OPENING'
-                elif self._open_elsewhere(assignment.app_id, display.id, space):
-                    state = 'OPEN ELSEWHERE'
-                elif self._has_open_window(assignment.app_id, display.id):
-                    state = 'NO WINDOW'
                 else:
-                    state = 'CLOSED'
+                    state = self.empty_tile_state(display.id, space, index, assignment.app_id)
                 result.append({"display_id": display.id, "space": space, "index": index, "rect": rectangles[index],
                                "app_id": assignment.app_id, "state": state})
         return result
+
+    def empty_tile_state(self, display_id, space, index, app_id):
+        """State of a tile pinned for an app, without a window: said the same
+        way by its card and by the Studio."""
+        pending = self._pending.get((display_id, space, index))
+        if pending and pending["app_id"] == app_id:
+            return 'OPENING'
+        if self._open_elsewhere(app_id, display_id, space):
+            return 'OPEN ELSEWHERE'
+        return 'NO WINDOW' if self._has_open_window(app_id, display_id) else 'CLOSED'
 
     def _open_elsewhere(self, app_id, display_id, space):
         """A window of the app on another display or in another space of this one.

@@ -553,7 +553,8 @@ class Studio(QMainWindow):
                     pending_slots.add(getattr(p,'index',-1))
             self.canvas.settings=studio_settings(self.controller.settings)
             self.canvas.active_hwnd=getattr(self.controller,'_last_tiled_selection',None)
-            self.canvas.set_profile(profile,display,self.controller.apps,self.controller.windows,shared,pending_slots,runtime=self.mode=='current')
+            self.canvas.set_profile(profile,display,self.controller.apps,self.controller.windows,shared,pending_slots,runtime=self.mode=='current',
+                state=(lambda i,app_id:self.controller.empty_tile_state(self.display_id,self.space,i,app_id)) if self.mode=='current' else None)
             if self.mode=='edit':
                 saved=next((t for t in self.controller.templates if t.id==self.template_id),None)
                 self.current_layout.setText(f"{saved.name if saved else 'Saved layout'}  ·  {preset_name(self.canvas.effective_preset)}")
