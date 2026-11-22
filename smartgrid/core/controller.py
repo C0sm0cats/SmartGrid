@@ -2079,10 +2079,19 @@ class Controller:
         self.history.push(self._resize_snapshot or self._snapshot())
         if old_display != target_display:
             value = source.assignments[source_index]
+            index = self._empty_drop_slot(target, window)
             for (display_id, _), profile in self.profiles.items():
                 if display_id == old_display:
                     profile.assignments = [None if a and a.window_id == hwnd else a for a in profile.assignments]
-            target.assignments.append(value)
+            if index is None:
+                target.assignments.append(value)
+            else:
+                target.assignments += [None] * (index + 1 - len(target.assignments))
+                if target.assignments[index] is None:
+                    target.assignments[index] = value
+                else:  # reserved for this app: the tile keeps its own pin
+                    target.assignments[index].window_id = hwnd
+                    self._pending.pop((target_display, target.space, index), None)
             self._apply_profile(source, compact=True)
             self._apply_profile(target, include_new=True, compact=True)
         else:
@@ -2096,6 +2105,20 @@ class Controller:
         self._hide_overlay()
         self._save()
         self._notify()
+
+    def _empty_drop_slot(self, profile, window):
+        """Empty tile that takes a window dropped from another display: the one
+        aimed at, unless it is reserved for another app; else the first pinned
+        one of the app. None: the window is inserted after the others."""
+        rects = self._profile_rects(profile)
+        slots = profile.assignments + [None] * (len(rects) - len(profile.assignments))
+        aimed = nearest_slot(rects, *self._drop_point(window, self._pointer()))
+        if aimed is not None:
+            slot = slots[aimed]
+            if slot is None or slot.window_id is None and slot.app_id == window.app_id:
+                return aimed
+        return next((i for i, a in enumerate(slots[:len(rects)]) if a and a.pinned and a.window_id is None
+                     and a.app_id == window.app_id), None)
 
     def _is_tiled(self, hwnd):
         """A window placed in a tile of the active space of its display."""

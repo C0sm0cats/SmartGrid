@@ -1687,6 +1687,73 @@ class SeveralPinsTests(unittest.TestCase):
             self.assertIn('Chrome',controller.last_error)
 
 
+class CrossDisplayDropTests(unittest.TestCase):
+    def make(self, directory, assignments, preset='auto', tiles=(), windows=()):
+        displays=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(2)]
+        backend=FakeBackend(displays,[record(1,'app','d2'),*windows],[ApplicationRef('app','App'),ApplicationRef('other','Other')])
+        backend.auto_launch=False
+        controller=Controller(backend,Repository(directory))
+        controller.profiles[('d1',0)]=SpaceProfile('d1',0,preset,list(tiles),assignments)
+        controller.start()
+        return backend,controller
+
+    def drop(self, backend, controller, index, hwnd=1):
+        rect=controller.resolved_rects('d1',0)[index]
+        controller._handle_event({'type':'move_start','hwnd':hwnd})
+        backend.cursor=(rect.x+rect.width//2,rect.y+rect.height//2)
+        backend.windows[hwnd]=replace(backend.windows[hwnd],rect=Rect(rect.x+5,rect.y+5,640,480),display_id='d1')
+        controller._handle_event({'type':'move_end','hwnd':hwnd});controller.refresh()
+
+    def tiles(self, controller, display='d1'):
+        return [(a.app_id,a.window_id,a.pinned) if a else None for a in controller.profile(display,0).assignments]
+
+    def test_the_empty_pinned_tile_is_filled(self):
+        # Aimed at, or elsewhere on its display.
+        for aimed in (1,0):
+            with self.subTest(aimed=aimed),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.make(directory,[Assignment('note'),Assignment('app',None,True)],windows=[record(2,'note')])
+                self.drop(backend,controller,aimed)
+                self.assertEqual(self.tiles(controller),[('note',2,False),('app',1,True)])
+                self.assertEqual((self.tiles(controller,'d2'),controller.reserved_slots()),([],[]))
+                self.assertEqual(backend.windows[1].rect,controller.resolved_rects('d1',0)[1])
+
+    def test_the_pinned_tile_aimed_at_is_chosen(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[Assignment('app',None,True) for _ in range(3)])
+            self.drop(backend,controller,1)
+            self.assertEqual([t[1] for t in self.tiles(controller)],[None,1,None])
+
+    def test_a_tile_reserved_for_another_app_is_not_taken(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[Assignment('other',None,True)])
+            self.drop(backend,controller,0)
+            self.assertEqual(self.tiles(controller),[('other',None,True),('app',1,False)])
+
+    def test_the_empty_custom_tile_aimed_at_is_filled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            thirds=[Tile(str(i),i/3,0,1/3,1) for i in range(3)]
+            backend,controller=self.make(directory,[None,None,None],'custom',thirds)
+            self.drop(backend,controller,1)
+            self.assertEqual(self.tiles(controller),[None,('app',1,False),None])
+
+    def test_the_launch_of_the_filled_tile_is_forgotten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[Assignment('app',None,True)])
+            controller.activate_reserved('d1',0,0);self.assertTrue(controller._pending)
+            self.drop(backend,controller,0)
+            self.assertFalse(controller._pending)
+            late=backend.add_window('app',hwnd=20).ref.hwnd;controller.refresh()
+            self.assertEqual([t[1] for t in self.tiles(controller)],[1,late])
+
+    def test_the_drop_is_undone(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,[Assignment('app',None,True)])
+            self.drop(backend,controller,0)
+            controller.undo()
+            self.assertEqual(self.tiles(controller),[('app',None,True)])
+            self.assertEqual([t[1] for t in self.tiles(controller,'d2')],[1])
+
+
 class PinnedCardTests(unittest.TestCase):
     def make(self, directory, windows, assignments, displays=1):
         shown=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(displays)]
