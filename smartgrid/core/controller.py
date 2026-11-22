@@ -1158,8 +1158,10 @@ class Controller:
         profile = self.draft(display_id, space).profile if draft else self.profile(display_id, space)
         return self._profile_rects(profile)
 
-    def _apply_profile(self, profile, include_new=False, launch_missing=False, hide_surplus=False, compact=False, explicit=False, launch_only=None):
-        """launch_only: index of the only tile whose application may be launched."""
+    def _apply_profile(self, profile, include_new=False, launch_missing=False, hide_surplus=False, compact=False, explicit=False, launch_only=None, waiting=None):
+        """launch_only: index of the only tile whose application may be launched.
+        waiting: launches in progress, given to the empty tiles of their app
+        instead of launching it again; those used are removed from the list."""
         self._display(profile.display_id)
         if not getattr(self.backend,'desktop_known',True):
             raise ValueError('Cannot identify the current Windows desktop; arrangement is suspended.')
@@ -1230,6 +1232,8 @@ class Controller:
             if hwnd is None:
                 key = (profile.display_id, profile.space, index)
                 if launch_missing and launch_only in (None, index) and key not in self._pending:
+                    if self._use_waiting(waiting, key, assignment):
+                        continue
                     app = next((a for a in self.apps if a.id == assignment.app_id), None)
                     if app is None:
                         result.unavailable.append(assignment.app_id)
@@ -1518,8 +1522,9 @@ class Controller:
             combined = ApplyResult()
             for key, profile in dirty.items():
                 old = self.profile(*key)
+                waiting = self._take_pending(key)
+                self._keep_arrived(old, profile)
                 removed = {a.window_id for a in old.assignments if a and a.window_id} - {a.window_id for a in profile.assignments if a and a.window_id}
-                self._cancel_pending(key)
                 self.profiles[key] = profile
                 other_memberships = {a.window_id for k, p in self.profiles.items() if k != key for a in p.assignments if a and a.window_id}
                 for hwnd in removed - other_memberships:
@@ -1528,10 +1533,15 @@ class Controller:
                     if self.backend.alive(hwnd):
                         self.backend.show(hwnd)
                 if profile.space == self.active_spaces.get(profile.display_id, 0):
-                    result = self._apply_profile(profile, launch_missing=True, explicit=True)
+                    try:
+                        result = self._apply_profile(profile, launch_missing=True, explicit=True, waiting=waiting)
+                    finally:
+                        self._settle_waiting(waiting, profile)
                     for field in ("placed", "hidden", "launched", "unavailable"):
                         getattr(combined, field).extend(getattr(result, field))
                     combined.failures.update(result.failures)
+                else:
+                    self._settle_waiting(waiting, profile)
                 self.repository.remember_variant(profile)
                 self.drafts[key] = Draft(deepcopy(profile))
                 self._draft_histories.setdefault(key, History(50)).clear()
@@ -1634,11 +1644,14 @@ class Controller:
             self._profile_rects(profile)
             self.history.push(self._snapshot())
             self._generation += 1
-            self._cancel_pending((display_id, space))
+            waiting = self._take_pending((display_id, space))
             self.running, self.paused = True, False
             self.profiles[(display_id, space)] = profile
             self.active_spaces[display_id] = space
-            self._apply_profile(profile, launch_missing=True, hide_surplus=True, compact=True, explicit=True)
+            try:
+                self._apply_profile(profile, launch_missing=True, hide_surplus=True, compact=True, explicit=True, waiting=waiting)
+            finally:
+                self._settle_waiting(waiting, profile)
             self.repository.remember_variant(profile)
             self.drafts[(display_id, space)] = Draft(deepcopy(profile))
             self._save()
@@ -1676,6 +1689,53 @@ class Controller:
                 self._cancelled_launches.append(dict(pending))
                 self._pending.pop(key,None)
         self._warn_slow_launches()
+
+    def _take_pending(self, context):
+        """The launches in progress of a space whose arrangement is replaced.
+        Older ones are cancelled: their app is launched again."""
+        now = time.monotonic()
+        recent = {key: value for key, value in sorted(self._pending.items())
+                  if key[:2] == context and now - value["created"] < self.UNPINNED_LAUNCH_WAIT}
+        for key in recent:
+            del self._pending[key]
+        self._cancel_pending(context)
+        return list(recent.values())
+
+    def _use_waiting(self, waiting, key, assignment):
+        entry = next((p for p in waiting or () if p["app_id"] == assignment.app_id), None)
+        if entry is None:
+            return False
+        waiting.remove(entry)
+        self._pending[key] = entry
+        return True
+
+    def _settle_waiting(self, waiting, profile):
+        """Launches not used by the arrangement (hidden space, fullscreen
+        window): for the empty tiles of their app, else cancelled."""
+        for index, assignment in enumerate(profile.assignments):
+            key = (profile.display_id, profile.space, index)
+            if assignment and assignment.window_id is None and key not in self._pending:
+                self._use_waiting(waiting, key, assignment)
+        self._cancelled_launches.extend(waiting)
+        waiting.clear()
+        self._warn_slow_launches()
+
+    def _keep_arrived(self, old, profile):
+        """A window that arrived in a tile while it was edited in the Studio
+        goes to a tile of the edited arrangement still reserved for its app:
+        its own first. A window whose tile was cleared does not come back: the
+        edit then has no more empty tiles for the app than before."""
+        def empty(arrangement, app_id):
+            return [i for i, a in enumerate(arrangement.assignments) if a and a.window_id is None and a.app_id == app_id]
+        for own in (True, False):
+            for index, assignment in enumerate(old.assignments):
+                window = self._window(assignment.window_id) if assignment and assignment.window_id else None
+                if (window is None or not self._eligible(window)
+                        or any(a and a.window_id == window.ref.hwnd for a in profile.assignments)):
+                    continue
+                slots = empty(profile, window.app_id)
+                if len(slots) > len(empty(old, window.app_id)) and (index in slots or not own):
+                    profile.assignments[index if own else slots[0]].window_id = window.ref.hwnd
 
     def _has_open_window(self, app_id, display_id=None):
         """A window of the app (on that display), floating and fullscreen ones
@@ -2106,6 +2166,10 @@ class Controller:
                     self._fill_pinned_slot(target, source_index, index)
                 else:
                     target.assignments[source_index], target.assignments[index] = aimed, value
+                    # A launch waiting for the tile aimed at follows it.
+                    waiting = self._pending.pop((target_display, target.space, index), None)
+                    if waiting:
+                        self._pending[(target_display, target.space, source_index)] = waiting
             self._apply_profile(target)
         self._hide_overlay()
         self._save()
