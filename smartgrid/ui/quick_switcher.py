@@ -120,6 +120,7 @@ class QuickSwitcher(QDialog):
         self.bridge.changed.connect(self.refresh_from_controller,Qt.ConnectionType.QueuedConnection)
         self.bridge.busy_changed.connect(lambda busy:self.arrange.setEnabled(not busy))
         self._template_signature=None
+        self._list_scroll=None
         self.refresh_from_controller()
         # Catalogue refresh is lazy: opening the picker is an explicit need for it.
         self.bridge.submit('refresh_apps',on_success=lambda _:self.refresh_previews())
@@ -168,6 +169,7 @@ class QuickSwitcher(QDialog):
         if signature!=self._template_signature:
             self._template_signature=signature
             current=self.list.currentItem().data(Qt.ItemDataRole.UserRole) if self.list.currentItem() else None
+            scroll=self._scroll_position() if self.list.count() else None
             with QSignalBlocker(self.list):
                 self.list.clear()
                 category=None
@@ -188,7 +190,24 @@ class QuickSwitcher(QDialog):
                 self.effects.setText("Create a layout in Studio to see it here.")
             self.refresh_previews()
             self.filter_templates()
+            self._list_scroll=None
+            item=self.list.currentItem()
+            if scroll is not None and item and item.data(Qt.ItemDataRole.UserRole)==current:
+                # Selecting the layout again scrolled the list to it.
+                self._list_scroll=(scroll,self._scroll_to(scroll))
         self._selection_changed()
+
+    def _scroll_position(self):
+        """Where the user left the list: a rebuilt list may be too short for it
+        until its previews are known."""
+        value=self.list.verticalScrollBar().value()
+        kept,shown=self._list_scroll or (value,value)
+        return kept if value==shown else value
+
+    def _scroll_to(self,value):
+        self.list.doItemsLayout()
+        self.list.verticalScrollBar().setValue(value)
+        return self.list.verticalScrollBar().value()
 
     def filter_templates(self):
         query=self.search.text().casefold().strip()
@@ -234,6 +253,9 @@ class QuickSwitcher(QDialog):
             if generation!=self._preview_generation:
                 return
             self.previews=previews
+            # The heights set below move the list.
+            scroll=self._scroll_position() if self._list_scroll else None
+            self._list_scroll=None
             for row in range(self.list.count()):
                 item=self.list.item(row)
                 key=item.data(Qt.ItemDataRole.UserRole)
@@ -248,6 +270,8 @@ class QuickSwitcher(QDialog):
                     item.setData(Qt.ItemDataRole.UserRole+3,self.controller.running and profile.preset==template.preset
                                  and [a.app_id if a else None for a in profile.assignments]==[a.app_id if a else None for a in template.assignments])
                     item.setSizeHint(QSize(0,82))
+            if scroll is not None:
+                self._scroll_to(scroll)
         self._selection_changed()
         self.bridge.submit(preview_all,on_success=ready)
 

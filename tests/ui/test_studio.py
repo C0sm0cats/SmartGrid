@@ -367,6 +367,34 @@ class UITests(unittest.TestCase):
             self.assertIn('1 open',studio.saved_summary.text())
             bridge_for(controller).shutdown();controller.quit()
 
+    def test_the_switcher_list_stays_where_it_was_scrolled(self):
+        from smartgrid.core.models import SpaceProfile
+        for i in range(30): self.controller.save_profile_template(f'L{i:02}',SpaceProfile('demo-primary',0,'2x2',assignments=[Assignment('editor')]))
+        picker=QuickSwitcher(self.controller);self.widgets.append(picker);picker.show();self.settle()
+        bar=picker.list.verticalScrollBar();row=picker.list.currentRow()
+        self.assertGreater(bar.maximum(),4)
+        for value in (bar.maximum()//2,bar.maximum()):
+            bar.setValue(value)
+            # One rebuild, then two before the previews are known.
+            for rebuilds in (1,2):
+                for _ in range(rebuilds):
+                    self.controller.backend.add_window('browser');self.controller.refresh()
+                    picker.refresh_from_controller()
+                self.settle()
+                self.assertEqual((bar.value(),picker.list.currentRow()),(value,row))
+        # A scroll while the previews are calculated is kept too.
+        self.controller.backend.add_window('browser');self.controller.refresh();picker.refresh_from_controller()
+        bar.setValue(2);self.settle()
+        self.assertEqual(bar.value(),2)
+        # The selected layout is deleted: the new selection is shown.
+        picker.list.setCurrentRow(1);bar.setValue(bar.maximum())
+        self.controller.delete_template(picker.list.currentItem().data(256))
+        picker.refresh_from_controller();self.settle()
+        self.assertLessEqual(bar.value(),picker.list.currentRow())
+        # The selection still scrolls the list into view.
+        picker.list.setCurrentRow(picker.list.count()-1)
+        self.assertGreater(bar.value(),2)
+
     def test_an_unpinned_tile_that_opens_says_so(self):
         from smartgrid.ui.tile_view import TileCard
         card=TileCard(0,self.controller.settings);self.widgets.append(card)
