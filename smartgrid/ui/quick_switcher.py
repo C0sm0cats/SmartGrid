@@ -164,7 +164,7 @@ class QuickSwitcher(QDialog):
         self.search.setVisible(bool(self.controller.templates))
         signature=(self.display_id,self.space,tuple(repr(t.to_dict()) for t in self.controller.templates),
             tuple((w.ref,w.app_id,w.state,w.display_id,w.eligible) for w in self.controller.windows),
-            tuple(a.id for a in self.controller.apps))
+            tuple(a.id for a in self.controller.apps),self.controller.launch_signature(self.display_id,self.space))
         if signature!=self._template_signature:
             self._template_signature=signature
             current=self.list.currentItem().data(Qt.ItemDataRole.UserRole) if self.list.currentItem() else None

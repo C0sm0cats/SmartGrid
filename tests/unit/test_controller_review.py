@@ -2108,6 +2108,29 @@ class ReplacedArrangementLaunchTests(unittest.TestCase):
             controller.swap_draft('d1',0,0,1);controller.apply_drafts([('d1',0)])
             self.assertEqual(([k for k in controller._pending],backend.launches),([('d1',0,0)],['app']))
 
+    def test_opening_tiles_of_a_draft_are_those_that_wait_after_apply(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,2)
+            opening=lambda:controller.opening_slots('d1',0,controller.draft('d1',0).profile)
+            self.assertEqual(opening(),{1,2})
+            controller.swap_draft('d1',0,0,1);self.assertEqual(opening(),{0,2})
+            controller.set_assignment('d1',0,2,None);self.assertEqual(opening(),{0})
+            controller.set_assignment('d1',0,2,Assignment('other'));self.assertEqual(opening(),{0})
+            self.assertEqual(controller.opening_slots('d1',1,controller.draft('d1',0).profile),set())
+            controller.apply_drafts()
+            self.assertEqual({k[2] for k,p in controller._pending.items() if p['app_id']=='app'},{0})
+
+    def test_the_launch_signature_follows_the_launches(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory)
+            self.assertEqual(controller.launch_signature('d1',0),((1,'app'),))
+            self.assertEqual(controller.launch_signature('d1',1),())
+            for pending in controller._pending.values(): pending['created']-=121
+            self.assertEqual(controller.launch_signature('d1',0),())
+            for pending in controller._pending.values(): pending['created']+=121
+            self.arrive(backend,controller)
+            self.assertEqual(controller.launch_signature('d1',0),())
+
     def test_the_preview_does_not_count_launches_in_progress(self):
         with tempfile.TemporaryDirectory() as directory:
             backend,controller=self.make(directory)

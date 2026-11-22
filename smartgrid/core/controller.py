@@ -1785,6 +1785,22 @@ class Controller:
     def _recent_launches(self, context):
         return [value["app_id"] for value in self._recent_pending(context).values()]
 
+    def launch_signature(self, display_id, space):
+        """Changes with the launches in progress counted by preview_template."""
+        return tuple((key[2], value["app_id"]) for key, value in self._recent_pending((display_id, space)).items())
+
+    def opening_slots(self, display_id, space, profile):
+        """Empty tiles of this arrangement (a Studio draft) whose app is being
+        opened: the launch of a moved tile follows it, as it does on Apply."""
+        empty = {i: a.app_id for i, a in enumerate(profile.assignments) if a and a.window_id is None}
+        launches = sorted((key[2], value["app_id"]) for key, value in list(self._pending.items())
+                          if key[:2] == (display_id, space))
+        slots = {index for index, app_id in launches if empty.get(index) == app_id}
+        for index, app_id in launches:
+            if empty.get(index) != app_id:
+                slots.update([i for i, a in sorted(empty.items()) if a == app_id and i not in slots][:1])
+        return slots
+
     def _use_waiting(self, waiting, key, assignment):
         entry = next((p for p in waiting or () if p["app_id"] == assignment.app_id), None)
         if entry is None:

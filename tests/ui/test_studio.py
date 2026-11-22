@@ -332,6 +332,49 @@ class UITests(unittest.TestCase):
             card.describe(Assignment('chrome',None,True),app if known else None,app_open=True,state=state)
             self.assertEqual(card.title,'PINNED · '+title)
 
+    def test_opening_tiles_and_counts_follow_the_launches(self):
+        from smartgrid.core.models import ApplicationRef, Display, Rect, SpaceProfile
+        from smartgrid.platform.fake import FakeBackend
+        with tempfile.TemporaryDirectory() as directory:
+            backend=FakeBackend([Display('d1','D',Rect(0,0,1920,1080),primary=True)],[],
+                                [ApplicationRef('chrome','Chrome'),ApplicationRef('note','Note')])
+            backend.auto_launch=False
+            note=backend.add_window('note').ref.hwnd
+            controller=Controller(backend,Repository(directory));controller.refresh_apps()
+            controller.profiles[('d1',0)]=SpaceProfile('d1',0,assignments=[Assignment('note',note),Assignment('chrome',None,True)])
+            controller.start()
+            def settle():
+                deadline=time.monotonic()+5
+                while bridge_for(controller).pending and time.monotonic()<deadline:
+                    self.app.processEvents();time.sleep(.01)
+                for _ in range(5): self.app.processEvents()
+            template=controller.save_profile_template('Saved',SpaceProfile('d1',0,'2x2',assignments=[Assignment('note'),Assignment('chrome')]))
+            studio=Studio(controller);self.widgets.append(studio);settle()
+            picker=QuickSwitcher(controller);self.widgets.append(picker);settle()
+            titles=lambda:[c.title for c in studio.canvas.cards[:2]]
+            self.assertEqual(titles()[1],'PINNED · CLOSED')
+            self.assertEqual(picker.previews[template.id]['open'],1)
+            controller.activate_reserved('d1',0,1);settle();studio.refresh_from_controller();picker.refresh_from_controller();settle()
+            self.assertEqual(titles()[1],'PINNED · OPENING')
+            # The counts follow without any window having changed.
+            self.assertEqual(picker.previews[template.id]['open'],0)
+            controller.swap_draft('d1',0,0,1);settle();studio.refresh_from_controller()
+            self.assertEqual(titles()[0],'PINNED · OPENING')
+            controller.reset_draft('d1',0);settle()
+            studio.template_id=template.id;studio._activate_mode('edit');settle()
+            self.assertIn('0 open',studio.saved_summary.text())
+            controller._cancel_pending();controller._notify();settle();studio.refresh_from_controller();settle()
+            self.assertIn('1 open',studio.saved_summary.text())
+            bridge_for(controller).shutdown();controller.quit()
+
+    def test_an_unpinned_tile_that_opens_says_so(self):
+        from smartgrid.ui.tile_view import TileCard
+        card=TileCard(0,self.controller.settings);self.widgets.append(card)
+        for pending,title,spoken in ((True,'OPENING','opening'),(False,'OPENS ON APPLY','opens on Apply')):
+            card.describe(Assignment('chrome'),None,pending=pending)
+            self.assertEqual(card.title,title)
+            self.assertTrue(card.accessibleName().endswith(spoken))
+
     def test_studio_tiles_say_the_same_as_the_cards(self):
         from smartgrid.core.models import ApplicationRef, Display, Rect, SpaceProfile, WindowRecord, WindowRef
         from smartgrid.platform.fake import FakeBackend

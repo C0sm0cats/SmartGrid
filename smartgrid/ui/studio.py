@@ -545,12 +545,7 @@ class Studio(QMainWindow):
                                 spaces.append(s)
                         if len(spaces)>1:
                             shared[i]=spaces
-            pending=getattr(self.controller,'pending',{})
-            pending_slots=set()
-            values=pending.values() if isinstance(pending,dict) else pending
-            for p in values:
-                if getattr(p,'display_id',None)==self.display_id and getattr(p,'space',None)==self.space:
-                    pending_slots.add(getattr(p,'index',-1))
+            pending_slots=self.controller.opening_slots(self.display_id,self.space,profile) if self.mode=='current' else set()
             self.canvas.settings=studio_settings(self.controller.settings)
             self.canvas.active_hwnd=getattr(self.controller,'_last_tiled_selection',None)
             self.canvas.set_profile(profile,display,self.controller.apps,self.controller.windows,shared,pending_slots,runtime=self.mode=='current',
@@ -604,7 +599,8 @@ class Studio(QMainWindow):
         if required is None:
             required=max((i+1 for i,a in enumerate(profile.assignments) if a),default=0)
         windows=sum(1 for a in profile.assignments if a and a.window_id)
-        pending=sum(1 for a in profile.assignments if a and not a.window_id and not a.pinned)
+        opening=self.controller.opening_slots(self.display_id,self.space,profile) if self.mode=='current' else ()
+        pending=sum(1 for i,a in enumerate(profile.assignments) if a and not a.window_id and not a.pinned and i not in opening)
         tiles=len(self.canvas.cards)
         preset=profile.preset
         self.legend.setVisible(self.mode=='current')
@@ -647,7 +643,8 @@ class Studio(QMainWindow):
         self.effect.setVisible(bool(text) and self.height()>=600)
 
     def _refresh_saved_summary(self,template_id,content=''):
-        key=(template_id,content,self.display_id,self.space,tuple((w.ref.hwnd,w.state) for w in self.controller.windows))
+        key=(template_id,content,self.display_id,self.space,tuple((w.ref.hwnd,w.state) for w in self.controller.windows),
+             self.controller.launch_signature(self.display_id,self.space))
         if getattr(self,'_summary_key',None)==key: return
         self._summary_key=key
         self.saved_summary.setText('PREVIEW')

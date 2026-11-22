@@ -100,7 +100,7 @@ class TileCard(QAbstractButton):
         elif assignment.pinned:
             description = f"Tile {self.index + 1}: {self.app_name}, pinned, {self.title.split(' · ')[1].lower()}"
         else:
-            description = f"Tile {self.index + 1}: {self.app_name}, opens on Apply"
+            description = f"Tile {self.index + 1}: {self.app_name}, {'opening' if pending else 'opens on Apply'}"
         if window and window.exclusion_reason:
             description += ". " + window.exclusion_reason
         self.setAccessibleName(description)
