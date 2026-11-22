@@ -2021,6 +2021,63 @@ class ReplacedArrangementLaunchTests(unittest.TestCase):
                 self.assertEqual(self.tiles(controller),[None,('app',20 if arrived else None)])
                 self.assertEqual(controller._floating,{1})
 
+    def opening(self, directory, displays=1):
+        """On each display, tile 1 holds a window of the app, tile 2 opens one."""
+        shown=[Display(f'd{i+1}',f'D{i+1}',Rect(1920*i,0,1920,1080),primary=not i) for i in range(displays)]
+        backend=FakeBackend(shown,[record(i+1,'app',d.id) for i,d in enumerate(shown)],[ApplicationRef('app','App')])
+        backend.auto_launch=False
+        controller=Controller(backend,Repository(directory))
+        for i,d in enumerate(shown):
+            controller.profiles[(d.id,0)]=SpaceProfile(d.id,0,assignments=[Assignment('app',i+1),Assignment('app',None,True)])
+        controller.start()
+        for d in shown: controller.activate_reserved(d.id,0,1)
+        return backend,controller
+
+    def test_a_cleared_window_stays_out_when_the_awaited_tile_is_moved(self):
+        for clears_first in (True,False):
+            with self.subTest(clears_first=clears_first),tempfile.TemporaryDirectory() as directory:
+                backend,controller=self.opening(directory)
+                if clears_first:
+                    controller.set_assignment('d1',0,0,None);controller.swap_draft('d1',0,0,1)
+                else:
+                    controller.swap_draft('d1',0,0,1);controller.set_assignment('d1',0,1,None)
+                self.arrive(backend,controller)
+                controller.apply_drafts()
+                self.assertEqual([t for t in self.tiles(controller) if t],[('app',20)])
+                self.assertEqual((controller._floating,backend.launches),({1},['app']))
+
+    def test_edits_on_two_displays_are_applied_together(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.opening(directory,2)
+            for d in ('d1','d2'):
+                controller.set_assignment(d,0,0,None);controller.swap_draft(d,0,0,1)
+            self.arrive(backend,controller,20);self.arrive(backend,controller,21)
+            controller.apply_drafts()
+            held=[[a.window_id for a in controller.profile(d,0).assignments if a] for d in ('d1','d2')]
+            self.assertEqual((sorted(sum(held,[])),controller._floating),([20,21],{1,2}))
+            self.assertEqual([len(h) for h in held],[1,1])
+
+    def test_an_edit_undone_then_made_again_starts_from_the_current_windows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.opening(directory)
+            controller.set_assignment('d1',0,0,None);controller.undo_draft('d1',0)
+            self.assertFalse(controller.draft('d1',0).dirty)
+            self.arrive(backend,controller)
+            # Both windows are in the arrangement the second edit starts from.
+            controller.set_assignment('d1',0,1,None)
+            controller.apply_drafts()
+            self.assertEqual([t for t in self.tiles(controller) if t],[('app',1)])
+            self.assertEqual(controller._floating,{20})
+
+    def test_the_window_of_a_cleared_awaited_tile_floats(self):
+        with tempfile.TemporaryDirectory() as directory:
+            backend,controller=self.make(directory,2)
+            controller.set_assignment('d1',0,1,None)
+            self.arrive(backend,controller)
+            controller.apply_drafts()
+            self.assertEqual(self.tiles(controller)[1:],[None,('app',None)])
+            self.assertEqual(controller._floating,{20})
+
     def test_apply_launches_only_the_tiles_added(self):
         with tempfile.TemporaryDirectory() as directory:
             backend,controller=self.make(directory,2)

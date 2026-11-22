@@ -63,6 +63,7 @@ class Controller:
         self.apps = []
         self.active_spaces = {}
         self.drafts = {}
+        self._draft_windows = {}
         self._draft_histories = {}
         self.history = History(10)
         self.running = False
@@ -438,7 +439,11 @@ class Controller:
 
     def _draft_checkpoint(self, display_id, space):
         key = (display_id, space)
-        self._draft_histories.setdefault(key, History(50)).push(self.draft(*key).profile)
+        draft = self.draft(*key)
+        if not draft.dirty:
+            # The windows an edit starts from: the others arrive during it.
+            self._draft_windows[key] = {a.window_id for a in draft.profile.assignments if a and a.window_id}
+        self._draft_histories.setdefault(key, History(50)).push(draft.profile)
 
     def _draft_changed(self, display_id, space):
         draft = self.draft(display_id, space)
@@ -1588,7 +1593,7 @@ class Controller:
             for key, profile in dirty.items():
                 old = self.profile(*key)
                 waiting = self._take_pending(key)
-                self._keep_arrived(old, profile)
+                self._keep_arrived(old, profile, self._draft_windows.pop(key, set()))
                 removed = {a.window_id for a in old.assignments if a and a.window_id} - {a.window_id for a in profile.assignments if a and a.window_id}
                 self.profiles[key] = profile
                 other_memberships = {a.window_id for k, p in self.profiles.items() if k != key for a in p.assignments if a and a.window_id}
@@ -1785,17 +1790,18 @@ class Controller:
         waiting.clear()
         self._warn_slow_launches()
 
-    def _keep_arrived(self, old, profile):
+    def _keep_arrived(self, old, profile, before):
         """A window that arrived in a tile while it was edited in the Studio
         goes to a tile of the edited arrangement still reserved for its app:
-        its own first. A window whose tile was cleared does not come back: the
-        edit then has no more empty tiles for the app than before."""
+        its own first. A window the edit started from (`before`) does not come
+        back if its tile was cleared, nor one whose awaited tile was: the edit
+        then has no more empty tiles for the app than the arrangement."""
         def empty(arrangement, app_id):
             return [i for i, a in enumerate(arrangement.assignments) if a and a.window_id is None and a.app_id == app_id]
         for own in (True, False):
             for index, assignment in enumerate(old.assignments):
                 window = self._window(assignment.window_id) if assignment and assignment.window_id else None
-                if (window is None or not self._eligible(window)
+                if (window is None or window.ref.hwnd in before or not self._eligible(window)
                         or any(a and a.window_id == window.ref.hwnd for a in profile.assignments)):
                     continue
                 slots = empty(profile, window.app_id)
