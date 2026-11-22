@@ -16,6 +16,11 @@ CALLBACK = getattr(C, 'WINFUNCTYPE', C.CFUNCTYPE)
 
 class POINT(C.Structure):
     _fields_ = [('x', LONG), ('y', LONG)]
+class MOUSEINPUT(C.Structure):
+    _fields_ = [('dx', LONG), ('dy', LONG), ('mouseData', DWORD), ('dwFlags', DWORD), ('time', DWORD), ('dwExtraInfo', ULONG_PTR)]
+class INPUT(C.Structure):
+    # The mouse member is the largest of the native union.
+    _fields_ = [('type', DWORD), ('mi', MOUSEINPUT)]
 class RECT(C.Structure):
     _fields_ = [('left', LONG), ('top', LONG), ('right', LONG), ('bottom', LONG)]
 class DWM_THUMBNAIL_PROPERTIES(C.Structure):
@@ -73,7 +78,7 @@ class Win32:
                 'SetWindowPos': (BOOL, [HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
                 'BeginDeferWindowPos': (HANDLE, [C.c_int]), 'EndDeferWindowPos': (BOOL, [HANDLE]),
                 'DeferWindowPos': (HANDLE, [HANDLE, HWND, HWND, C.c_int, C.c_int, C.c_int, C.c_int, UINT]),
-                'ShowWindowAsync': (BOOL, [HWND, C.c_int]), 'SetForegroundWindow': (BOOL, [HWND]), 'GetForegroundWindow': (HWND, []), 'WindowFromPoint': (HWND, [POINT]),
+                'ShowWindowAsync': (BOOL, [HWND, C.c_int]), 'SetForegroundWindow': (BOOL, [HWND]), 'GetForegroundWindow': (HWND, []), 'WindowFromPoint': (HWND, [POINT]), 'SendInput': (UINT, [UINT, p(INPUT), C.c_int]),
                 'PostMessageW': (BOOL, [HWND, UINT, WPARAM, LPARAM]),
                 'SendMessageTimeoutW': (LRESULT, [HWND, UINT, WPARAM, LPARAM, UINT, UINT, p(ULONG_PTR)]),
                 'SetWinEventHook': (HANDLE, [DWORD, DWORD, HANDLE, WINEVENTPROC, DWORD, DWORD, DWORD]), 'UnhookWinEvent': (BOOL, [HANDLE]),

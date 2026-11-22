@@ -181,9 +181,6 @@ class FakeBackend:
         self._to_front(hwnd)
         return True
 
-    def accepts_activation(self, hwnd):
-        return hwnd in self.windows
-
     def activate(self, hwnd):
         self.operations.append(('activate', hwnd))
         if hwnd in self.failures:

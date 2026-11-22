@@ -10,7 +10,7 @@ import time
 from functools import wraps
 from smartgrid.core.models import Rect, Display, WindowRef, WindowRecord
 from smartgrid.core.exclusions import excluded_class
-from .api import Win32, RECT, POINT, DWORD, UINT, BOOL, MONITORINFOEX, DISPLAY_DEVICE, MONITORPROC, ENUMPROC, WINDOWPLACEMENT, MINMAXINFO, ULONG_PTR, WINEVENTPROC
+from .api import Win32, RECT, POINT, INPUT, DWORD, UINT, BOOL, MONITORINFOEX, DISPLAY_DEVICE, MONITORPROC, ENUMPROC, WINDOWPLACEMENT, MINMAXINFO, ULONG_PTR, WINEVENTPROC
 from .apps import AppCatalogue
 from .messages import MessageThread
 from .virtual_desktops import VirtualDesktops,scoped_display
@@ -746,23 +746,28 @@ class WindowsBackend:
             found.append(int(current))
         return found
 
-    def accepts_activation(self, hwnd):
-        """Neither disabled (a dialog of its own is open: WS_DISABLED) nor made
-        never to be activated (WS_EX_NOACTIVATE)."""
-        return bool(self.alive(hwnd) and not self.api.GetWindowLong(hwnd, -16) & 0x08000000
-                    and not self.api.GetWindowLong(hwnd, -20) & 0x08000000)
-
     def activate(self, hwnd):
         """Give the foreground to a window without changing its state: focus()
         restores a maximized one. True when Windows accepted at once."""
         if not self.alive(hwnd) or self._hung(hwnd):
             return False
-        if self.foreground() != hwnd:
-            self.api.SetForegroundWindow(hwnd)
+        if self.foreground() == hwnd:
+            return True
+        self._request_foreground(hwnd)
+        step = 'set'
         if self.foreground() != hwnd and self.api.SwitchToThisWindow:
-            # Windows may refuse the call above to a background process.
             self.api.SwitchToThisWindow(hwnd, True)
-        return self.foreground() == hwnd
+            step = 'switch'
+        accepted = self.foreground() == hwnd
+        log.info('Foreground asked for %s: %s', hwnd, step if accepted else 'refused')
+        return accepted
+
+    def _request_foreground(self, hwnd):
+        """Windows refuses the foreground to a process that did not receive the
+        last input: a null mouse input first (no move, no button)."""
+        null = INPUT()
+        self.api.SendInput(1, C.byref(null), C.sizeof(INPUT))
+        self.api.SetForegroundWindow(hwnd)
 
     def returns_maximized(self, hwnd):
         """Minimized while maximized: Windows brings it back maximized."""
@@ -777,7 +782,10 @@ class WindowsBackend:
         and nothing done, for any other window."""
         if self._hung(hwnd) or not self.returns_maximized(hwnd):
             return False
-        self.api.SetForegroundWindow(hwnd)
+        before = self.foreground()
+        if before != hwnd:
+            self._request_foreground(hwnd)
+        log.info('Recall of %s: foreground %s, then %s', hwnd, before, self.foreground())
         self.api.ShowWindowAsync(hwnd, 9)  # SW_RESTORE
         deadline = time.monotonic() + .5
         while self.alive(hwnd) and time.monotonic() < deadline:
@@ -877,7 +885,7 @@ class WindowsBackend:
                 return None
             self._events = MessageThread(self.api, 'SmartGrid WinEvents', window_message)
             def install():
-                event_types = {0x8000:'created', 0x8001:'destroyed', 0x8002:'shown', 0x8003:'hidden', 0x800b:'location', 0x800c:'title', 3:'foreground', 8:'capture', 0xa:'move_start', 0xb:'move_end', 0x16:'minimized', 0x17:'restored'}
+                event_types = {0x8000:'created', 0x8001:'destroyed', 0x8002:'shown', 0x8003:'hidden', 0x800b:'location', 0x800c:'title', 3:'foreground', 0xa:'move_start', 0xb:'move_end', 0x16:'minimized', 0x17:'restored'}
                 def event_proc(hook, event, hwnd, object_id, child_id, thread_id, event_time):
                     if not hwnd or (event >= 0x8000 and (object_id != 0 or child_id != 0)):
                         return
@@ -886,9 +894,6 @@ class WindowsBackend:
                         # resized (dozens per step): nothing to follow there.
                         return
                     payload = {'type':event_types.get(event, 'changed'), 'hwnd':int(hwnd), 'native_time':event_time}
-                    if event == 8:
-                        # The mouse pressed in a window, or in one of its children.
-                        payload['hwnd'] = int(self.api.GetAncestor(hwnd, 2) or hwnd)
                     if event == 0xa:
                         # The window and the pointer as the gesture starts,
                         # before the runtime handles it.

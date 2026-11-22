@@ -653,12 +653,6 @@ class Controller:
             self._native_gestures[event["hwnd"]] = time.monotonic()
         elif kind in ("move_end", "resize_end", "movesize_end", "destroyed"):
             self._native_gestures.pop(event.get("hwnd"), None)
-        if kind == "capture":
-            try:
-                self._press_in(event.get("hwnd"))
-            except Exception:
-                log.exception("Mouse press could not be read")
-            return
         if event.get("type") in ("location", "location_change") and event.get("hwnd"):
             self._notify_follow(event["hwnd"])
             if event["hwnd"] in self._tile_rects:
@@ -835,54 +829,6 @@ class Controller:
                                            retries=1, force=True)
             for hwnd in [h for h in self._guard_fixed if now - self._guard_fixed[h][-1] > 3]:
                 self._guard_fixed.pop(hwnd)
-
-    def _pressed_behind(self, hwnd):
-        """The foreground window, when the mouse is pressed in the title bar of
-        another one, tiled and in its normal state; None otherwise."""
-        backend, window, tile = self.backend, self._window(hwnd), self._tile_rects.get(hwnd)
-        if (not window or not tile or window.state != "normal" or not self._is_tiled(hwnd)
-                or self._interacting or self._native_gestures or self._swap_snapshot is not None
-                or not getattr(backend, "desktop_known", True)
-                or backend.is_maximized(hwnd) or backend.is_minimized(hwnd) or not backend.accepts_activation(hwnd)):
-            return None
-        foreground, pointer, rect = backend.foreground(), self._pointer(), backend.window_rect(hwnd)
-        display = next((d for d in self.displays if d.id == tile[0]), None)
-        if (not foreground or foreground == hwnd or not pointer or not rect or not display or not rect.contains(*pointer)
-                or pointer[1] - rect.y > TITLE_BAR * display.dpi / 96 or backend.window_at(pointer) != hwnd):
-            return None
-        return foreground
-
-    def _press_in(self, hwnd):
-        """The mouse just pressed in a window. Windows activates a window at the
-        press; the buttons some applications draw (GitHub Copilot) do not let
-        it, and their window was seen maximizing behind its neighbours. Checked
-        a moment later, for Windows to do it first."""
-        if hwnd not in self._tile_rects or not hasattr(self.backend, "accepts_activation"):
-            return
-        if not getattr(self.backend, "mouse_down", lambda: False)():
-            return
-        # Only read here, on the event thread; the rest under the lock.
-        foreground = self.backend.foreground()
-        if not foreground or foreground == hwnd:
-            return
-        timer = threading.Timer(.02, self._activate_pressed, (hwnd, foreground))
-        timer.daemon = True
-        timer.start()
-
-    def _activate_pressed(self, hwnd, before):
-        try:
-            # A busy runtime is not waited for past the click.
-            if self._stop_event.is_set() or not self._lock.acquire(timeout=.1):
-                return
-            try:
-                if not self._stop_event.is_set() and self._pressed_behind(hwnd) == before:
-                    accepted = self.backend.activate(hwnd)
-                    log.info("Pressed %s was not activated: activated (%s, foreground was %s)", hwnd,
-                             "accepted" if accepted else "refused", before)
-            finally:
-                self._lock.release()
-        except Exception:
-            log.exception("Pressed window could not be activated")
 
     def _note_maximized(self, hwnd):
         """Read as soon as a tiled window is maximized, on the event thread: the

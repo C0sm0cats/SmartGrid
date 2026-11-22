@@ -3,7 +3,7 @@ from contextlib import nullcontext
 import sys
 from unittest import TestCase
 from smartgrid.core.models import Rect, ApplicationRef
-from smartgrid.platform.windows.api import RECT, WINDOWPLACEMENT, MSG, HWND, LPARAM, DWORD, Win32
+from smartgrid.platform.windows.api import INPUT, RECT, WINDOWPLACEMENT, MSG, HWND, LPARAM, DWORD, Win32
 from smartgrid.platform.windows.backend import WindowsBackend, eligibility, animation_rect
 from smartgrid.platform.windows.apps import application_id
 from smartgrid.platform.windows.hotkeys import parse_shortcut
@@ -341,6 +341,7 @@ class BringToFrontTests(TestCase):
             GetWindowLong=lambda h, i: 8 if h in topmost else 0,
             IsWindow=lambda h: 1, IsHungAppWindow=lambda h: hung,
             GetForegroundWindow=lambda: state['foreground'],
+            SendInput=lambda count, pointer, size: state.setdefault('inputs', []).append((count, size)) or 1,
             SetForegroundWindow=foreground_call('set', accepts),
             SwitchToThisWindow=foreground_call('switch', switch),
             SetWindowPos=lambda h, after, *rest: state['calls'].append((after.value, rest[-1])) or 1)
@@ -351,6 +352,16 @@ class BringToFrontTests(TestCase):
         self.assertEqual(backend.windows_above(4), [3, 2])
         self.assertEqual(backend.windows_above(2), [])
         self.assertEqual(backend.windows_above(1), [])
+
+    def test_foreground_is_asked_after_a_null_mouse_input(self):
+        self.assertEqual(C.sizeof(INPUT), 40 if C.sizeof(C.c_void_p) == 8 else 28)
+        self.assertEqual(bytes(INPUT()), bytes(C.sizeof(INPUT)))  # INPUT_MOUSE, no move, no button
+        backend, state = self.backend([2, 1], foreground=2)
+        backend.activate(1)
+        self.assertEqual(state['inputs'], [(1, C.sizeof(INPUT))])
+        backend, state = self.backend([2, 1], foreground=1)
+        backend.activate(1)
+        self.assertNotIn('inputs', state)
 
     def test_activation_falls_back_when_windows_refuses_the_foreground(self):
         backend, state = self.backend([2, 1], foreground=2)
@@ -385,12 +396,6 @@ class BringToFrontTests(TestCase):
             backend.api.IsZoomed = lambda h: not shown['iconic']
             self.assertEqual(backend.recall_maximized(1), bool(expected))
             self.assertEqual(state['calls'], expected)
-
-    def test_disabled_and_never_activated_windows_are_told(self):
-        for style, exstyle, expected in ((0x14cf0000, 0, True), (0x1ccf0000, 0, False), (0x14cf0000, 0x08000000, False)):
-            backend, _ = self.backend([1])
-            backend.api.GetWindowLong = lambda h, i: style if i == -16 else exstyle
-            self.assertEqual(backend.accepts_activation(1), expected)
 
     def test_a_hung_or_always_on_top_window_is_left_alone(self):
         backend, state = self.backend([2, 1], foreground=2, hung=True)

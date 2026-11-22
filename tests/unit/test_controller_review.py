@@ -1337,65 +1337,6 @@ class ControllerReviewTests(unittest.TestCase):
         controller.switch_space('d1',0)
         self.assertEqual(backend.foreground_hwnd,0);self.assertEqual(self.fronted(backend),[])
 
-    def pressed(self, **state):
-        """The mouse pressed in the title bar of window 3, window 1 in front."""
-        controller,backend = self.make([record(h,f'app{h}') for h in (1,2,3)])
-        controller.start()
-        tile = backend.windows[3].rect
-        backend.z_order = [1,2,3];backend.foreground_hwnd = 1;backend.mouse_pressed = True
-        backend.cursor = (tile.right-60,tile.y+15)
-        backend.window_at = lambda point: 3
-        backend.operations.clear()
-        for name,value in state.items(): setattr(backend,name,value(tile) if callable(value) and name=='cursor' else value)
-        return controller,backend
-
-    def press(self, controller, then=None):
-        import threading
-        from unittest.mock import patch
-        with patch('smartgrid.core.controller.threading.Timer') as timer:
-            controller._enqueue_event({'type':'capture','hwnd':3})
-        if timer.called:
-            if then: then()
-            controller._activate_pressed(*timer.call_args[0][2])
-        return timer.called
-
-    def test_window_pressed_on_its_title_bar_is_activated_before_it_maximizes(self):
-        controller,backend = self.pressed()
-        self.assertTrue(self.press(controller))
-        self.assertEqual(backend.foreground_hwnd,3)
-        # In front already once maximized: nothing more.
-        backend.windows[3] = replace(backend.windows[3],state='maximized',rect=Rect(0,0,1920,1080))
-        controller._enqueue_event({'type':'location','hwnd':3})
-        controller._handle_event({'type':'location','hwnd':3})
-        self.assertEqual(self.fronted(backend),[('activate',3)])
-
-    def test_press_activating_its_window_by_itself_is_left_to_windows(self):
-        controller,backend = self.pressed(foreground_hwnd=3)
-        self.assertFalse(self.press(controller))
-        controller,backend = self.pressed()
-        self.press(controller,lambda: setattr(backend,'foreground_hwnd',3))
-        self.assertEqual(self.fronted(backend),[])
-        controller,backend = self.pressed()
-        self.press(controller,lambda: setattr(backend,'foreground_hwnd',2))
-        self.assertEqual(self.fronted(backend),[])
-
-    def test_other_presses_never_activate_a_window(self):
-        for state in (dict(mouse_pressed=False),dict(cursor=lambda tile:(tile.right-60,tile.y+200)),
-                      dict(cursor=lambda tile:(5,tile.y-40)),dict(window_at=lambda point:1),
-                      dict(accepts_activation=lambda hwnd:False),dict(foreground_hwnd=0)):
-            controller,backend = self.pressed(**state)
-            self.press(controller)
-            self.assertEqual(self.fronted(backend),[],state)
-        for change in (lambda c: c._floating.add(3),lambda c: setattr(c,'paused',True),
-                       lambda c: c._interacting.add(1),lambda c: c._native_gestures.update({1:0})):
-            controller,backend = self.pressed();change(controller)
-            self.press(controller)
-            self.assertEqual(self.fronted(backend),[])
-        # A gesture started by this very press.
-        controller,backend = self.pressed()
-        self.press(controller,lambda: controller._native_gestures.update({3:0}))
-        self.assertEqual(self.fronted(backend),[])
-
     def test_maximization_first_seen_by_a_rescan_comes_to_the_front_too(self):
         controller,backend,_ = self.maximized_behind()
         controller.refresh()
