@@ -1021,7 +1021,8 @@ class Controller:
                     self._preview_hwnd = hwnd
                     # Windows reports every move or resize loop as move_start.
                     kind = "resize" if kind == "resize_start" else \
-                        getattr(self.backend, "gesture_kind", lambda h: None)(hwnd)
+                        getattr(self.backend, "gesture_kind", lambda h: None)(
+                            hwnd, **({"pressed": event["pressed"]} if "pressed" in event else {}))
                     # The edges held, as the window tells (an edge inside the
                     # frame of an application drawing its own, too): the
                     # neighbours follow from the first pixel, before it moved.
@@ -1101,6 +1102,8 @@ class Controller:
                                  f'window {window.state}' if window.state != 'normal' else 'its display is gone')
                     if self.running and not self.paused and original and original[1] in {d.id for d in self.displays} and window and window.state == "normal":
                         before, display_id = original
+                        if gesture is None and self._travelled(before, window.rect):
+                            gesture = "move"
                         after = self._released_rect(window.rect, before) if self.preview_rectangles else window.rect
                         threshold = self._resize_thresholds(gesture)[0]
                         resized = abs(after.width - before.width) > threshold or abs(after.height - before.height) > threshold
@@ -2367,6 +2370,13 @@ class Controller:
         return (2, 2) if kind == "resize" else (8, 5)
 
     @staticmethod
+    def _travelled(before, after):
+        """The window moved whole along an axis (both edges by as much): a
+        resize never does, even when the application also changes its size."""
+        return any(abs(first) > 2 and abs(first - last) <= 2 for first, last in (
+            (after.x - before.x, after.right - before.right), (after.y - before.y, after.bottom - before.bottom)))
+
+    @staticmethod
     def _edge_moves(before, after, threshold):
         return [(edge, delta) for edge, delta in (("left", after.x - before.x), ("right", after.right - before.right),
                                                   ("top", after.y - before.y), ("bottom", after.bottom - before.bottom))
@@ -2754,6 +2764,11 @@ class Controller:
         rects = self._profile_rects(profile)
         original = self._move_origins.get(hwnd)
         kind=self._gesture_kinds.get(hwnd)
+        if kind is None and original and self._travelled(original[0],rect):
+            # Its size change is its own (its minimum size): a move.
+            kind=self._gesture_kinds[hwnd]="move"
+            self._held_edges=set();self._pointer_driven=False;self._preview_after=None
+            self._free_cursor()
         resizing=kind!="move"
         threshold,edge_threshold=self._resize_thresholds(kind)
         after=self._pointer_rect(rect,original[0],pointer) if resizing and original else rect

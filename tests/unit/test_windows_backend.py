@@ -324,6 +324,46 @@ class StackAboveTests(TestCase):
         self.assertEqual(calls[0][1], 70)
 
 
+class GestureKindTests(TestCase):
+    def kind(self, point, hit=1, pressed=True, dpi=96, told=None):
+        """The kind of a gesture started on a 496x450 window at 1032,930."""
+        from types import SimpleNamespace
+        backend = WindowsBackend.__new__(WindowsBackend)
+        backend.window_rect = lambda hwnd: Rect(1032, 930, 496, 450)
+        backend.mouse_down = lambda: pressed
+        def cursor(pointer):
+            pointer._obj.x, pointer._obj.y = point
+            return 1
+        def answer(hwnd, message, w, l, flags, timeout, result):
+            result._obj.value = hit
+            return 1
+        backend.api = SimpleNamespace(GetCursorPos=cursor, SendMessageTimeoutW=answer, GetDpiForWindow=lambda h: dpi,
+                                      physical_coordinates=nullcontext)
+        return backend.gesture_kind(1, told)
+
+    def test_title_bar_drawn_by_the_application_is_moved(self):
+        self.assertEqual(self.kind((1200, 945)), 'move')
+        self.assertEqual(self.kind((1200, 1100)), 'move')
+
+    def test_edge_or_keyboard_gesture_stays_unknown(self):
+        self.assertIsNone(self.kind((1200, 945), pressed=False))
+        self.assertIsNone(self.kind((1280, 1155), pressed=False))
+        for point in ((1200, 936), (1038, 1100), (1521, 1100), (1200, 1374)):
+            self.assertIsNone(self.kind(point), point)
+        self.assertIsNone(self.kind((1200, 945), dpi=192))
+        # The size grip of a status bar.
+        self.assertIsNone(self.kind((1510, 1362)))
+        self.assertEqual(self.kind((1510, 1300)), 'move');self.assertEqual(self.kind((1400, 1362)), 'move')
+
+    def test_button_is_taken_as_it_was_when_the_gesture_started(self):
+        self.assertEqual(self.kind((1200, 945), pressed=False, told=True), 'move')
+        self.assertIsNone(self.kind((1200, 945), pressed=True, told=False))
+
+    def test_native_title_bar_and_borders_are_told_as_before(self):
+        self.assertEqual(self.kind((1200, 936), hit=2, pressed=False), 'move')
+        self.assertEqual(self.kind((1031, 1100), hit=10), 'resize')
+
+
 class BringToFrontTests(TestCase):
     def backend(self, order, topmost=(), foreground=0, accepts=True, hung=False, switch=True):
         """order: the windows front to back."""

@@ -247,7 +247,7 @@ class WindowsBackend:
         return (told & near) or None
 
     @physical
-    def gesture_kind(self, hwnd):
+    def gesture_kind(self, hwnd, pressed=None):
         """'move' or 'resize' for a gesture that has just started on hwnd.
 
         Windows reports the start of a move or resize loop without saying which.
@@ -264,12 +264,20 @@ class WindowsBackend:
                   rect.y + margin <= point.y < rect.bottom - margin)
         if not inside:
             return 'resize'
-        # Over the client area, not a title bar: a gesture started from the
-        # keyboard (Alt+Space, Size or Move puts the cursor in the middle).
-        # Unknown: a size change then makes it a resize.
+        # Over the client area: the title bar an application draws itself, or a
+        # gesture started from the keyboard (Alt+Space, Size or Move puts the
+        # cursor in the middle).
         result = ULONG_PTR()
         if self.api.SendMessageTimeoutW(hwnd, 0x84, 0, ((point.y & 0xffff) << 16) | (point.x & 0xffff), 3, 100, C.byref(result)) and result.value == 1:
-            return None
+            # Held by the mouse away from its edges: a move. Otherwise unknown:
+            # a size change then makes it a resize.
+            scale = (self.api.GetDpiForWindow(hwnd) if self.api.GetDpiForWindow else 96) / 96
+            edge, grip = round(10 * scale), round(24 * scale)
+            away = (rect.x + edge <= point.x < rect.right - edge and
+                    rect.y + edge <= point.y < rect.bottom - edge and
+                    # The size grip of a status bar.
+                    not (point.x >= rect.right - grip and point.y >= rect.bottom - grip))
+            return 'move' if away and (self.mouse_down() if pressed is None else pressed) else None
         return 'move'
 
     def _identity(self, hwnd, *, pid=None, scan_identities=None):
@@ -899,6 +907,7 @@ class WindowsBackend:
                         # before the runtime handles it.
                         try:
                             payload['rect'], payload['cursor'] = self.window_rect(hwnd), self.cursor_position()
+                            payload['pressed'] = self.mouse_down()
                         except Exception:
                             log.exception('Gesture start could not be read')
                     self._enqueue(payload)

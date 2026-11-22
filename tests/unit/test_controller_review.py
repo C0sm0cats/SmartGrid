@@ -234,6 +234,58 @@ class ControllerReviewTests(unittest.TestCase):
         controller._handle_event({'type':'move_end','hwnd':hwnd})
         return guide
 
+    def test_window_growing_as_it_is_moved_is_dropped_not_resized(self):
+        """An application drawing its own title bar (gesture of unknown kind)
+        that takes its minimum height back as soon as it moves."""
+        for step in ('grows first','grows as it moves','moves left only'):
+            (Path(self.temporary.name)/'session.json').unlink(missing_ok=True)
+            controller,backend=self.make([record(h,f'app{h}') for h in (1,2,3,4)])
+            controller.start()
+            tiles={h:backend.windows[h].rect for h in (1,2,3,4)}
+            rect=tiles[4];target=tiles[3]
+            self.assertEqual(rect.y,target.y)
+            backend.gesture_kind=lambda h:None
+            backend.cursor=(rect.right-200,rect.y+10)
+            controller._handle_event({'type':'move_start','hwnd':4})
+            if step=='grows first':
+                backend.windows[4]=replace(backend.windows[4],rect=replace(rect,height=rect.height+214))
+                controller._handle_event({'type':'location','hwnd':4})
+            dx,dy=target.x+target.width//2-backend.cursor[0],0 if step=='moves left only' else 9
+            backend.cursor=(backend.cursor[0]+dx,backend.cursor[1]+dy)
+            backend.windows[4]=replace(backend.windows[4],rect=Rect(rect.x+dx,rect.y+dy,rect.width,rect.height+214))
+            controller._last_preview=0
+            controller._handle_event({'type':'location','hwnd':4})
+            self.assertEqual(controller.preview_rectangles,[]);self.assertEqual(controller.preview_covers,[])
+            self.assertEqual(controller.drag_guide[1],target);self.assertIn('Swap',controller.drag_guide[2])
+            controller._handle_event({'type':'move_end','hwnd':4})
+            self.assertEqual({h:backend.windows[h].rect for h in (1,2,3,4)},
+                             {1:tiles[1],2:tiles[2],3:tiles[4],4:tiles[3]},step)
+            self.assertEqual(controller.profile('d1',0).resize_tiles,[])
+            self.assertIsNone(backend.cursor_clip)
+            controller.stop()
+
+    def test_button_read_at_the_start_is_passed_on(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        seen=[]
+        backend.gesture_kind=lambda h,pressed=None:seen.append(pressed) or 'move'
+        controller._handle_event({'type':'move_start','hwnd':1,'pressed':True})
+        controller._handle_event({'type':'move_end','hwnd':1})
+        controller._handle_event({'type':'move_start','hwnd':1})
+        self.assertEqual(seen,[True,None])
+
+    def test_unknown_gesture_moving_one_edge_is_still_a_resize(self):
+        controller,backend=self.make([record(1),record(2)])
+        controller.start()
+        rect,other=backend.windows[1].rect,backend.windows[2].rect
+        backend.gesture_kind=lambda h:None
+        backend.cursor=(rect.x+300,rect.y+400)
+        controller._handle_event({'type':'move_start','hwnd':1})
+        backend.windows[1]=replace(backend.windows[1],rect=replace(rect,width=rect.width-150))
+        controller._handle_event({'type':'location','hwnd':1})
+        controller._handle_event({'type':'move_end','hwnd':1})
+        self.assertEqual(backend.windows[2].rect.x,other.x-150)
+
     def test_drop_target_is_under_the_pointer(self):
         for driven in (False,True):
             # A new run, not the same windows found again after a restart.
