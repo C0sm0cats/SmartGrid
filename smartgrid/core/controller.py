@@ -2122,10 +2122,19 @@ class Controller:
             window = self._window(hwnd)
             if now > grace[0] or not grace[1] or not window:
                 self._launch_grace.pop(hwnd, None)
+                continue
+            if window.state == "maximized" and hwnd in self._tile_rects:
+                # Its event may be late or lost: read now whether it was by hand.
+                self._note_maximized(hwnd)
+            if window.state == "maximized" and (self._maximized.get(hwnd) or {}).get("by_hand"):
+                # Maximized by the user from its title bar: kept, grace over.
+                self._launch_grace.pop(hwnd, None)
             elif (self.running and not self.paused and window.state == "maximized" and self._eligible(window)
                     and hwnd not in self._floating and self.backend.show(hwnd)):
                 grace[1] -= 1
                 window.state = "normal"
+                # Its note told this maximization, not the user's next one.
+                self._maximized.pop(hwnd, None)
                 restored = True
                 log.info("Launched by a layout, %s (%s) maximized itself: restored for its tile", hwnd, window.app_id)
         return restored
@@ -2205,6 +2214,9 @@ class Controller:
             if action not in ('minimize','maximize','close'):
                 raise ValueError('Unknown window action')
             self._capture(reference.hwnd)
+            if action=='maximize':
+                # Asked by the user: never restored as a launched app's own.
+                self._launch_grace.pop(reference.hwnd,None)
             if action=='maximize' and window.state=='maximized':
                 success=self.backend.show(reference.hwnd)
             else:

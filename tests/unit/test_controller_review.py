@@ -1463,6 +1463,25 @@ class ControllerReviewTests(unittest.TestCase):
         self.assertEqual(backend.windows[hwnd].state,'maximized')
         self.assertFalse(controller._launch_grace)
 
+    def test_launched_application_maximized_by_hand_during_the_grace_is_kept(self):
+        controller,backend = self.pending_template()
+        hwnd = backend.add_window('slow').ref.hwnd
+        controller.refresh()
+        tile = controller._tile_rects[hwnd][1]
+        backend.cursor = (tile.right-60,tile.y+15)
+        backend.window_at = lambda point: hwnd
+        backend.maximize(hwnd);controller.refresh()
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+        self.assertNotIn(hwnd,controller._launch_grace)
+
+    def test_launched_application_maximized_from_the_palette_during_the_grace_is_kept(self):
+        controller,backend = self.pending_template()
+        window = backend.add_window('slow');hwnd = window.ref.hwnd
+        controller.refresh()
+        self.assertTrue(controller.window_action('maximize',window.ref))
+        self.assertEqual(backend.windows[hwnd].state,'maximized')
+        self.assertNotIn(hwnd,controller._launch_grace)
+
     def test_maximized_launch_is_kept_while_paused_floating_or_not_launched(self):
         controller,backend = self.pending_template()
         other = backend.add_window('other',state='maximized').ref.hwnd
